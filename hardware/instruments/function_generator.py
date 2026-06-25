@@ -1,0 +1,81 @@
+"""Generic SCPI function-generator driver.
+
+The command set here intentionally uses common SCPI commands supported by many
+Keysight, Rigol, Siglent, Tektronix, and Aim-TTi function generators. Model
+specific quirks can be added later as subclasses.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .visa_resource import VisaInstrument
+
+
+@dataclass
+class FunctionGenerator(VisaInstrument):
+    """Minimal USB/VISA function generator driver."""
+
+    output_channel: int = 1
+
+    def configure_sine(
+        self,
+        frequency_hz: float,
+        amplitude_vpp: float,
+        offset_v: float = 0.0,
+        phase_deg: float | None = None,
+        channel: int | None = None,
+    ) -> None:
+        """Configure a sine wave while leaving output state unchanged."""
+
+        ch = channel or self.output_channel
+        self.write(f"SOUR{ch}:FUNC SIN")
+        self.write(f"SOUR{ch}:FREQ {frequency_hz:.12g}")
+        self.write(f"SOUR{ch}:VOLT {amplitude_vpp:.12g}")
+        self.write(f"SOUR{ch}:VOLT:OFFS {offset_v:.12g}")
+        if phase_deg is not None:
+            self.set_phase(phase_deg, ch)
+
+    def configure_square(
+        self,
+        frequency_hz: float,
+        amplitude_vpp: float,
+        offset_v: float = 0.0,
+        duty_percent: float = 50.0,
+        channel: int | None = None,
+    ) -> None:
+        """Configure a square wave while leaving output state unchanged."""
+
+        ch = channel or self.output_channel
+        self.write(f"SOUR{ch}:FUNC SQU")
+        self.write(f"SOUR{ch}:FREQ {frequency_hz:.12g}")
+        self.write(f"SOUR{ch}:VOLT {amplitude_vpp:.12g}")
+        self.write(f"SOUR{ch}:VOLT:OFFS {offset_v:.12g}")
+        self.write(f"SOUR{ch}:FUNC:SQU:DCYC {duty_percent:.12g}")
+
+    def output_on(self, channel: int | None = None) -> None:
+        ch = channel or self.output_channel
+        self.write(f"OUTP{ch} ON")
+
+    def output_off(self, channel: int | None = None) -> None:
+        ch = channel or self.output_channel
+        self.write(f"OUTP{ch} OFF")
+
+    def set_frequency(self, frequency_hz: float, channel: int | None = None) -> None:
+        ch = channel or self.output_channel
+        self.write(f"SOUR{ch}:FREQ {frequency_hz:.12g}")
+
+    def set_phase(self, phase_deg: float, channel: int | None = None) -> None:
+        ch = channel or self.output_channel
+        self.write(f"SOUR{ch}:PHAS {phase_deg:.12g}DEG")
+
+    def get_frequency(self, channel: int | None = None) -> str:
+        ch = channel or self.output_channel
+        return self.query(f"SOUR{ch}:FREQ?")
+
+    def get_phase(self, channel: int | None = None) -> str:
+        ch = channel or self.output_channel
+        return self.query(f"SOUR{ch}:PHAS?")
+
+    def get_error(self) -> str:
+        return self.query("SYST:ERR?")

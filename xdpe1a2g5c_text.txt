@@ -1,0 +1,4564 @@
+
+--- PAGE 1 ---
+ 
+ 
+Final Datasheet Please read the Important Notice and Warnings at the end of this document Rev 1.0 
+www.infineon.com 1 of 80 2026-02-25 
+XDPE1A2G5C 
+ 
+R e s t r i c t e d 
+XDPE1A2G5C Digi tal Multi -phase Controller  
+16 -phase Dual Loop Voltage Regulator  
+Features  
+• Digital controller assisted with high performance analog front ends with a fully programmable ARM® 
+CortexTM –M0 Processor 
+• PMBus compliant with rev 1.4 with AVSBus serial interface  
+− Output voltage control 
+− Query voltage, current, temperature faults  
+− Fault Response  
+− Maximum supported bus speed 1 MHz  
+− Supports 1.8/3.3 V operation 
+• AVSBus 
+− Supports 1.2V/1.8V operation 
+− Supports clock frequencies up to 50MHz 
+• Output voltage regulation range 
+− 0.05 V to 3.1 V (1 mV/step) 
+• Digitally controlled phasing for full flexibility in both loop configuration and phase firing order 
+• Configurable autonomous phase add/drop  
+• Automatic phase detection at start-up 
+• Supports start-up into pre-bias voltage 
+• Integrated power stage current sense  
+• Differential output voltage sense  
+• Fast current balancing with current-mode control 
+• Digitally programmable PID (Proportional, Integral, Differential) loop compensation 
+• Digitally programmable load line slope and offset 
+• Digital temperature compensation 
+• Extensive fault detection and protection capability  
+− IUVP, OUVP & OOVP (fixed and tracking) 
+− OCP instantaneous & averaged (total current)  
+− Multiple OTP thresholds 
+− Peak phase current pulse limiting  
+− Negative current limit protection 
+• Internal non-volatile memory (NVM) to store multiple custom configurations 
+• RoHS compliant and Halogen free 56-lead QFN plastic package 
+ 
+ 
+  
+--- PAGE 2 ---
+  
+ 
+Final Datasheet 2 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Potential applications 
+R e s t r i c t e d 
+ 
+Potential applications 
+• CORE power regulator for AI based Microprocessors  
+− Telecom applications 
+− ASIC POWER 
+Product validation 
+Qualified for industrial applications according to the relevant tests of JEDEC47/20/22 
+Description 
+The XDPE1A2G5C digital dual loop 16 phase controller provides power for AI servers, workstation, and telecom 
+applications that use AVSBUS. Voltage on either the first loop or the second loop can be provided by a multi-
+phase buck converter with up to 16 synchronous-rectified channels.  Typical configurations of 16+0, 15+1, and 
+up to 8+8 are supported. 
+Command and monitoring functions are controlled through the PMBus and AVS interfaces which supports 
+dynamic voltage identification with 1 mV/step, output range up to 3.1 V, offset and trim resolution of 625 uV 
+and accuracy better than 0.5%.  
+The XDPE1A2G5C controller utilizes digital technology to implement all control functions, providing the 
+ultimate system solution in terms of flexibility and stability. Advanced control loop features, such as current 
+mode control, variable frequency operation, Active Transient Response (ATR/FATR), fast DVID response, 
+automatic phase shedding and Pulse Frequency Modulation (PFM) enable optimal response to a highly 
+dynamic load with fast di/dt load transients across a wide range of load current.  
+The XDPE1A2G5C controller supports multi-vendor pin compatible integrated power stages with trivalent PWM 
+interfaces, fast response, integrated current sense, integrated temperature sense, and advanced fault 
+detection capability, interface and signaling.  
+In addition to supporting power stage fault protection features, the XDPE1A2G5C controller also includes a set 
+of sophisticated over-voltage, under-voltage, over-temperature, over-current, and phase fault protections. 
+These attributes provide a complete and advanced protection feature set for microprocessor and power 
+systems. 
+Infineon strongly recommends pairing Infineon’s power stages with our Digital XDP™ family of controllers to 
+ensure correct interoperability.  Interoperability when pairing with other vendor power stages/ discrete power 
+components cannot be guaranteed by Infineon and requires thorough evaluation and characterization by the 
+power stage/ discrete power component vendor. 
+Table 1 Part number and package summary 
+Part Number Package 
+XDPE1A2G5C 56-lead 7 mm x 7 mm QFN 
+PG-VQFN-56 
+ 
+ 
+ 
+--- PAGE 3 ---
+  
+ 
+Final Datasheet 3 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Table of contents 
+R e s t r i c t e d 
+Table of contents 
+Features ................................ ................................ ................................ ................................ ........ 1 
+Potential applications ................................ ................................ ................................ ..................... 2 
+Product validation ................................ ................................ ................................ ..........................  2 
+Description ................................ ................................ ................................ ................................ .... 2 
+Table of contents ................................ ................................ ................................ ............................  3 
+1 Ordering information ................................ ................................ ................................ ............. 5 
+2 Functional block diagram ................................ ................................ ................................ ........ 7 
+3 Typical application drawings ................................ ................................ ................................ ... 8 
+4 Pin descriptions ................................ ................................ ................................ ..................... 9 
+5 Absolute maximum ratings ................................ ................................ ................................ .... 12 
+6 Electrical specifications ................................ ................................ ................................ ......... 13 
+7 Theory of operation ................................ ................................ ................................ ............... 18 
+7.1 Startup configuration ............................................................................................................................ 18 
+7.2 Power-up configuration ........................................................................................................................ 18 
+7.3 Initialization ........................................................................................................................................... 19 
+7.4 Inactive state and TON_DELAY ............................................................................................................. 19 
+7.5 Soft-start ................................................................................................................................................ 19 
+7.6 Active regulation ................................................................................................................................... 19 
+7.7 Shutdown .............................................................................................................................................. 20 
+7.8 PWM output configuration .................................................................................................................... 20 
+8 Application information ................................ ................................ ................................ ......... 22 
+8.1 Input power sense ................................................................................................................................. 22 
+8.2 Differential output voltage sense (VOSEN_Lx / VORTN_Lx) ................................................................ 22 
+8.3 Output phase current sense (ISENx) ..................................................................................................... 23 
+8.3.1 Support for output current greater than 2048A .............................................................................. 24 
+8.4 Temperature sense (TSENx, Internal) ................................................................................................... 26 
+8.5 Auxiliary voltage sense (VAUX) .............................................................................................................. 27 
+8.6 AVSBus ................................................................................................................................................... 27 
+8.6.1 Interface ........................................................................................................................................... 27 
+8.6.2 Operation ......................................................................................................................................... 28 
+8.6.3 Electrical Interface ........................................................................................................................... 29 
+8.6.3.1 Timing .......................................................................................................................................... 29 
+8.6.3.2 Electrical Drive Levels ................................................................................................................. 30 
+8.6.4 AVSBus Status Alert Mask ................................................................................................................ 30 
+8.6.5 AVSBus Command Group ................................................................................................................ 31 
+8.6.6 AVSBus Addressing ........................................................................................................................... 34 
+8.6.7 VOUT transition rate ........................................................................................................................ 34 
+8.7 Phase Add/Drop: Autonomous ............................................................................................................. 34 
+8.8 Linear loop compensation (PID / Poles / PI) ......................................................................................... 35 
+8.9 Active transient response (ATR / FATR) ................................................................................................ 35 
+8.9.1 ATRH and ATRL ................................................................................................................................. 36 
+8.9.2 FATR .................................................................................................................................................. 37 
+8.10 High-speed phase current balance (HSPB) .......................................................................................... 38 
+8.11 Telemetry ............................................................................................................................................... 39 
+8.11.1 Telemetry sample rate, filter bandwidth, and range/resolution ................................................... 39 
+--- PAGE 4 ---
+  
+ 
+Final Datasheet 4 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Table of contents 
+R e s t r i c t e d 
+8.11.2 Programmable filter bandwidth ...................................................................................................... 40 
+8.12 Fault handler ......................................................................................................................................... 41 
+8.12.1 VDD under-voltage lockout (VDD UVLO) ......................................................................................... 43 
+8.12.2 Driver PWM Faults ............................................................................................................................ 43 
+8.12.3 Driver not ready – TMON low ........................................................................................................... 43 
+8.12.4 Input voltage fault protection (IUVP/IOVP) ..................................................................................... 43 
+8.12.5 Input current protection (IOCP) ....................................................................................................... 44 
+8.12.6 Output over & under-voltage protection (OOVP/OUVP) ................................................................. 45 
+8.12.7 Output over-current protection (OOCP) ......................................................................................... 45 
+8.12.8 Per phase current protection (P2CL, NCL) ...................................................................................... 47 
+8.12.9 Output over-power protection (OOPP) ........................................................................................... 48 
+8.12.10 Over-temperature protection (OTP) ................................................................................................ 48 
+8.12.11 Power stage fault detection ............................................................................................................. 48 
+8.12.12 CRC failure ........................................................................................................................................ 49 
+8.12.13 Communication fault ....................................................................................................................... 49 
+8.12.14 Fault response control ..................................................................................................................... 49 
+8.12.15 Fault pin mapping ............................................................................................................................ 49 
+8.13 Active voltage positioning (AVP) ........................................................................................................... 50 
+8.14 Multi-function pins ................................................................................................................................ 52 
+8.15 PMBus interface ..................................................................................................................................... 53 
+8.16 PMBus protocol ..................................................................................................................................... 54 
+8.16.1 PMBus command set ....................................................................................................................... 56 
+8.16.2 11-bit Linear Format ........................................................................................................................ 66 
+8.16.3 16-bit Linear Format ........................................................................................................................ 66 
+8.17 Configuration management ................................................................................................................. 67 
+8.18 Security .................................................................................................................................................. 69 
+8.18.1 Write Protect .................................................................................................................................... 69 
+8.18.2 Password Protect ............................................................................................................................. 69 
+8.19 Blackbox feature ................................................................................................................................... 70 
+8.19.1 User configuration ........................................................................................................................... 70 
+8.19.2 Stored blackbox data ....................................................................................................................... 71 
+8.20 TLVR secondary open and short detection .......................................................................................... 73 
+9 Physical characteristics (56-lead QFN package, 7 mm x 7 mm) ................................ ................... 76 
+10 Package layout guidelines ................................ ................................ ................................ ...... 77 
+11 Layout considerations ................................ ................................ ................................ ........... 78 
+11.1 Component placement ......................................................................................................................... 78 
+11.2 Routing of AVS signals ........................................................................................................................... 78 
+12 Package marking ................................ ................................ ................................ .................. 79 
+13 Environmental qualifications ................................ ................................ ................................ . 80 
+ 
+ 
+--- PAGE 5 ---
+  
+ 
+Final Datasheet 5 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Ordering information 
+R e s t r i c t e d 
+1 Ordering information 
+Table 2 Ordering information 
+Base Part Number Package Type Standard Pack 
+Form and Quantity 
+Orderable Part Number 
+XDPE1A2G5C QFN 7 mm x 7 mm Tape and Reel 3000 XDPE1A2G5C0000XUMA1 
+Note 1 
+XDPE1A2G5CxyzzXUMA1 
+Note 2 
+Note:  
+1. Standard part number with default configuration 
+2. Customer Specific Configuration File, where x = Firmware ID and yzz  = Custom Configuration File ID (Codes 
+assigned by Product Marketing).  
+ 
+Sample Programming 
+The customer can program the parts to their specific system requirements using software/hardware available 
+from Infineon or through other controller programming facilities (contact Infineon for recommendations).  
+Infineon Field Application Engineers are available to assist with system and configuration file optimization and 
+programming of the controllers.  Alternatively, samples can be ordered with a customer specific custom 
+configuration pre-programmed at the factory, but lead times for these types of samples are significantly longer 
+than for non-configured samples.  The generic part numbering format is shown below: 
+ 
+X D P E  1 A 2 G 5   A  xyzz
+Prefix
+Part Number
+   5 characters Version Control
+  
+Configuration 
+Control
+  
+ 
+Figure 1 Part number decoding 
+ 
+--- PAGE 6 ---
+  
+ 
+Final Datasheet 6 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Ordering information 
+R e s t r i c t e d 
+ 
+ISEN16
+ISEN15
+VDD
+VD12
+VINSEN
+GPIO
+TSEN2/VAUX
+TSEN1
+ADDR
+EN_L2
+VOSEN_L2
+VORTN_L2
+ISEN1
+ISEN2
+ISEN4
+ISEN3
+ISEN8
+ISEN7
+ISEN6
+ISEN5
+ISEN10
+ISEN9
+PWM6
+PWM5
+PWM4
+PWM3
+PWM8
+PWM7
+PWM10
+PWM9
+PWM11
+PWM12
+PWM16
+PWM14
+PWM13
+PWM15
+DIE PADDLE
+GND
+PWM2
+PWM1
+SM_SDA
+SM_CLK
+EN_L1
+PG_L1
+PG_L2
+IMON_L2
+SM_ALERT#
+AVS_TDAT
+VDDIO
+AVS_CDAT
+AVS_CLK
+ISEN11
+ISEN12
+ISEN14
+ISEN13
+XDPE1A2G5
+IMON_L1
+VOSEN_L1
+VORTN_L1
+16 phases max.
+7x7mm, 56 pins QFN
+ 
+Figure 2 Package top view 
+--- PAGE 7 ---
+  
+ 
+Final Datasheet 7 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Functional block diagram 
+R e s t r i c t e d 
+2 Functional block diagram 
+ 
+ISEN2
+VID Step
+Softstart
+Multi-Protocol
+OverClock Control
+PWM3
+Verr
+PID
+Voltage Mode
+Current Mode
+TonMin/ToffMin
+PWM Controller
+ATA
+FATR
+ISEN3
+PWM2
+PWM4
+ISEN1 PWM1
+Fault
+Handler
+ISADC
+ISADC
+ISADC
+ISADC
+PWM14
+PWM13
+VOSEN_L2
+VORTN_L2
+VOSEN_L1
+VORTN_L1
+SM_ALERT#
+ADDR
+MUX
+TSADC
+TSEN1
+ISADC
+ISEN13
+ISEN4
+PWM15
+IMON_L1
+Loop Mode/
+Channel assignment
+ISP
+ISZ
+Phase Current
+PCL/NCL
+IPhase Error
+Total Current
+Current Protection
+IBAL Offset
+IBAL Error
+Phase Drop
+AVP
+Vtarget
+PFM Controller
+LDO
+SCR POR
+VDD POR
+VD12
+EN_L2
+PG_L1
+Multi-purpose IO
+CPUS
+Internal Bus
+BIF Registers
+I2C/
+PMBUS
+SM_SDA
+SM_SCL
+64K OTP
+40K RAM
+128K ROM
+ISEN16
+ISADC
+PWM16
+FAULT
+EN_L1
+FAULT
+OCW
+TSEN2
+PG_L2
+MUX TSDAC
+vin
+vaux
+atsen
+btsen
+xaddr
+VINSEN
+640 uA
+100 uA
+100 uA
+TSP
+TELEM
+VSADC
+VSADC VSP
+VSP
+VD12
+MDACTMUX
+TBUS
+Phase
+Enumeration
+Phase Offset
+Phase Alignment
+Scan
+SWD
+BIST
+OCP
+OTP
+VRHOT
+PWM
+Modulators
+Loop Mode/ 
+Channel 
+Assignment
+ISEN14
+ISEN15
+Serial I/F
+Infrastructure
+ISADC
+ISADC
+VDDIO
+CLK
+CDATA
+TDATA
+IMON_L2
+ 
+Figure 3 Block diagram 
+--- PAGE 8 ---
+  
+ 
+Final Datasheet 8 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Typical application drawings 
+R e s t r i c t e d 
+3 Typical application drawings 
+ 
+VIN
+(+12V)
+VDRV
+(+5V)
++3.3V
+I2C Interface
+AVS Interface
+VCC
+EN_L1
+PG_L1
+AVS_CDATA
+SM_DIO
+SM_CLK
+PWM15_2
+ISEN15_2
+AVS_CLK
+VORTN_L2
+VOSEN_L2
+LOAD1
+VINSEN
+PWM1
+ISEN1
+PWM2
+ISEN2
+PWM3
+ISEN3
+TEMP1
+VAUX
+PWM4
+ISEN4
+PWM8
+ISEN8
+PWM9_8
+ISEN9_8
+VORTN_L1
+VOSEN_L1
+GPIO
+PG_L2
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+220pF
+PWM16_1
+ISEN16_1
++1.2V VD12
+XDPE1A2G5
+EN_L2
+100pF
+SM_ALERT#
+52
+50
+13
+30
+12
+31
+14
+29
+11
+32
+7
+36
+5
+37
+27
+28
+56
+43
+55
+44
+46
+45
+23
+24
+15
+16
+22
+47
+19
+18
+53
+54
+49
+17
+51
+1KW
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+L
+CBOOT
+TDA21590
+ 
+VIN
+SW
+BOOST
+PGND
+VDRV
+VCC
+PWM
+PHASE
+LGNDIMON
+IMON
+REF
+TMON/FLT
+EN
+LOAD2
+5.36KW
+AVS_TDATA
+25
+VDDIO
+26
+220pF
+ADDR OFFSET ADDR
+48
+1KW
+13KW
+10
+10
+ 
+Figure 4 Dual loop VR using XDPE1A2G5C Controller and TDA21590 Power Stage in 8+8 phase  
+--- PAGE 9 ---
+  
+ 
+Final Datasheet 9 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Pin descriptions 
+R e s t r i c t e d 
+4 Pin descriptions 
+Table 3 Pin descriptions 
+Key: I = Input / O = Output / S = Supply 
+Pin# Pin name I/O Type Pin description 
+1 PWM14 O CMOS PWM output.  Refer to PWM1 description. 
+2 PWM13 O CMOS PWM output.  Refer to PWM1 description. 
+3 PWM12 O CMOS PWM output.  Refer to PWM1 description. 
+4 PWM11 O CMOS PWM output.  Refer to PWM1 description. 
+5 PWM10 O CMOS PWM output.  Refer to PWM1 description. 
+6 PWM9 O CMOS PWM output.  Refer to PWM1 description. 
+7 PWM8 O CMOS PWM output.  Refer to PWM1 description. 
+8 PWM7 O CMOS PWM output.  Refer to PWM1 description. 
+9 PWM6 O CMOS PWM output.  Refer to PWM1 description. 
+10 PWM5 O CMOS PWM output.  Refer to PWM1 description. 
+11 PWM4 O CMOS PWM output.  Refer to PWM1 description. 
+12 PWM3 O CMOS PWM output.  Refer to PWM1 description. 
+13 PWM2 O CMOS PWM output.  Refer to PWM1 description. 
+14 PWM1 O CMOS Pulse Width Modulation (PWM) output.  This signal is used to 
+drive the PWM input of the FET driver IC.  Any PWM pin can be 
+assigned any phase angle on either loop.  See Note 3 below 
+15 SM_SDA I/O Open 
+Drain 
+SMBus/I2C bi-directional serial data interface. 
+16 SM_SCL I Open 
+Drain 
+SMBus/I2C serial clock interface.  
+17 SM_ALERT# O Open 
+Drain/ 
+CMOS 
+Multipurpose pin configurable as SM_ALERT# signal for a PMBus 
+device, Low-power Mode (LPM#) enable, or FAULT# 
+18 PG_L1 O Open 
+Drain 
+Voltage regulator “Ready” output signal for Loop 1.  The PG_L1 
+indicator will be asserted when the controller is ready to accept 
+AVS commands. This open-drain output requires an external 
+pull-up resistor (1 KΩ recommended).  PG_L1 will be pulled low 
+when the enable is de-asserted or a shutdown fault occurs. 
+19 EN_L1 I CMOS Active high Output Enable input.  Asserting the EN_L1 pin will 
+activate loop 1, pending status of the internal power-on-reset 
+circuit and any existing fault states. De-asserting then asserting 
+EN_L1 after a latched-fault based shutdown will cause the 
+controller to enter the soft-start state.  Faults will be cleared 
+when EN_L1 is reasserted. This pin can also be configured to be a 
+common enable for both Loop 1 and Loop 2. 
+20 IMON_L2 O Analog IMON output that will provide a current that is analogous to the 
+total output current of Loop 2 
+21 IMON_L1 O Analog IMON output that will provide a current that is analogous to the 
+total output current of Loop 1 
+--- PAGE 10 ---
+  
+ 
+Final Datasheet 10 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Pin descriptions 
+R e s t r i c t e d 
+Pin# Pin name I/O Type Pin description 
+22 PG_L2 O Open 
+Drain 
+Voltage regulator “Ready” output signal for Loop 2.  See PG_L1 
+description for more detail.   
+23 
+AVS_CDAT I CMOS 
+Bus line that is driven by the AVSBus controller (ASIC, FPGA, or 
+Processor) and carries data to the target (VR Controller). Float or 
+connect to ground if not used.  Note 3 
+24 AVS_CLK I CMOS Bus clock that is driven by the controller and clocks data for both 
+the AVS_CDAT and AVS_TDAT lines. Note 3 
+25 
+AVS_TDAT O CMOS 
+Bus line that is driven by an AVSBus Target (VR Controller) and 
+carries data to the AVSBus controller (ASIC, FPGA, or Processor).  
+Note 3  
+26 VDDIO S External 
+Supply 
+Common voltage for the controller and target I/O circuitry. 
+27 
+VOSEN_L1 I Analog 
+Loop 1 voltage sense inputs. VOSEN_L1 and VORTN_L1 are inputs 
+to the precision differential remote sense amplifier and should 
+be connected to the sense pins of the remote load. The sense 
+amplifier converts the differential voltage of the remote output 
+sense to a single-ended voltage referenced to chip ground. It is 
+recommended to add a 10 Ohm, 220 pF filter for VOSEN_L1  
+28 VORTN_L1 I Analog Loop 1 voltage sense input reference. 
+29 ISEN1 I Analog Current sense input used with PWM1 output.  See Note 5  
+30 ISEN2 I Analog Current sense input used with PWM2 output.  
+31 ISEN3 I Analog Current sense input used with PWM3 output.   
+32 ISEN4 I Analog Current sense input used with PWM4 output.   
+33 ISEN5 I Analog Current sense input used with PWM5 output.   
+34 ISEN6 I Analog Current sense input used with PWM6 output.   
+35 ISEN7 I Analog Current sense input used with PWM7 output.   
+36 ISEN8 I Analog Current sense input used with PWM8 output.   
+37 ISEN9 I Analog Current sense input used with PWM9 output.   
+38 ISEN10 I Analog Current sense input used with PWM10 output.   
+39 ISEN11 I Analog Current sense input used with PWM11 output.   
+40 ISEN12 I Analog Current sense input used with PWM12 output.   
+41 ISEN13 I Analog Current sense input used with PWM13 output.   
+42 ISEN14 I Analog Current sense input used with PWM14 output.   
+43 ISEN15 I Analog Current sense input used with PWM15 output.   
+44 ISEN16 I Analog Current sense input used with PWM16 output.   
+45 VORTN_L2 I Analog Loop B voltage sense input reference. 
+46 
+VOSEN_L2 I Analog 
+Loop 2 voltage sense inputs. Refer to VOSEN_L1 and VORTN_L1 
+description.  It is recommended to tie these pins to GND in single 
+rail applications. 
+47 EN_L2 I CMOS Active high Output Enable input.  Asserting the EN_L2 pin will 
+activate loop 2, pending status of the internal power-on-reset 
+circuit and any existing fault states. De-asserting then asserting 
+EN_L2 after a latched-fault based shutdown will cause the 
+controller to enter the soft-start state.  Faults will be cleared 
+--- PAGE 11 ---
+  
+ 
+Final Datasheet 11 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Pin descriptions 
+R e s t r i c t e d 
+Pin# Pin name I/O Type Pin description 
+when EN_L2 is reasserted.  
+48 ADDR I Analog Used to set the PMBus address of the controller along with the 
+address in NVM by tying an external resistor between this pin and 
+GND. 
+49 TSEN1 I Analog Loop 1 or Loop 2 external temperature sense input.  Connects to 
+the integrated power stage temperature sensor output.   
+50 TSEN2 I Analog Loop 1 or Loop 2 external temperature sense input.  Connects to 
+the integrated power stage temperature sensor output.   
+VAUX I Analog Auxiliary voltage monitor to measure power stage supply voltage 
+through an external resistor divider. 
+51 GPIO I/O CMOS General Purpose IO 
+52 VINSEN I Analog Monitor VIN with an external resistor divider 
+53 VD12 S Internal 
+Supply 
+Internally generated 1.2 V voltage reference used to power digital 
+core logic and to provide a reference voltage for external Power 
+Stages.  The pin is provided for attaching external decoupling 
+capacitors. Decouple using high quality 1.0 µF + 0.1 µF ceramic 
+capacitors.  Do not apply voltage to or ground this pin.   
+54 VDD S External 
+Supply 
+3.3 V power supply input to the controller.  This pin should be 
+connected to the system +3.3 V supply and decoupled using high 
+quality 1.0 µF + 0.1 µF ceramic capacitors. 
+55 PWM16 O CMOS PWM output.  Refer to PWM1 description. 
+56 PWM15 O CMOS PWM output.  Refer to PWM1 description. 
+Die paddle S Ground Exposed Ground pad beneath the device must be soldered to the 
+PCB ground for proper operation. 
+Note:  
+3. If the AVS interface is not enabled, the AVS interface pins can be left floating or grounded. 
+4. Leave unused PMW output pins floating 
+5. Leave unused ISEN input pins floating 
+--- PAGE 12 ---
+  
+ 
+Final Datasheet 12 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Absolute maximum ratings 
+R e s t r i c t e d 
+5 Absolute maximum ratings 
+Table 4 Absolute maximum ratings 
+Symbol Description Min to Max Conditions 
+VDD Supply voltage GND-0.3 V to 4.0 V See Note 6 below 
+VOSEN_L1/L2  GND-0.3 V to 3.7 V Do not exceed VDD + 0.2 V 
+VORTN_L1/L2  GND-0.3 V to 0.5 V - 
+ISENx  GND-0.3 V to 3.7 V See Note 6 below 
+VDDIO, AVS_CLK, 
+AVD_CDAT, 
+AVS_TDAT 
+ GND-0.3 V to 2.0 V - 
+VD12  -15 mA to +1 mA Do not drive this pin 
+ All other pins GND-0.3 V  to  4.0 V* See Note 6 below, and Note 7 
+TJ Junction temperature -40~150 °C   - 
+TSTG Storage temperature -65~150 °C   - 
+Note:  
+6. The absolute maximum VDD supply voltage is 4.0 V with the conditions that the junction temperature range is 
+maintained between -40 °C ≤ TJ ≤ +125  °C and the product is not operated at the absolute maximum VDD 
+supply voltage for more than 24 hours cumulatively over the lifetime of the product. 
+7. *The lesser of 4 V or VDD+0.2 V; outputs in Hi-Z state 
+Attention: Stresses beyond those listed under ‘Absolute maximum ratings may cause permanent 
+damage to the device. These are stress ratings only and functional operation of the device at 
+these or any other conditions beyond those indicated in the operational sections of the 
+specifications are not implied. 
+ 
+ 
+--- PAGE 13 ---
+  
+ 
+Final Datasheet 13 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Electrical specifications 
+R e s t r i c t e d 
+6 Electrical specifications 
+Table 5 Recommended operating conditions for reliable operation with margin 
+Operating Junction Temperature Range Tj -40 °C to 125°C 
+Supply Voltage Range VDD +2.97 V to +3.63 V 
+ 
+Table 6 Temperature information 
+Symbol Description 7 mm x 7 mm QFN 
+JA(0) Junction-to-ambient thermal resistance at 0 lfm 27.1 C/W 
+JA(200) Junction-to-ambient thermal resistance at 200 lfm 23.1 C/W 
+JA(500) Junction-to-ambient thermal resistance at 500 lfm 21.7 C/W 
+JC Junction-to-case thermal resistance 2.8 C/W 
+ 
+The electrical characteristics table lists the spread of values guaranteed within the recommended operating 
+conditions. Typical values represent the median values, which are related to 25°C. 
+Table 7 Electrical characteristics 
+Parameter Test conditions Min Typ Max Units 
+VDD supply  
+Nominal supply current Phase count maximum – 80 – mA 
+VREN = low – 55 – mA 
+PWM[x:1] 
+Output low voltage (VOL) ILOAD = +5 mA – – 0.4 V 
+Output high voltage (VOH) ILOAD = -5 mA 2.6 – – V 
+Output current in Hi-Z state pin driven to 2.3 V -1 – 1 μA 
+PWM low threshold 
+Configured as inputs prior to 
+power-up when used to detect 
+shorted or open PWM 
+- 0.8 - V 
+SM_SDA, SM_SCL 
+Input low voltage (VIL) Configured as 3.3 V buffer – – 1.0 V 
+Input high voltage (VIH) Configured as 3.3 V buffer 2.1 – – V 
+Input low voltage (VIL) Configured as 1.8 V buffer – – 0.8 V 
+Input high voltage (VIH) Configured as 1.8 V buffer 1.35 – – V 
+Input current 
+ 
+pin driven to 0.0 V -1 – 1 μA 
+pin driven to 3.4 V -1 – 1 μA 
+Output low voltage (VOL) open drain output, ILOAD = +5 mA – – 0.4 V 
+Pin capacitance See Note 9 – – 4 pF 
+AVS_CDAT, AVS_CLK 
+Input low voltage (VIL) CPU I/O Voltage (VDDIO) = 1.2 V – – 35% 
+VDDIO V 
+--- PAGE 14 ---
+  
+ 
+Final Datasheet 14 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Electrical specifications 
+R e s t r i c t e d 
+Parameter Test conditions Min Typ Max Units 
+Input high voltage (VIH) CPU I/O Voltage (VDDIO) = 1.2 V 65% 
+VDDIO – – V 
+Hysteresis voltage (VHYST) 
+CPU I/O Voltage (VDDIO) = 1.2 V 
+See Note 9 0.1 – – V 
+Input leakage current (IL) pin driven to VDDIO -10 – 10 μA 
+Pin capacitance See Note 9 – – 2 pF 
+AVS_TDAT 
+Output low voltage (VOL) CMOS driven, ILOAD = +4 mA – – 0.22 V 
+Output high voltage (VOH) CMOS driven, ILOAD = -4 mA VDDIO 
+– 0.22 – – V 
+EN_L1, EN_L2 
+Input low voltage (VIL)  – – 0.6 V 
+Input high voltage (VIH) See Note 8 0.7 – – V 
+Input current 
+ 
+pin driven to 0.0 V -1 – 1 μA 
+pin driven to 3.4 V -1 – 1 μA 
+PG_L1, PG_L2 
+Output low voltage (VOL) open drain output, ILOAD = +5 mA – – 0.4 V 
+Output current in Hi-Z state pin driven to +3.4 V -1 – 1 μA 
+SM_ALERT# 
+Output low voltage (VOL) CMOS driven, ILOAD = +5 mA – – 0.4 V 
+Output high voltage (VOH) CMOS driven, ILOAD = -5 mA 2.6 – – V 
+Output low voltage (VOL) open drain output, ILOAD = +5 mA – – 0.4 V 
+Output current in Hi-Z state pin driven to +3.4 V -1 – 1 μA 
+IMON_L1/L2 
+Output voltage range 
+RIMON < 1.6 kΩ, See note 9 
+ 0 to 1.05  V 
+Output current range  0 to 640  µA 
+Output current resolution  0.625  µA 
+IMON IDAC accuracy Tested at 100uA -3  3 % 
+Update rate 
+See note 9 
+ 25  MHz 
+Code zero offset  200  nA 
+VOSEN_L1/L2 (Voltage Sense Amplifier) 
+Input voltage range  – 0 to 3.5 – V 
+Input current VOSEN_L1/L2 = 2.5 V 70 – 300 μA 
+VORTN_L1/L2 
+Input voltage range  – -0.3 to 
+0.3 – V 
+--- PAGE 15 ---
+  
+ 
+Final Datasheet 15 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Electrical specifications 
+R e s t r i c t e d 
+Input current VORTN_L1/L2 = 0 V -120 – -10 μA 
+ISEN[x:1] (Integrated current sense) 
+Input voltage range  
+Internal 1 kΩ resistor enabled 
+See note 14 
+– -200 to 
++550 – mV 
+Internal 500 Ω resistor enabled 
+See note 14 
+ -100 to 
++450  mV 
+External 1 kΩ resistor with 
+Vmode enabled, See note 14 – -200 to 
++650 – mV 
+ISEN Input current Vmode enabled 
+VISEN = 1.85 V, See Note 10 – <1 – μA 
+ISEN Input resistance 
+Internal 1 kΩ resistor enabled 
+VISEN = 1.85 V, See Note 10 – 1 – kΩ 
+Internal 500 Ω resistor enabled 
+VISEN = 1.85 V, See Note 10 – 500 – Ω 
+Vmode 
+VISEN = 1.85 V, See Note 10  >1 – MΩ 
+ISEN accuracy 
+Internal 1 kΩ resistor enabled 
+Calibrated; 60A load 
+-5 °C ≤ TA ≤ 85 °C 
+See notes 10, 11, and 12 
+– ±1.9 – % 
+Internal 1 kΩ resistor enabled 
+Calibrated; 60A load 
+-40 °C ≤ TA ≤ 125 °C 
+See notes 10, 11, and 12 
+– ±2.1 – % 
+Internal 500 Ω resistor enabled 
+Calibrated; 144A load 
+-5 °C ≤ TA ≤ 85 °C 
+See notes 10, 11, and 12 
+– ±1.2 – % 
+Internal 500 Ω resistor enabled 
+Calibrated; 144A load 
+-40 °C ≤ TA ≤ 125 °C 
+See notes 10, 11, and 12 
+– ±1.6 – % 
+Internal 333 Ω resistor enabled 
+Calibrated; 180 A load 
+-5 °C ≤ TA ≤ 85 °C 
+See Note 10, 11, and 12 
+– ±1.9 – % 
+Internal 333 Ω resistor enabled 
+Calibrated; 180 A load 
+-40 °C ≤ TA ≤ 125 °C 
+See Note 10, 11, and 12 
+– ±2.3 – % 
+External 1 kΩ resistor with Vmode  
+Calibrated; 60A load 
+-5 °C ≤ TA ≤ 85 °C 
+See notes 10, 11, and 12 
+– ±2.0 – % 
+--- PAGE 16 ---
+  
+ 
+Final Datasheet 16 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Electrical specifications 
+R e s t r i c t e d 
+External 1 kΩ resistor with Vmode  
+Calibrated; 60A load 
+-40 °C ≤ TA ≤ 125 °C 
+See notes 10, 11, and 12 
+– ±2.2 – % 
+VAUX, VINSEN 
+Input resistance See note 9 – >1 – MΩ 
+Input voltage range  – 0 to 1.2 – V 
+ADDR 
+Measured voltage  
+See note 9 
+ 0 to 1.2  V 
+Current Measurement   0 to 640  μA 
+TSEN1, TSEN2 (for power stages with Integrated temperature sense) 
+Input Voltage Range  – 0 to 2.2 – V 
+Valid Temperature Range  – -40 to 
+200 – ºC 
+Sensor Reference Sensor Voltage at 25°C – 0.8 – V 
+Sensor Scale  – 8 – mV/ºC 
+Bias Current  TSEN1, TSEN2 = 1.2 V – -12 – μA 
+Driver Fault Threshold   2.2 2.4 2.6 V 
+Switching Frequency 
+Frequency range See note 9 250 – 3000 kHz 
+Frequency accuracy 
+TA = 25°C, VDD = 3.3V -2 – 2 % 
+-5 ≤ TA ≤ 85C, 2.97 V ≤ VDD ≤ 3.63 
+V; See note 9 -4 – 4 % 
+-40 ≤ TA ≤ 120C, 2.97 V ≤ VDD ≤ 
+3.63 V; See note 9 -7 – 7 % 
+System Set-point Accuracy 
+0.25 V ≤ VID ≤ 0.5 V See notes 9 and 13 – ±8 – mV  
+0.5 V < VID ≤ 0.75 V See notes 9 and 13 – ±5 – mV 
+0.75 V < VID ≤ 3.1 V  
+-5 °C ≤ TA ≤ 85 °C; 3.0 V ≤ VDD ≤ 3.6 
+V, VDD > VID + 200 mV, Typ = 3  ; 
+see notes 9 and 13 
+– 
+±0.5 
+– 
+% 
+0.75 V < VID ≤ 3.1 V -40 °C ≤ TA ≤ 125 °C; 3.0 V ≤ VDD ≤ 
+3.6 V, VDD > VID + 200 mV, Typ = 3 
+; see notes 9 and 13 
+– 
+±0.8 
+– 
+% 
+Fault Monitors 
+OUVP threshold accuracy See note 9 – ±20 – mV 
+Fixed OOVP threshold 
+accuracy 
+– ±20 – mV 
+--- PAGE 17 ---
+  
+ 
+Final Datasheet 17 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Electrical specifications 
+R e s t r i c t e d 
+Tracking OOVP threshold 
+accuracy 
+– ±20 – mV 
+OT threshold accuracy 
+TSENx = 100 °C (1.4 V) 
+See note 9 – ±3 – °C 
+VDD UVLO threshold VDD Rising – 2.78 2.95 V 
+ VDD Falling 2.5 2.7 – V 
+VDD UVLO hysteresis  – 80 – mV 
+Startup Timing 
+3.3V stable to controller ready See note 9 and 16 – 10 - ms 
+EN_Lx high to loopx start See note 9 –  300 μs 
+xVREN low to Loopx shutdown See note 9 -  300 μs 
+Common EN high to loopx 
+start   See notes 9 and 15   600 μs 
+Note:  
+8. These pins should not be left open. In most applications they should be driven by an open drain driver with an 
+external pull-up resistor. 
+9. Not subject to production test – verified by design and/or characterization. 
+10. Current sense reference voltage is 1.2V through the internal supply 
+11. Runtime offset calibration enabled, over -40 ≤ TA ≤ 85C, 2.97 V ≤ VDD ≤ 3.63 V; typical=3 sigma 
+12. External 1 kΩ tolerance is not included in the accuracy sec; internal 1 kΩ resistor error is included 
+13. Production test limits verified at 0.85 V, 1.1 V, 1.85 V. Full range not subject to production test. 
+14. For Isense input voltage ranges above +450 mV, the current sense DAC offset must be enabled 
+15. VR start is sequential with a common EN pin or when both EN_Lx pins are asserted simultaneously.  Loop1 will 
+start 300us after EN and loop2 will start 300us after loop1 
+16. For standard production parts with default firmware patch 
+ 
+ 
+ 
+--- PAGE 18 ---
+  
+ 
+Final Datasheet 18 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Theory of operation 
+R e s t r i c t e d 
+7 Theory of operation 
+7.1 Startup configuration 
+The XDPE1A2G5 is a digital power management controller with a firmware-based state-machine (See figure 
+below). Operation is controlled by application specific firmware and configuration settings stored in ROM and 
+NVM, then loaded into RAM and control registers during initialization. Configuration and firmware updates are 
+supported, but the number of reprogramming cycles is limited. See Section 8.17 for more details on 
+Configuration Management. 
+ 
+Figure 5 State machine 
+7.2 Power-up configuration 
+Operating from a single +3.3 V (VDD) supply to the controller, an on-chip regulator generates an internal +1.2 V 
+voltage. Controller operation is initialized by an internal threshold-based power-on reset circuit. During 
+controller configuration, the contents of the NVM are downloaded into the control registers. During this period, 
+the PWM outputs are held in high impedance (Hi-Z) state, allowing board pull-up or pull-down resistors to set 
+the correct default levels for static input signals. To ensure no sensitive analog measurements such as XValent 
+resistor decoding is executed prior to 3.3 V supply is settled, the controller provides a delay which extends the 
+“Configuration/NVM Download” state between power-on reset and entering the Initialization state. This delay 
+is used to ensure the internal analog circuitry settles before making any precision measurements that are 
+performed in the next state. 
+ 
+Power On
+Reset
+Initialization
+Inactive
+Soft_Start
+Shutdown
+Ton_delay
+Active
+Regulation
+Configuration/
+NVM Download
+--- PAGE 19 ---
+  
+ 
+Final Datasheet 19 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Theory of operation 
+R e s t r i c t e d 
+7.3 Initialization 
+During the Initialization state, the controller measures the external temperatures, input voltage, and executes 
+the various calibration routines within the IC. Prior to exiting the Initialization state, the controller performs the 
+external resistor pin set measurement that determines the PMBus (see Table 36) address. To properly set the 
+device address, a resistor with at least a 1% tolerance must be connected from the ADDR pin to ground. 
+7.4 Inactive state and TON_DELAY 
+Upon completion of the Initialization process, the controller will enter the Inactive State. Before the system can 
+be started, the controller will verify that the following conditions are satisfied: 
+1. VDD > 2.95 V (start threshold) 
+2. No shutdown faults are asserted that are defined in the programmed shutdown mask. 
+3. VIN > VIN_ON threshold 
+4. VAUX > VAUX_ON threshold (if pin is configured for Vaux sensing) 
+5. Assertion of EN_Lx: It is recommended that EN_Lx be asserted only after VDD, VIN and power supplies for 
+the power stages are ready.  EN_Lx is generally pulled up with an external resistor to the 3.3 V controller 
+supply, but it is also compatible with a low voltage pull-up (e.g. 1.8 V) to allow for flexibility in system-level 
+sequencing. 
+6. Optionally, the XDPE1A2G5 controller may also be configured to wait for TSEN inputs to rise above 0.4 V (the 
+valid temperature range) and/or the PWM voltage to rise above 1.0 V (indicating the trivalent bias resistor 
+pull-up supply is valid) on all phases.  This allows the power stage driver to indicate its readiness via its 
+TOUT or PWM I/O.  Alternatively, the XDPE1A2G5 controller may be configured to auto detect populated 
+phases, where the PWM voltage indicates the presence of populated phases and the controller may start up 
+with just the phases that were detected.  
+Once the above startup conditions are satisfied, the controller will wait for a programmable period of time 
+(TON_DELAY) before ramping up the output voltage.  
+7.5 Soft-start 
+Prior to entering the Active Regulation state, the controller performs a controlled, monotonic Soft-Start ramp 
+of the voltage output. At the onset of Soft-Start, the controller will perform a pre-bias condition measurement 
+of the output voltage. The controller will set the initial startup ramp voltage at the appropriate level so that it 
+will not sink current from the pre-biased output. Soft-Start is performed by actively regulating the output 
+voltage while digitally ramping up a reference voltage from the measured pre-biased voltage to its final target 
+value.  
+For the case when Vboot is a nonzero value, the output voltage will ramp to Vboot and assert the PG_Lx pin 
+when the voltage ramps above the POWER_GOOD_ON threshold. The voltage will ramp at the rate set by the 
+TON_RISE setting.  
+ 
+7.6 Active regulation 
+Each rail of the controller implements a variable switching frequency, digital PID current mode voltage error 
+control loop and inner digital PI current control loop, input voltage feedforward and dual-edge PWM 
+architecture. During operation, the output voltage is sensed differentially and digitized by a precision analog-
+to-digital converter (ADC). The resultant digital error signal is then fed into a digital PID compensator. 
+The locations of the poles and zeroes are determined by the digital loop coefficients Kp, Ki, Kd, Kfp1 and Kfp2, 
+which are the PID (proportional, integral, and derivative) and low pass filter pole terms, respectively.   
+--- PAGE 20 ---
+  
+ 
+Final Datasheet 20 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Theory of operation 
+R e s t r i c t e d 
+ The output of the PID compensator is scaled by 1 / Nph and becomes the target current for each phase.  The 
+target current is compared against the measured sense current, and this error current feeds a PI compensator 
+for each phase to generate a delta pulse width value that is combined with the feedforward duty cycle 
+computation to determine the cycle width.   
+ The cycle width for each phase current loop is converted to a PWM pulse using a digital dual-edge pulse width 
+modulator, with programmable maximum duty cycle limit and phase current limit capability.  In addition to 
+using this dual edge modulation scheme, the XDPTM controller also includes non-linear control mechanisms 
+such as variable frequency and diode body braking high speed transient control, and frequency active transient 
+response (FATR), to minimize voltage excursions during transient and repetitive transient events. 
+7.7 Shutdown 
+The shut-down state can be entered from either soft-start or active regulation states through user intervention 
+(de-asserting EN_Lx) or through a detected fault including OTP, OCP, IUVP, OOVP and OUVP conditions. The 
+controller’s two rails may be programmed to shut down together or independently in case of a fault condition.  
+The XDPE1A2G5 controller supports two user selectable shutdown options in response to de-assertion of 
+EN_Lx. The first option is a closed-loop shutdown where the controller ramps down the output voltage at a user 
+defined slew rate. Once the output voltage has ramped to below 200 mV, the controller would switch off the 
+output power stage FETs to avoid undershoot below GND due to residual inductor current. The second option 
+is a hard-shutdown (Hi-Z) response, where the output stage power FETs are immediately switched off. In either 
+case, the EN_Lx inputs are deglitched using the TOFF_DELAY setting to provide immunity to errant shutdowns 
+due to noise on these pins. If immediate shut-down is required, TOFF_DELAY should be set to 0 msec. For cases 
+where the shutdown is caused by a fault, the resultant shutdown response is always Hi-Z except for OOVP, in 
+which case the low side FETs are turned on under this condition. 
+7.8 PWM output configuration 
+The switching frequencies for the rails are independently selectable and configurable by setting the 
+appropriate register values for each rail output. PWM outputs are 3.3 V compatible trivalent signals which are 
+set to high impedance during reset, configuration, initialization, and inactive states. PWM outputs can be 
+assigned to any phase channel and to either loop. The multi-phase PWM output signals are flexible and can be 
+configured to fire in any order that is required to take advantage of input and output ripple cancellation by 
+interleaving adjacent phases, or to facilitate PCB layout. 
+ 
+Table 8 PWM Channel Selection for typical Loop Configurations 
+Loop 
+Configuration 
+Loop A Phase Map 
+Setting 
+Loop A Phase 
+Channels 
+Loop B Phase Map 
+Setting 
+Loop B Phase 
+Channels 
+1+0 0x0001 1 0x0000 na 
+2+0 0x0003 1, 2 0x0000 na 
+…     
+16+0 0xFFFF 1 - 16 0x0000 na 
+1+1 0x0001 1 0x8000 16 
+2+1 0x0003 1, 2 0x8000 16 
+…     
+15+1 0x7FFF 1 - 15 0x8000 16 
+14+2 0x3FFF 1 - 14 0xC000 15, 16 
+12+4 0x0FFF 1 - 12 0xF000 13, 14, 15, 16 
+--- PAGE 21 ---
+  
+ 
+Final Datasheet 21 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Theory of operation 
+R e s t r i c t e d 
+Loop 
+Configuration 
+Loop A Phase Map 
+Setting 
+Loop A Phase 
+Channels 
+Loop B Phase Map 
+Setting 
+Loop B Phase 
+Channels 
+8+8 0x00FF 1 - 8 0xFF00 9 - 16 
+ 
+ 
+ 
+ 
+ 
+ 
+--- PAGE 22 ---
+  
+ 
+Final Datasheet 22 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+8 Application information 
+8.1 Input power sense 
+The XDPE1A2G5 controller provides the capability to estimate the input power consumption of the individual 
+voltage regulator. The input power supply voltage is monitored via VINSEN for feedforward control, telemetry, 
+power sequencing, and fault detection.  Input power is obtained by multiplying the measured input voltage by 
+the estimated the input current.  
+ 
+13 kW
+1 kW10 nF
+VIN Digita l Controller
+VINSEN
+0 to 1.2V
+ 
+Figure 6 VINSEN monitoring 
+8.2 Differential output voltage sense (VOSEN_Lx / VORTN_Lx) 
+The differentially sensed remote output voltage of each rail (VOSEN_Lx/VORTN_Lx) is used for PID loop 
+compensation, over voltage fault protection, and telemetry. The output voltages of all rails are sensed 
+differentially and converted to a digital representation over a range of 0 to 3.1 V using a high speed, precision 
+analog-to-digital converter (ADC).  An on-chip factory trimmed temperature compensated bandgap voltage 
+reference ensures precise set-point accuracy.  
+It is advantageous to add a higher bandwidth external RC filter network to increase the attenuation of high 
+frequency noise that may couple onto the voltage sense lines. This additional filter provides minimal phase 
+margin impact on the feedback loop. If such an additional filter is used, it is recommended that values of Rext = 
+10 Ω and Cext = 220 pF be used. 
+ 
+Digital Controller
+10K 10K
+0.65 V
+Rext
+Cext Rload
+VOSEN_Lx
+VORTN_Lx
+Vout
+ 
+Figure 7 Output voltage sense internal impedance and external filtering 
+ 
+--- PAGE 23 ---
+  
+ 
+Final Datasheet 23 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+8.3 Output phase current sense (ISENx) 
+The phase current sense circuitry converts the differential signal of the remote current sense connected to the 
+ISENx pins and the VD12 pin as a reference into a digital representation of the instantaneous phase current. 
+The phase currents are used for current-mode control, computing total output current, current monitoring, 
+telemetry, adaptive voltage positioning (AVP), phase current balance, phase error detection, positive and 
+negative current limit, output over-current protection, and load adaptive response (auto phase shedding). The 
+phase currents can be temperature compensated based on the internal die temperature of the controller. This 
+insures that the integrated 1 kΩ resistors at each ISENx input are well compensated over the full temperature 
+range. Current sense gain and offset parameters are trimmed at ATE which ensures a high degree of accuracy. 
+Offset parameters are also continuously calibrated during controller operation to ensure good accuracy with 
+varying operating conditions. 
+Integrated current sense is a scheme using a power stage which incorporates a current or voltage output, 
+IMON, proportional to the output current through the power stage high-side and low-side transistors. Some of 
+Infineon’s integrated power stages vary their IMON gain as a function of output voltage (Duty Cycle), VDRV 
+voltage, and current. The XDPE1A2G5 controller has implemented controls to compensate the varying IMON 
+gain and produce exceptional phase current measuring accuracy. 
+Figure 8 shows the recommended method to connect the integrated current sense signals between the 
+XDPE1A2G5 controller and an integrated power stage. The controller supports an input signal range for 
+integrated current sense of -200 mV to +650 mV (+550mV with the internal 1 kΩ) with 1750 µV resolution. This 
+provides a phase current range of -40 A to +130 A (110 A with the internal 1 kΩ) with 0.35 A resolution.  The 
+integrated power stage IMON pin output is a transconductance output of 5 µA/A.  
+ 
+ 
+Digital Controller
+PWM
+TSEN
+ISEN
+VD12
+PWM
+TMON/FLT
+IMON
+IMONREF
+L
+VOUT
+VDRV/VCC VIN
+Integrated Power Stage
+VREF
+1K
+100pF
+Optional  
+Figure 8 Recommended connections between integrated power stage and controller 
+The XDPE1A2G5C allows the user to parallel as many as four power stages on each PWM pin.  The max phase 
+current shown in Tables 9 and 10 is the total phase current for all paralleled power stages.   
+--- PAGE 24 ---
+  
+ 
+Final Datasheet 24 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+ 
+Table 9 Maximum Positive Phase Current 
+Paralleled 
+Power 
+stages 
+Resistor 
+Location 
+Resistor 
+(Ω) 
+Max Sense 
+Voltage (mV) 
+Max Phase 
+Current (A) 
+Max Output 
+Current (A) 
+Internal Vref 
+Isink (mA) 
+VD12 pin 
+Isink (mA) 
+3 Internal 333 333 200 3200 -16 NA 
+2 Internal 500 450 180 2880 -14.4 NA 
+1 Internal 1000 550 110 1760 -10.4 NA 
+4 External 250 650 520 8320 NA -40 
+ 
+Table 10 Maximum Negative Phase Current 
+Paralleled 
+Power 
+stages 
+Resistor 
+Location 
+Resistor 
+(Ω) 
+Min Sense 
+Voltage (mV) 
+Min Phase 
+Current (A) 
+Max Sink 
+Current (A) 
+Internal Vref 
+Isource (mA) 
+VD12 pin 
+Isource (mA) 
+3 Internal 333 -66 -40 -640 3.2 NA 
+2 Internal 500 -100 -40 -640 3.2 NA 
+1 Internal 1000 -200 -40 -640 3.2 NA 
+4 External 250 -200 -40 -200 NA 1 
+8.3.1 Support for output current greater than 2048A 
+The XDPE1A2G5C has firmware and hardware updates that allow the controller to be used in applications with 
+output currents greater than 2048A.  Register tlm()_lp_iout_scale sets the max output current. The max 
+supported loop output current is shown in Table 11 
+Table 11 Max Output Current per loop 
+Tlm()_lp_iout_scale (hex) Loop A (tlm0_lp_iout_scale) Loop B (tlm1_lp_iout_scale) 
+0 2048 1024 
+1 4096 2048 
+2 8192 4096 
+3 reserved reserved 
+ 
+The following registers are not scaled by the tlm_lp_iout_scale register and need to be scaled external  
+Table 12 Registers requiring external scaling  
+Section Access Register Name Register Address Required Action 
+PMBUS 
+Read/write 
+FW_CONFIG_REGULATION. 
+MFR_RDROOP_IDELTA_SEG3 
+0xC5 [111:96] 
+Write a value that is 
+1/(1+tlm_lp_iout_scale)  
+the required value 
+FW_CONFIG_REGULATION. 
+MFR_RDROOP_ITHR_SEG2 
+0xC5 [95:80] 
+config 
+Mod0_phase2_delta 0x70000C0C [9:5] 
+Mod1_phase2_delta 0x7000100C [9:5] 
+Mod0_phase3_delta 0x70000C0C [14:10] 
+--- PAGE 25 ---
+  
+ 
+Final Datasheet 25 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Section Access Register Name Register Address Required Action 
+Mod1_phase3_delta 0x7000100C [14:10] 
+Mod0_phase4_delta 0x70000C0C [19_15] 
+Mod1_phase4_delta 0x7000100C [19_15] 
+Mod0_phase5_delta 0x70000C0C [24:20] 
+Mod1_phase5_delta 0x7000100C [24:20] 
+Mod0_phase6_delta 0x70000C0C [29:25] 
+Mod1_phase6_delta 0x7000100C [29:25] 
+Mod0_phase7_delta 0x70000C10 [4:0] 
+Mod1_phase7_delta 0x70001010 [4:0] 
+Mod0_phase8_delta 0x70000C10 [9:5] 
+Mod1_phase8_delta 0x70001010 [9:5] 
+Tlm_imon_l1_max 0x70002044 [12:2] 
+Tlm_imon_l2_max 0x70002048 [12:2] 
+Mod0_ce_ni_thresh 0x70000C40 [17:12] 
+Mod1_ce_ni_thresh 0x70001040 [17:12] 
+ 
+ 
+ 
+ 
+ 
+Read only 
+Ip1_adc_lpf 0x70007464 [13:0] 
+ 
+ 
+ 
+ 
+Multiply register 
+reading by 
+(1+tlm_lp_iout_scale) 
+for correct phase 
+current 
+Ip2_adc_lpf 0x70007464 [27:14] 
+Ip3_adc_lpf 0x70007468 [13:0] 
+Ip4_adc_lpf 0x70007468 [27:14] 
+Ip5_adc_lpf 0x7000746C [13:0] 
+Ip6_adc_lpf  0x7000746C [27:14] 
+Ip7_adc_lpf 0x70007470 [13:0] 
+Ip8_adc_lpf 0x70007470 [27:14] 
+Ip9_adc_lpf 0x70007474 [13:0] 
+Ip10_adc_lpf 0x70007474 [27:14] 
+Ip11_adc_lpf 0x70007478 [13:0] 
+Ip12_adc_lpf 0x70007478 [27:14] 
+Ip13_adc_lpf 0x7000747C [13:0] 
+Ip14_adc_lpf 0x7000747C [27:14] 
+Ip15_adc_lpf 0x70007480 [13:0] 
+Ip16_adc_lpf 0x70007480 [27:14] 
+ 
+ 
+The controller produces an internal synthesized current based on the externally sensed phase current from the 
+power stages and the internally created emulated current. The controls, as shown in Figure 9, are available to 
+configure the device to produce accurate synthesized current based on the inductors and power stage drivers 
+used. Controls for both Standard and TLVR inductor designs are available. 
+ 
+--- PAGE 26 ---
+  
+ 
+Final Datasheet 26 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+IADC &
+Isynth
+Power Stage
+1
+Power Stage
+n
+Iphase1
+Iphasen
+Isynth1
+Isynthn
+Lo Slope K-track 
+Control
+Driver 
+Delays
+Lc Slope
+Lo1
+Lon
+Lc
+Vout
+* TLVR Configuration
+.
+.
+.
+ 
+Figure 9 Synthesized current controls 
+ 
+ 
+Table 13 Isynth controls 
+Controls Description 
+Lo Slope Sets the value of the output inductor so that the expected slope of the inductor 
+current can be used to accurately create the emulated current 
+K-track Control Sets the gain terms to control how quickly the emulated current is modified based 
+on the error of the sensed current versus the present emulated current. Gain terms 
+are available for PWM ON, OFF, and Tri-state conditions. 
+Driver Delays Sets the positive, negative, and tri-state delays based on the power stage driver 
+used. This compensates for the PWM to Switch Node delays and any IMON delays of 
+the power stage. 
+Lc Slope Sets the value of the Lc Inductor used in a TLVR design so that the expected slope of 
+the contributing inductor current can be used to accurately create the emulated 
+current 
+ 
+8.4 Temperature sense (TSENx, Internal) 
+XDPE1A2G5 controllers provide the capability to measure the temperature of up to two external temperature 
+sensors. The temperature sensors are connected through the TSENx pins from the TMON output of an 
+integrated power stage.  In the case of TDA21570 or equivalent power stages, this voltage is at a nominal value 
+of 0.8 V @ 25 °C and a temperature slope of 8 mV/°C. The TMON (temperature output) pins of multiple power 
+stages are OR-tied together so that the power stage with the hottest temperature (highest TMON voltage) will 
+drive the signal line to the controller TSENx pin. 
+Additionally, the power stage is able to provide catastrophic over temperature protection within the power 
+stage itself to quickly trigger VR shutdown in case of temperatures exceeding the allowed junction limit. This is 
+accomplished by the power stage driving its TMON/FLT to 3.3 V. The controller will respond to this when the 
+TSENx voltage goes greater than 2.4 V typically. 
+In additional to the two external temperature sense inputs, the XDPE1A2G5 incorporates an internal die 
+temperature sensor (TSEN_INT). This is useful for local temperature monitoring, and for using the die 
+temperature in device characterization and ATE trimming. 
+--- PAGE 27 ---
+  
+ 
+Final Datasheet 27 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Each temperature sensor input can be configured as the Fault or Telemetry source for Loop A or Loop B as 
+shown in Table 14. This is configured through the PMBus command MFR_SELECT_TEMPERATURE_SENSOR 
+(CCh). 
+Table 14 Temperature Sensor Select 
+Function Loop A or B Source Select 
+FAULT 0 – TSEN1 
+1 – TSEN2 
+2 – TSEN_INT 
+READ_TEMPERATURE_1, READ_TEMPERATURE_2 0 – TSEN1, TSEN2 
+1 – TSEN1, TSEN_INT 
+2 – TSEN2, TSEN1 
+3 – TSEN2, TSEN_INT 
+4 – TSEN_INT, TSEN1 
+5 – TSEN_INT, TSEN2 
+ 
+8.5 Auxiliary voltage sense (VAUX) 
+The XDPE1A2G5 supports monitoring of an auxiliary supply rail (typically used to monitor Power Stage 
+VDRV/VCC to control sequencing). The supply voltage on the VAUX pin is compared against a programmable 
+threshold. Once the rising VAUX voltage crosses the turn-on threshold (Vaux ON) and ENx is asserted, all PWM 
+outputs become active when there are no faults in the VR. The VAUX supply voltage is valid until it falls below 
+the programmed turn-off level (Vaux UV). 
+A 6.4:1 attenuation network is connected to the VAUX pin as shown in Figure 10. Recommended values for a 5V 
+system are R1=5.36 kΩ and R2=1 kΩ, with a 1% tolerance or better. C1 is required to have a minimum 1nF for 
+noise suppression, with a maximum value of 10nF. 
+ 
+5.36 kW
+1 kW10 nF
+VDRV/VCC (Power Stage) Digita l Controller
+VAUX
+0 to 1.2V
+ 
+Figure 10 VAUX sense resistor divider network 
+8.6 AVSBus 
+8.6.1 Interface 
+The XDPE1A2G5 implements a fully compliant AVSBus interface  with an AVS clock frequency up to 25MHz. See 
+section 8.6.3.1 for details for operation with AVS clock frequencies up to 50MHz. This is typically a three -wire 
+interface between a processor and a VR that consists of clock, controller data and target data signals. (Figure 
+11) The XDPE1A2G5 implements all the required AVSBus commands per PMBus Rev 1. 4 Part III. A list of 
+supported commands is shown in Table 17.  
+--- PAGE 28 ---
+  
+ 
+Final Datasheet 28 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Alternatively, a 2 -wire interface ( Figure 12) can be implemented making the target data signal optional. This 
+renders the system incapable of sending data back to the controller, but may be useful in simplifying the bus 
+interface. 
+ 
+ 
+Figure 11 AVSBus 3-wire Interface 
+ 
+ 
+Figure 12 AVSBus 2-wire Interface 
+8.6.2 Operation 
+The interface operation consists of compl ementary functions in the controller and the target devices. The 
+AVSBus Controller must initiate all data transfers and it must guarantee that AVS_ CData is held at a logic value 
+‘1’ when the clock is not running. This must occur during initialization prior to any bus transfers, as well as 
+during idling between frames. AVS_CData is not allowed to be at a logic value ‘0’ when the clock starts. 
+The AVSBus Target listens for and may respo nd to controller commands but cannot initiate a transfer under 
+any circumstances. In general , the target must guarantee that AVS_ TData is held at a logic value ‘1’ when the 
+clock is not running. This must occur during initialization prior to any bus transf ers, between frames, as well as 
+at any time during a transfer when the target is not sending data to the controller. An exception to this rule is 
+that the AVSBus Target will set AVS_ TData to a logic value ‘0’ when it needs to alert the AVSBus Controller to 
+start a frame so that it can send a “Status Response Frame” 
+The XDPE1A2G5 implements mechanisms that allow recovery of the bus in case noise or some other artifact 
+causes the bus to enter an incorrect state. One mechanism is target resynchronization. After receiving 34 clocks 
+while the AVS_Cdata is held high, the device will resynchronize its bus interface and wait for the next start code. 
+The second mechanism is a Bus Timeout. When the device determines that an ongoing transfer has been 
+effectively aborted because the clock stopped running for a user programmable amount of time ( timeout), the 
+device will reset the bus interface and again wait for the next start code. 
+
+--- PAGE 29 ---
+  
+ 
+Final Datasheet 29 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+8.6.3 Electrical Interface 
+The XDPE1A2G5 will accept clock and data signals from the controller driven to the VDDIO level and will also 
+provide its data to the controller, also driven to the VDDIO level. This is shown in Figure 14.  
+8.6.3.1 Timing 
+Both the controller and target launch data from the rising edge of the clock.  The XDPE1A2G5C (target) captures 
+data on the clock falling edge.  The AVS controller can capture data at any time between the clock falling edge 
+and the rising edge of the following clock.   
+ 
+ 
+Figure 13 Timing diagram for AVS_TData 
+The timing diagram shows a skew in the clock and data lines, t delay, which corresponds to the transmission 
+delays on the board. A comparable delay affects the data lines. Setup a nd hold times are measured at the pads 
+of the controller or target, as pertinent. 
+Table 15  
+Parameter Description Min. Typ. Max. Units 
+tp Period for active clock 20  200 ns 
+thigh Duration of the high-phase of clock 40   % tp 
+tlow Duration of the low-phase of clock 30   % tp 
+Target to Controller data path 
+tlaunch-target Time from rising clock edge in target to data-
+out transition at target’s data-out port 
+ 6 11 ns 
+tsetup-controller Time from data-out edge in target to capture 
+clock edge in controller 
+0   % tp 
+thold-controller Time from capture clock edge in controller to 
+data –out edge in target (for next bit) 
+20   % tp 
+  
+Due to transmission delays, clock and data rise and fall times, and tlaunch-target delays, 50MHz operation requires 
+that the target data be clocked into the controller at some point in time after the falling edge of the clock pulse.  
+
+--- PAGE 30 ---
+  
+ 
+Final Datasheet 30 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+The target holds the data on the TDATA line until the next clock rising edge (plus tlaunch-target). So, the controller 
+can clock in the target data at any time after the clock falling edge up to and including the rising edge of the 
+following clock pulse  
+8.6.3.2 Electrical Drive Levels 
+ 
+ 
+Figure 14 Electrical Interface 
+The threshold levels for the incoming clock and controller data lines  are set by the VDDIO voltage level . The 
+nominal levels are shown in Table 16 
+ 
+Table 16 Nominal Clock and Data Threshold Levels 
+Nominal VDDIO Vil Vil 
+1 V 0.35 V 0.65 V 
+1.2 V 0.42 V 0.78 V 
+1.5 V 0.53 V 0.98 V 
+1.8 V 0.63 V 1.17 V 
+ 
+ 
+8.6.4 AVSBus Status Alert Mask 
+The XDPE1A2G5 Target will alert the Controller that its status has changed by asserting the AVS_ TDATA low. 
+This will happen when the following Warnings or Fault bits are set. 
+• OCW = Output Over-current Warning (STATUS_IOUT, bit 5) 
+• UVW = Output Under-voltage Warning (STATUS_VOUT, bit 5) 
+• OTW = Over-temperature Warning (STATUS_TEMP, bit 6) 
+• OPW = Output Over-power Warning (STATUS_IOUT, bit 0) 
+• Faults or Warnings in MFR_SPECIFIC (STATUS_MFR_SPECIFIC, bits 7:0) 
+The XDPE1A2G5 has a Mask Register that can mask any or all chosen warnings or faults listed above. Setting the 
+associated bit to a ‘1’ will mask that warni ng or fault from asserting the AVS_ TDATA low. The Status Alert and 
+specific warning bits will still be set and can be seen when an AVS Status Read command is performed. 
+
+--- PAGE 31 ---
+  
+ 
+Final Datasheet 31 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+8.6.5 AVSBus Command Group 
+Table 17 AVSBus Command Group 0b 
+Data 
+Types 
+Command 
+Name 
+Transaction 
+Type 
+Range/Resolution Description 
+0000b Voltage Read/Write 
+16-bit 
+unsigned integer 
+field with 1 LSB = 
+1 mV 
+This type allows the AVSBus Controller 
+to read or write a new voltage target for 
+a rail on an AVSBus Target. 
+0001b 
+Vout 
+Transition 
+Rate 
+Read/Write 
+8-bit 
+unsigned integer 
+field with 1 LSB = 
+1 mV/µs 
+This type allows the AVSBus Controller 
+to read or write a new transition rate for 
+a rail on an AVSBus Target. 
+0010b Current Read 
+16-bit 
+unsigned integer 
+field with 1 LSB = 
+see Table 19 
+This type allows the AVSBus Controller 
+to read the current for a rail on an 
+AVSBus Target. Writes are not 
+supported. 
+0011b Temperature Read 
+16-bit 
+signed integer 
+field with 1 LSB = 
+0.1 ˚C 
+This type allows the AVSBus Controller 
+to read the temperature for a rail on an 
+AVSBus Target. Writes are not 
+supported. 
+0100b Voltage Reset Write All 0’s 
+This type allows the AVSBus Controller 
+to force a “Predetermined Value” for an 
+AVSBus Target rail, particularly while 
+handling exceptions that could 
+otherwise cause damage. The 
+“Predetermined Value” is set by PMBus 
+VOUT_COMMAND. 
+0101b Power Mode Read/Write 000b – 111b 
+This type allows the AVSBus Controller 
+to set the mode of operation for the 
+output of an AVSBus Target rail. The 
+Power Mode settings are the same as the 
+PMBus Power Mode descriptions. 
+0110b Reserved for 
+Future Use    
+0111b Reserved for 
+Future Use    
+1000b Reserved for 
+Future Use    
+1001b Reserved for 
+Future Use    
+1010b Reserved for 
+Future Use 
+   
+1011b Reserved for 
+Future Use 
+   
+--- PAGE 32 ---
+  
+ 
+Final Datasheet 32 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Data 
+Types 
+Command 
+Name 
+Transaction 
+Type 
+Range/Resolution Description 
+1100b Reserved for 
+Future Use 
+   
+1101b Reserved for 
+Future Use 
+   
+1110b AVSBus Status Read/Write <VDONE> 
+<OCW> 
+<UVW> 
+<OTW> 
+<OPW> 
+<RSV_3> 
+<MFR_SPEC_8> 
+ 
+This type allows the AVSBus Controller 
+to read the <AVSBus_Status> of an 
+AVSBus Target, or to clear the target’s 
+<AVSBus_Status> by a write. When 
+writing to this data type, all Status bits 
+written with a 1(binary) are cleared. All 
+others remain unchanged. Persistent 
+faults will be immediately re-asserted. 
+MFR_SPEC_8 = PMBus 
+STATUS_MFR_SPECIFIC Register. 
+1111b AVSBus 
+Version 
+Read 0001b This type allows the AVSBus Controller 
+to read the version of AVSBus 
+implemented by an AVSBus Target. 
+ 
+ 
+Table 18 MFR Specific Commands. Command Group 1b 
+CmdGroup CmdDataType Description Comments 
+1 0x0 Read Input Current  See Table 20 for resolution setting 
+1 0x1 Read Input Voltage See Table 23 for resolution setting 
+1 0x2 Read Actual Output 
+Voltage 
+See Table 24 for resolution setting 
+1 0x3 Read Output Power See Table 21 for resolution setting 
+1 0x4 Read Input Power See Table 22 for resolution setting 
+1 0x5 Read Aux Voltage 125mV per lsb 
+1 0x8 Read and Write 
+load line  
+Linear 16 format; 0.25 µΩ lsb. See Table 34 for actual 
+load line resolution settings. The power on reset (POR) 
+load line is set by the PMBus VOUT_DROOP command.  
+The load line can be updated with the VOUT_DROOP 
+command until an AVS load line command is written.  
+After an AVS load line command is sent, the 
+VOUT_DROOP command is ignored until the next POR 
+1 0x9 Read minimum 
+output current 
+Same resolution as READ IOUT 
+1 0xA Read maximum 
+output current 
+Same resolution as READ IOUT.  Reading this command 
+clears min and max IOUT  
+1 0xB Read minimum 
+output voltage 
+Lsb resolution is 0.122mV 
+1 0xC Read maximum 
+output voltage 
+Lsb resolution is 0.122mV.  Reading this command 
+clears min and max VOUT 
+1 0xD Read MFR_REV Returns value in PMBus command 0x9B 
+--- PAGE 33 ---
+  
+ 
+Final Datasheet 33 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+CmdGroup CmdDataType Description Comments 
+1 0xE Read MFR_MODEL Returns value in PMBus command 0x9A 
+1 0xF Read MFR_ID Returns value in PMBus command 0x99 
+The MFR read commands (Table 18) in the XDPE1A2G5C have a resolution that can be set by the user.  Table 19 
+to Table 24 below show the telemetry resolution and the register settings 
+Table 19 Read IOUT 
+LSB tlm_iout_hs_telem_gain_exp tlm_iout_hs_telem_gain_man 
+10 mA 0x37 0xC80 
+20 mA 0x36 0xC80 
+40 mA 0x35 0xC80 
+50 mA 0x35 0xA00 
+100 mA 0x34 0xA00 
+ 
+Table 20 Read IIN 
+LSB tlm_iin_hs_telem_gain_exp tlm_iin_hs_telem_gain_man 
+10 mA 0x37 0xC80 
+20 mA 0x36 0xC80 
+40 mA 0x35 0xC80 
+50 mA 0x35 0xA00 
+100 mA 0x34 0xA00 
+Table 21 Read POUT 
+LSB tlm_pout_hs_telem_gain_exp tlm_pout_hs_telem_gain_man 
+10 mW 0x37 0xC80 
+20 mW 0x36 0xC80 
+40 mW 0x35 0xC80 
+50 mW 0x35 0xA00 
+100 mW 0x34 0xA00 
+Table 22 Read PIN 
+LSB tlm_pin_hs_telem_gain_exp tlm_pin_hs_telem_gain_man 
+10 mW 0x37 0xC80 
+20 mW 0x36 0xC80 
+40 mW 0x35 0xC80 
+50 mW 0x35 0xA00 
+100 mW 0x34 0xA00 
+Table 23 Read VIN 
+LSB tlm_vin_hs_telem_gain_exp tlm_vin_hs_telem_gain_man 
+1 mV 0x3A 0xFA0 
+10 mV 0x37 0xC80 
+--- PAGE 34 ---
+  
+ 
+Final Datasheet 34 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Table 24 Read VOUT 
+LSB tlm_vout_hs_telem_gain_exp tlm_vout_hs_telem_gain_man 
+1 mV 0x3A 0xFA0 
+10 mV 0x37 0xC80 
+ 
+ 
+8.6.6 AVSBus Addressing 
+ 
+The XDPE1A2G5 can control two loops with one device. This requires addressing control to differentiate 
+between the two loops that use the same AVSBus interface. This is accomplished by address registers 
+0x70004004 [3:0] for Loop1 and 0x70004404 [3:0] for Loop2 that can be set to a value of 0 – 14 for each loop. 
+Note that address 15 should not be used since this is the all call address on the AVSBus. 
+Table 25 AVS Address Registers 
+Register Description Value 
+0x70004004[3:0] AVSBus Address Loop1 0 to 14 
+0x70004404[3:0] AVSBus Address Loop2 0 to 14 
+ 
+8.6.7 VOUT transition rate 
+The XDPE1A2G5 supports dynamic VID changes by writing to the AVS ‘VOLTAGE’ command. The DVID slew rate 
+is set by writing to the AVS ‘VOUT TRANSITION RATE’ command.  The slew rate can be set as low as 1 mV/µs up 
+to 50 mV/µs.  The practical limit of the slew rate will be determined by the number of phases, per phase 
+inductance, and the total output capacitance. 
+During dynamic VID changes to a higher value, the tracking output over voltage protection (OOVP) is 
+temporarily disabled. However, the fixed OOVP remains enabled.   
+8.7 Phase Add/Drop: Autonomous 
+The XDPE1A2G5 controller provides a selectable autonomous phase add/drop feature. By comparing the total 
+measured current with a set of user programmable thresholds, the controller will autonomously add or drop 
+phases. Phases are added or dropped one at a time based on the current level.  
+Two types of user programmable parameters are provided for current based autonomous phase control: 
+1. The threshold parameter determines the current level at which a phase is added. 
+2. The hysteresis parameter, when subtracted from the threshold, determines the current level at which a 
+phase is dropped. Independent threshold parameters are provided for each phase count transition. There is a 
+single hysteresis parameter (6 A or 10 A) for all phase count transitions. 
+In addition to the phase add method described above, the XDPE1A2G5 controller provides the following 
+methods for immediate phase adding which helps to improve transient performance: 
+1. When error voltage exceeds a programmable threshold (ATRH Entry Threshold).  
+2. During DVID events. 
+--- PAGE 35 ---
+  
+ 
+Final Datasheet 35 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Due to the different output configurations of the power stage when in a reduced phase count state, the Pole 
+filters are automatically scaled based on the active phase count, and there are an independent set of PID and 
+Pole filter settings for single phase count for optimal transient performance. 
+8.8 Linear loop compensation (PID / Poles / PI) 
+The XDPE1A2G5 uses digital voltage and current feedback loops to maintain a tightly regulated output voltage 
+with inherent phase current balance. During operation, the output voltage is sensed differentially and digitized 
+by a precision analog-to-digital converter (ADC). The digitized voltage is compared to a target voltage whose 
+error is fed into a digital compensator that consists of PID parameters, Kp (proportional coefficient), Ki (integral 
+coefficient), and Kd (derivative coefficient), as well as the low-pass filter pole locations, Kfp1 and Kfp2.  Various 
+PID coefficient and Poles settings are available for optimizing loop response during soft-start, steady state, load 
+transient, and power saving states. 
+The output of each loop’s digital compensator is converted into a control current that is divided and fanned-
+out equally to all active phases. The phase current is sensed and compared to a target emulation current. The 
+error is digitized and is used to adjust the emulation current creating a synthesized phase current output. The 
+control current going to the phases is compared to the synthesized phase current of each phase to create a 
+phase current error that is feed into a digital compensator that consists of PI parameters. This is the inner 
+phase current feedback loop whose output is converted into PWM pulses for each phase. The PI coefficients 
+settings are available to optimize the inner loop response based on the output inductors used in the design. 
+Figure 15 shows a simplified diagram of the compensation loops use in the linear current-mode feedback 
+control. 
+ 
+ 
+HPID-
+VID
+- -
+Vo
+IO1
+HAVP
+1
+N HPI Vin
+1/kapc
+- IO2
+HPI Vin
+1/kapc
+- ION
+HPI Vin
+1/kapc
+1
+ZC
+TCL
+TCL
+TCL
+TV
+ 
+Figure 15 Voltage and current compensation loops 
+8.9 Active transient response (ATR / FATR) 
+The XDPE1A2G5 controller supports an Active Transient Response function which allows for improved transient 
+regulation with reduced output capacitance. Error voltage tracking comparators with programmable 
+--- PAGE 36 ---
+  
+ 
+Final Datasheet 36 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+thresholds (magnitude and slope) continuously monitor the output voltage. The ATR High (ATRH) function will 
+increase the switching frequency (PFM) and will boost the control current (Increased Pulse Width) during a load 
+step to reduce output undershoot. The ATR Low (ATRL) function will blank PWM output pulses and can also 
+enter Diode Braking (PWM Hi-Z) during a load release to reduce output overshoot. Frequency Active Transient 
+Response (FATR) allows control of the ATR non-linear gains, PID, Diode Braking, Vout Offset, and High-speed 
+Phase Balance based on load oscillation frequency. The load oscillation frequency can be detected by the 
+control engine and thresholds set to enable/disable functions or change gains to the linear and non-linear 
+controls. 
+ 
+ 
+8.9.1 ATRH and ATRL 
+Load
+Vout
+Verror
+ATRH 
+Control
+ATRL 
+Control
+Entry Magnitude & Slope 
+Thresholds
+Exit Magnitude & Slope 
+Thresholds
+Exit Magnitude & Slope 
+Thresholds
+Entry Magnitude & Slope 
+Thresholds
+Linear 
+Control
+Linear 
+Control
+Linear 
+Control
+PFM + PWMPWM PWM PWMTruncation + Diode Brake
+ 
+Figure 16 ATRH & ATRL Transient control 
+ 
+Table 26 ATRH & ATRL transient controls 
+Control Description 
+ATRH Entry & Exit 
+Thresholds 
+Error magnitude and slope thresholds to control entry into and exit out of ATRH 
+control. Magnitude: 0 – 318.75 mV, 1.25 mV. Slope: 0 – 0.492 mV/ nsec, 7.8 µV/nsec 
+Frequency Boost Gain control to adjust the Pulse Frequency Modulation (PFM) during ATRH control. 
+Delta Tstep = Kp x error + Kd x error slope 
+Control Current Boost Gain control to adjust control current to each phase during ATRH control. 
+Delta Ipid = Kp x error + Kd x error slope 
+ATRH Kp Proportional Gain term applied to the control current during ATRH control. 
+ATRH Ki Integral Gain term applied to the control current during ATRH control. Only reacts 
+--- PAGE 37 ---
+  
+ 
+Final Datasheet 37 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Control Description 
+to positive error 
+ATRH Kd Differential Gain term applied to the control current during ATRH control. 
+ATRH Lift Positive voltage offset applied during ATRH control. 
+Frequency Boost 
+Increase 
+Frequency Boost strength control versus load oscillation frequency. 
+Strength increase: 1/8 – 7/8 every 1/8 switching cycle, 0 disables control. 
+Control Current 
+Decrease 
+Frequency Boost strength control versus load oscillation frequency. 
+Strength decrease: 1/8 – 7/8 every 1/8 switching cycle, 0 disables control. 
+ATRL Entry & Exit 
+Thresholds 
+Error magnitude and slope thresholds to control entry into and exit out of ATRL 
+control. Magnitude: 0 – 318.75 mV, 1.25 mV. Slope: 0 – 0.492 mV/ nsec, 7.8 µV/nsec 
+Diode Braking Max Tri-
+state Time 
+Maximum allowable tri-state time during diode braking. 
+320 nsec – 2240 nsec, 320 nsec increments. 
+Diode Braking 
+Frequency Threshold 
+Load oscillation frequency above which diode braking is disabled. 
+49 kHz – 12.5 MHz, 200 Hz, 0 disables body braking 
+ 
+8.9.2 FATR 
+The load oscillation frequency is measured by the controller using the FATR detectors. The detectors measure 
+the time between each excursion of the output voltage error beyond a programmable OV and UV threshold. 
+Two sets of detectors and a frequency threshold are available to allow for robust detection of higher load 
+oscillation frequencies where the error voltage starts to become very small. 
+ 
+ 
+ 
+Figure 17 Load oscillation frequency detector 
+Table 27 FATR controls 
+Control Description 
+OV/UV Detector1 Threshold OV/UV error voltage thresholds for load oscillation frequencies below 50kHz 
+FATR High Frequency 
+Threshold 
+Frequency threshold above which OV/UV Detector2 Thresholds will be used. 
+OV/UV Detector2 Threshold OV/UV error voltage thresholds for load oscillation frequencies above High-
+Frequency Threshold 
+
+--- PAGE 38 ---
+  
+ 
+Final Datasheet 38 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Control Description 
+Body Braking Disable 
+Threshold 
+Frequency threshold above which body braking (ATRL Hi-Z) is disabled 
+ATRL Disable Threshold Frequency threshold above which ATRL is disabled 
+Auto Phasing Disable 
+Threshold 
+Frequency threshold above which auto phase drop is disabled 
+HSPB Enable Threshold Frequency threshold above which High-speed Phase Balance (HSPB) is 
+enabled 
+FATR PID Enable Threshold Frequency threshold above which FATR PID settings are used 
+FATR Vout Offset Enable 
+Threshold 
+Frequency threshold above which FATR Vout Offset is enabled 
+FATR Vout Offset Voltage offset used when load oscillation frequency above the FATR Vout 
+Offset Enable Threshold 
+8.10 High-speed phase current balance (HSPB) 
+In addition to the inherent phase current balance in current-mode control, the controller features High-speed 
+Phase Balance control which is particularly valuable at load oscillation frequencies around the voltage 
+regulator switching frequency. This control reduces “Beat Frequencies” that occur when the load oscillation 
+frequency is equal to the switching frequency. 
+The HSPB control monitors the peak current of each phase and compares it to the average current of all the 
+active phases. When the peak current of one phase is greater than the current imbalance threshold for a 
+programmable number of switching cycles, and the load oscillation frequency is greater than the HSPB Enable 
+Threshold, the switching frequency will move to an alternate, and typically higher switching frequency. When 
+switching at the alternate frequency and an imbalance occurs the switching frequency will revert back to the 
+original frequency setting. It will also revert back when the load oscillation frequency goes below the HSPB 
+Enable Threshold. 
+--- PAGE 39 ---
+  
+ 
+Final Datasheet 39 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+ 
+Figure 18 HSPB response 
+8.11 Telemetry 
+The XDPE1A2G5 can provide real-time accurate measurement of input voltage, input current, output voltage, 
+output current, phase current, and temperature, and provides this information over PMBus. 
+8.11.1 Telemetry sample rate, filter bandwidth, and range/resolution 
+Table 28  
+Telemetry Register Sensing/ 
+Calculation 
+Sample 
+Rate 
+(Typical) 
+Filter 
+Bandwidth 17 
+(Typical) 
+Range/Resolution 
+Input Voltage 
+(Local) 
+PMBus: READ_VIN 
+ 
+VINSEN 125 kHz 1.9 kHz 0 – 63.75 V/ 
+0.25 V 
+Input Current 
+(Loop) 
+PMBus: READ_IIN 
+ 
+IIN 125 kHz 15 kHz 0 - 127.875 A/ 
+0.125 A 
+Input Power 
+(Loop) 
+PMBus: READ_PIN 
+ 
+VIN x IIN 125 kHz 15 kHz 0 – 8184 W/ 
+1, 2, 4, 8 W 
+Output 
+Voltage 
+PMBus: READ_VOUT 
+ 
+VOSEN_Lx – 
+VORTN_Lx 
+50 MHz Bypass VOUT_MAX/ 
+VOUT_MODE 
+Output 
+Current 
+PMBus: READ_IOUT 
+ 
+Sum of ISENx 25 MHz 4.86 kHz 0 – 8184 A/ 
+1, 2, 4, 8 A  Note 18 
+Output PMBus: READ_POUT VOUT x IOUT 25 MHz 5.8 kHz 0 – 4092 W/ 
+
+--- PAGE 40 ---
+  
+ 
+Final Datasheet 40 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Telemetry Register Sensing/ 
+Calculation 
+Sample 
+Rate 
+(Typical) 
+Filter 
+Bandwidth 17 
+(Typical) 
+Range/Resolution 
+Power  1, 2, 4 W 
+Phase 
+Current 
+Iphx_adc_lpf ISENx 25 MHz 486 Hz -43.4 A – 179.2 A/ 
+0.022 A 
+Temperature 
+(External) 
+PMBus: 
+READ_TEMPERATURE_1 
+TSEN1/TSEN2 125 kHz 478 Hz -40 C – 215 C/ 
+1 C 
+Temperature 
+(Internal) 
+PMBus: 
+READ_TEMPERATURE_2 
+Die 
+Temperature 
+125 kHz 1.2 Hz -40 C – 215 C/ 
+1 C 
+Auxiliary 
+Voltage 
+Vaux_supply VAUX 125 kHz 478 Hz 0 – 8.125 V/ 
+0.125 V 
+ 
+Note:  
+17. Filter Rates are programmable. Range is a function of the sample rate. See Section 8.11.2 
+18. Output Current range/resolution  is user settable with register tlm_lp_iout_scale 
+ 
+ 
+8.11.2 Programmable filter bandwidth 
+ 
+The filter bandwidth for each telemetry is fully programmable. The bandwidth is a function of the update rate, 
+Table 29 shows the list of telemetry and their filter bandwidth programming range. The low-pass filter can be 
+bypassed for any telemetry input by setting the filter index to 0. 
+Table 29 Programmable filter bandwidth range 
+Telemetry Filter Bandwidth Range 
+Input Voltage 2.4 Hz – 11.78 kHz 
+Input Current 
+(Loop) 
+2.4 Hz – 11.78 kHz 
+Input Current 
+(System) 
+2.4 Hz – 11.78 kHz 
+Input Power 
+(Loop) 
+2.4 Hz – 11.78 kHz 
+Input Power 
+(System) 
+2.4 Hz – 11.78 kHz 
+Output Voltage 1.942 kHz – 9.42 MHz 
+Output Current 486 Hz – 2.355 MHz 
+Output Power 1.942 kHz – 9.42 MHz 
+Phase Current 486 Hz – 2.355 MHz 
+Temperature 
+(External) 
+1.2 Hz – 5.89 kHz 
+Temperature 1.2 Hz – 5.89 kHz 
+--- PAGE 41 ---
+  
+ 
+Final Datasheet 41 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Telemetry Filter Bandwidth Range 
+(Internal) 
+Auxiliary Voltage 19 Hz – 94.2 kHz 
+ 
+8.12 Fault handler 
+The XDPE1A2G5 controller provides a comprehensive fault detection system. Reporting and handling features 
+include: 
+• Controller VDD under-voltage lock out (VDD UVLO) 
+• Driver PWM faults with Infineon integrated power stages 
+• Driver not ready – Tmon fault with Infineon integrated power stages 
+• Driver fault with Infineon integrated power stages 
+• Input under/over-voltage protection (IUVP/IOVP) 
+• Input over-current warning and fault (IOCP) 
+• Input over-power warning (IOPP) 
+• Output under/over-voltage protection (OUVP/OOVP) 
+• Output Over-current protection (OOCP) 
+• Pulse-by-pulse peak current limit protection (P2CL) 
+• Output over-power warning (OOPP) 
+• Over temperature protection (OTP) 
+• Temperature Warning (OT_WARN) 
+• Configuration (CRC) failure 
+• Communication failure (CML) 
+All individual faults are latched and can be reported over the PMBus.  A configurable fault signal, FAULT1, is 
+provided for fault reporting. The fault conditions available for reporting on this pin are listed in Table 30.  Each 
+fault output signal supports individual masking of any fault, allowing a subset of faults to be reported over that 
+signal. The fault signals can also be configured as active high or active low polarity, and CMOS level driven or 
+open drain outputs.  
+Table 30  
+Protection PMBus Command/Register Range/Resolution Fault Reporting VR Fault Response 
+VIN UVLO VIN_OFF 0 – 63.75 V/ 
+0.25 V 
+STATUS_INPUT[3] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+VIN UV 
+Warn 
+VIN_UV_WARN_LIMIT 0 – 63.93 V/ 
+0.0625 V 
+STATUS_INPUT[4] 
+SMBALERT#/FAULT1 
+Asserts alert pins 
+VIN OV 
+Fault 
+VIN_OV_FAULT_LIMIT 
+VIN_OV_FAULT_RESPONSE 
+0 – 63.93 V/ 
+0.0625 V 
+STATUS_INPUT[7] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+VIN OV 
+Warn 
+VIN_OV_WARN_LIMIT 0 – 63.93 V/ 
+0.0625 V 
+STATUS_INPUT[6] 
+SMBALERT#/FAULT1 
+Asserts alert pins 
+IIN Fault IIN_OC_FAULT_LIMIT 
+IIN_OC_FAULT_RESPONSE 
+0 – 127.875 A/ 
+0.125 A 
+STATUS_INPUT[2] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+IIN Warn IIN_OC_WARN_LIMIT 0 – 127.875 A/ 
+0.125 A 
+STATUS_INPUT[1] 
+SMBALERT#/FAULT1 
+Asserts alert pins 
+--- PAGE 42 ---
+  
+ 
+Final Datasheet 42 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Protection PMBus Command/Register Range/Resolution Fault Reporting VR Fault Response 
+Loop PIN 
+Warn 
+PIN_OP_WARN_LIMIT 0 – 8184 W/ 
+1, 2, 4, 8 W 
+STATUS_INPUT[0] 
+SMBALERT#/FAULT1 
+Asserts alert pins 
+VOUT OV 
+fixed 
+VOUT_OV_FAULT_LIMIT 
+VOUT_OV_FAULT_RESPONSE 
+VOUT_OV_WARN_LIMIT 
+0 – VOUT_MAX/ 
+VOUT_MODE 
+STATUS_VOUT [7:6] 
+SMBALERT#/FAULT1 
+Fault: shutdown 
+with LS FET ON 
+Warn: Asserts alert 
+pins 
+VOUT OV 
+Tracking 
+MFR_OVP_RELATIVE_THRESH 
+VOUT_OV_FAULT_RESPONSE 
+50 – 500mV/ 
+50mV 
+Above VID 
+STATUS_VOUT [7] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+VOUT UV 
+fixed 
+VOUT_UV_FAULT_LIMIT 
+VOUT_UV_FAULT_RESPONSE 
+VOUT_UV_WARN_LIMIT 
+0 – VOUT_MAX/ 
+VOUT_MODE 
+STATUS_VOUT [5:4] 
+SMBALERT#/FAULT1 
+Fault: Hi-Z 
+Shutdown 
+Warn: Asserts alert 
+pins 
+VOUT UV 
+Tracking 
+MFR_UVP_RELATIVE_THRESH 
+VOUT_UV_FAULT_RESPONSE 
+50 – 500mV/ 
+50mV 
+Below VID 
+STATUS_VOUT [4] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+IOUT OC 
+Fault 
+IOUT_OC_FAULT_LIMIT 
+IOUT_OC_FAULT_RESPONSE 
+0 – 2046 A/ 
+1, 2 A 
+STATUS_IOUT [7] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+IOUT OC 
+Warn 
+IOUT_OC_WARN_LIMIT 
+ 
+0 – 2046 A/ 
+1, 2 A 
+STATUS_VOUT [5] 
+SMBALERT#/FAULT1 
+VALRT# 
+Asserts alert pins 
+P2CL p2cl_limit 0 – 178.85 A/ 
+0.35 A 
+STATUS_MFR_SPECIFIC [5] 
+MFR_COMMON_FAULT_ 
+STATUS1 [6] 
+SMBALERT#/FAULT1 
+Truncates PWM 
+until current is 
+below the limit 
+Asserts alert pins 
+NCL ncl_limit 0 to -43.4 A/ 
+1.4 A 
+STATUS_MFR_SPECIFIC [5] 
+MFR_COMMON_FAULT_ 
+STATUS1 [6] 
+SMBALERT#/FAULT1 
+Hi-Z PWM until 
+current is above 
+the limit 
+Asserts alert pins 
+POUT 
+Warn 
+POUT_OP_WARN_LIMIT 0 – 4092 W/ 
+1, 2, 4 W 
+STATUS_VOUT [0] 
+SMBALERT#/FAULT1 
+Asserts alert pins 
+OT Fault OT_FAULT_LIMIT 
+OT_FAULT_RESPONSE 
+64 – 255 C/ 
+1 C 
+STATUS_TEMP [7] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+OT Warn OT_WARN_LIMIT 
+ 
+64 – 255 C/ 
+1 C 
+STATUS_TEMP [6] 
+SMBALERT#/FAULT1 
+VALRT# 
+Asserts alert pins 
+PS Fault NA NA STATUS_MFR_SPECIFIC [5] 
+MFR_COMMON_FAULT_ 
+STATUS1 [7] 
+SMBALERT#/FAULT1 
+Hi-Z Shutdown 
+Asserts alert pins 
+CRC Fault NA NA STATUS_CML [4] 
+SMBALERT#/FAULT1 
+Asserts alert pins 
+Com Fault NA NA STATUS_CML [1] 
+SMBALERT#/FAULT1 
+Asserts alert pins 
+--- PAGE 43 ---
+  
+ 
+Final Datasheet 43 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+8.12.1 VDD under-voltage lockout (VDD UVLO) 
+An analog comparator continuously monitors the +3.3 V (VDD) supply. When the supply falls below a fixed 
+threshold of approximately 2.7 V, the VDD UVLO fault is asserted. A VDD UVLO assertion will trigger Hi-Z 
+shutdown mode which immediately turns off both the high and low side MOSFETs of the power stage. 
+ 
+8.12.2 Driver PWM Faults 
+Driver PWM fault is designed to detect when a MOSFET driver/power stage is missing or not powered up. Prior 
+to regulation, the controller will check the power stage’s PWM pin status. When the Infineon driver is powered 
+up, it will drive the PWM voltage to a tri-state level of approximately 1.6 V. If the PWM pin is shorted or open, the 
+controller will not send PWM signals out and it will report Driver PWM related faults as follows:   
+• PWM shorted to GND or VDRV UVLO 
+• PWM open 
+ 
+8.12.3 Driver not ready – TMON low 
+In addition to Driver PWM faults the controller also monitors the power stage’s TMON signal. Infineon’s 
+integrated power stage TMON signal indicates whether the driver is ready and able to respond to PWM signals 
+correctly. The controller will delay soft-start until the TMON voltage is greater than 0.28V (-40 C), ensuring that 
+the driver has sufficient supply voltage to operate properly. 
+8.12.4 Input voltage fault protection (IUVP/IOVP) 
+The XDPE1A2G5 controller monitors the VIN (+12 V) supply with the VINSEN pin. The signal is low-pass filtered 
+and compared against a set of user defined programmable thresholds to resolve VIN status conditions. Typical 
+placement of the input under voltage (IUVP), the turn-on (VIN_ON), and input over voltage (IOVP) thresholds 
+are shown in Figure 19.  
+ 
+--- PAGE 44 ---
+  
+ 
+Final Datasheet 44 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+VIN
+VIN_ON
+IUVP (VIN_OFF)
+IOVP (VIN_OV_FAULT_LIMIT)
+VIN_OV_WARN_LIMIT
+VIN_UV_WARN_LIMIT
+Normal Operating Range
+Fault & Shutdown
+Fault & Shutdown
+Hysteresis
+ 
+Figure 19 VIN threshold settings 
+VIN_ON 
+VIN must be greater than the VIN_ON (35h) threshold to start the system. If the controller has reached the 
+Active Regulation state, it does not require VIN to remain above the VIN_ON threshold to maintain regulation.  
+Input Under Voltage Protection (IUVP) 
+When the controller is in the Active Regulation state, VIN dropping below IUVP threshold will assert an IUVP 
+fault and shut down the system. IUVP detection is enabled once VIN ramps above VIN_ON threshold after the 
+Initialization state. VIN OFF (36h) PMBus command sets the IUVP threshold. 
+Input Over Voltage Protection (IOVP) 
+When VIN is above the IOVP threshold, the controller can be programmed to shut down the system. The 
+maximum IOVP threshold that can be set is 16.8 V. 
+In addition to the fault thresholds, warning thresholds can be set with VIN_OV_WARN_LIMIT (42h) and 
+VIN_UV_WARN_LIMIT (43h). These can be used to alert of over-voltage or under-voltage conditions occurring 
+close to the fault shutdown limits. 
+ 
+8.12.5 Input current protection (IOCP) 
+The controller can be configured to estimate each loop input current. Each loop input current can be set to be: 
+• Estimated Loop A current 
+• Estimated Loop B current 
+--- PAGE 45 ---
+  
+ 
+Final Datasheet 45 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+• Estimated sum of Loop A and Loop B current 
+An IIN over-current fault is triggered when the estimated loop current exceeds the fault threshold set by the 
+IIN_OC_FAULT_LIMIT (5Dh). If the response to the fault is set to shut down the PWMs will go Hi-Z. A warning 
+threshold, IIN_OC_WARN_LIMIT (58h), can be used to flag that an over-current condition is occurring but not 
+shutdown voltage regulator. This is useful for communicating with the system to reduce its load so that the 
+maximum input power is not exceeded. 
+8.12.6 Output over & under-voltage protection (OOVP/OUVP) 
+Output over and under-voltage protection can be set to both a tracking and a fixed threshold as shown in 
+Figure 20. A tracking feature allows thresholds to be set relative to the target voltage. The programmable 
+thresholds are between 50 mV to 800 mV in 50 mV steps above and below the target voltage. Tracking 
+thresholds are enabled during the soft-start and active regulation states. PWMs will go Hi-Z when either 
+tracking threshold are exceeded. 
+The fixed thresholds are an absolute voltage with selectable values between 0 V to VOUT_MAX. Fixed OOVP 
+detection is active after the initialization state. When a fixed OV condition is detected, the PWMs are forced low 
+to turn on the Low-side FETs to clamp the output voltage through the inductors. Fixed OUVP is active during 
+the active regulation state. PWMs will go Hi-Z when Vout drops below the set threshold. 
+ 
+Fixed OV Threshold (VOUT_OV_FAULT_LIMIT)
+Fixed UV Threshold (VOUT_UV_FAULT_LIMIT)
+VOUT
+Tracking OVP (MFR_OVP_RELATIVE_THRESH)
+Tracking UVP (MFR_UVP_RELATIVE_THRESH)
+VOUT_OV_WARN_LIMIT
+VOUT_UV_WARN_LIMIT
+Inactive/Ton 
+Delay Soft-Start Active Regulation
+ 
+Figure 20 Tracking and Fixed OV and UV Protections 
+8.12.7 Output over-current protection (OOCP) 
+The controller calculates the total output current by summing the sampled phase currents from all active 
+phases. The total current signal used for over-current detection is filtered through a programmable filter that is 
+settable to four selections (63, 210, 380, 532 kHz). This provides the user the ability to tailor the required 
+response time to both a fault shutdown and the assertion of a warning signal. Additional control of the 
+response time is controlled via a fault and warning counter that is programmable from 0 to 31 1MHz clock 
+cycles in 1 cycle increments. Typically, the fault limit, IOUT_OC_FAULT_LIMIT (46h), is set 120% higher than the 
+expected maximum current, which is defined by the application/user.  The warning limit is defined by 
+IOUT_OC_WARN_LIMIT (4Ah). 
+--- PAGE 46 ---
+  
+ 
+Final Datasheet 46 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+ 
+Figure 21 Shutdown response to over-current fault (63 kHz Filter Index, Delay Count = 0) 
+ 
+ 
+ 
+Figure 22 Shutdown response to over-current fault (532 kHz Filter Index, Delay Count = 0) 
+ 
+
+--- PAGE 47 ---
+  
+ 
+Final Datasheet 47 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+8.12.8 Per phase current protection (P2CL, NCL) 
+P2CL 
+Per phase pulse-by-pulse current limiting prevents inductor saturation by preventing the individual phase 
+currents from exceeding a user-programmed threshold.  The threshold can be set up to 178 A in 0.35 A 
+increments. The width limit of the PWM pulse is calculated based on the synthesized inductor current. Once the 
+inductor current exceeds the maximum threshold limit, the PWM pulse is truncated to turn on the low-side FET 
+for the rest of the PWM cycle. The P2CL fault monitors each phase independently.  
+P2CL can be used to clamp the output current to insulate devices at the input side from delivering excessive 
+power. The controller has been designed to ride thru peak current events.  The VR will assert the P2CL flag 
+when the peak is 10A below the set value.  The VR will increase the FSW 1.625x as current continues to increase. 
+From 500K up to 800K for the event depicted in Figure 23.   
+This allows a system manager to receive a P2CL flag and throttle operation accordingly before VOUT droops to 
+a dangerous level 
+ 
+ 
+ 
+Figure 23 P2CL Response 
+ 
+NCL 
+The controller constantly monitors the inductor ripple current of each phase. Upon detection of negative 
+current in the inductor exceeding a user-programmed threshold (up to -43.4 A in 1.4 A increments), the 
+controller will set the PWM output of that phase to Hi-Z in order to reduce the negative current. The prevention 
+of very high negative currents avoids potential damage to the high-side FET body diode during switching 
+cycles.  
+ 
+
+--- PAGE 48 ---
+  
+ 
+Final Datasheet 48 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+ 
+Figure 24 NCL Response 
+8.12.9 Output over-power protection (OOPP) 
+The controller monitors both the output current and the output voltage and uses this information to calculate 
+the output power. An Output Over-power Warning will be issued when the power exceeds the user 
+programmable threshold, POUT_OP_WARNING_LIMIT (6Ah).  Exceeding this limit does not cause a shutdown. 
+Only the warning bit in VOUT_STATUS bit 0 and any configured warning outputs will be asserted. 
+8.12.10 Over-temperature protection (OTP) 
+Over Temperature Protection (OTP) is triggered when the operating temperature reported on TSEN1/2 exceeds 
+the user-programmed shutdown threshold, OT_FAULT_LIMIT (4Fh).  
+When selected for shutdown, an OTP fault will trigger a Hi-Z shutdown. Temperature protection is enabled after 
+the Initialization state. 
+8.12.11 Power stage fault detection 
+In addition to directly interfacing with Infineon Power Stage to monitor temperature, the TSENx input is used to 
+monitor a Power Stage fault condition. Any fault within the Power Stage is communicated to the controller by 
+pulling its temperature sense output (TMON) to 3.3V. A 3.3V at the controller’s TSENx pin indic ates one of the 
+following has occurred in the Power Stage:  
+1) A power stage High-side FET Short (HSS) 
+2) An over temperature fault (OT) 
+3) A persistent overcurrent fault (OC) 
+4) High-side driver voltage UV fault (Boot UVLO) 
+Additionally, a Power Stage fault condition, VDRV UV fault, can be communicated to the controller by pulling its 
+current sense output (IMON) to ground.  
+The controller can shut down or continue operating and assert the SMB_ALERT# and/or FAULT1 pin upon 
+receiving the power stage fault. 
+The controller can be configured to accommodate future Power Stage Fault ID implementations. Consult with 
+local Infineon representative for availability and enablement. 
+
+--- PAGE 49 ---
+  
+ 
+Final Datasheet 49 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+8.12.12 CRC failure 
+The integrity of downloading the configuration from the NVM to the controller’s control registers is assured by 
+CRC check. A configuration download CRC failure prevents the controller from leaving the Inactive state. 
+8.12.13 Communication fault 
+When receiving unimplemented commands or improperly structured I2C protocol, such as PEC (packet error 
+checking) faults, the controller will report communication failures. 
+8.12.14 Fault response control 
+The controller can configure the response to the detected shutdown faults.  Depending on the detected fault, 
+these responses can be set to; Ignore, Shut Down (latch), Shut Down (Retry), and Shut Down & Resume. 
+Additional control is available to delay the shutdown as well as delay the time the output is restarted. Table 31 
+shows a list of faults and their configurable response 
+Table 31 Configurable fault response 
+Fault Configurable Response 
+Vout Over-voltage Ignore, Shutdown & Retry (No retry, 1 to 6 times, continuously) , Shutdown & 
+Resume when OK 
+Vout Under-voltage Ignore, Shutdown & No Retry 
+Iout Over-current Shutdown & Retry (No retry, 1 to 6 times, continuously) 
+Over-temperature Ignore, Shutdown & Retry (No retry, 1 to 6 times, continuously), Shutdown & 
+Resume when OK 
+Vin Over-voltage Ignore, Shutdown & Retry (No retry, 1 to 6 times, continuously), Shutdown & 
+Resume when OK 
+Iin Over-current Ignore, Shutdown & Retry (No retry, 1 to 6 times, continuously), Shutdown & 
+Resume when OK 
+Ton Max Ignore, Shutdown & Retry (No retry, 1 to 6 times, continuously), Shutdown & 
+Resume when OK 
+Power Stage Ignore, Shutdown & No Retry (Set through Fault Enable Mask) 
+ 
+8.12.15 Fault pin mapping 
+The controller has a Fault Path that can be mapped to any Loop or Common fault.  Pin 17 can be configured as 
+the FAULT# output.  Each fault or warning can be masked for the Fault Path in order to control the assertion of 
+the Fault Output. 
+Table 32 FAULT Common Faults 
+Fault 
+VDD UVLO Fault POR VDDA Fault 
+ 
+Table 33 FAULT Loop Faults 
+Fault 
+Vout OV Fault Vout OV Warn 
+Vout UV Fault Vout UV Warn 
+--- PAGE 50 ---
+  
+ 
+Final Datasheet 50 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Fault 
+Vin OV Fault Vin OV Warn 
+P2CL Limit Vin UV Warn 
+Iout OC Fault Iout OC Warn 
+Vout UV Tracking Fault Vout OV Tracking Fault 
+Iin OC Fault Iin OC Warn 
+Over-temperature Fault Over-temperature Warning 
+Pin OP Warn Pout OP Warn 
+Vout Min/Max Warning TMON High 
+IMON low  
+ 
+ 
+8.13 Active voltage positioning (AVP) 
+The controller provides programmability of a linear DC load line slope via VOUT_DROOP (28h) register. The 
+linear DC load line slope is programmable from 0 to 15.98 mΩ linear 11 mode with least significant bits (LSB) in 
+steps ranging from 15.6 uΩ to 2.4 uΩ steps. The actual load line LSB is set in the vc_vavp_lsb_sel register.  The 
+load line LSB can be set to 19.5 µΩ, 9.8 µΩ, 4.8 µΩ, or 2.4 µΩ.  
+Additionally, a non-linear DC load line slope can be programmed. The slope of the non-linear load line can be 
+broken into two additional segments. The load line slope of each segment is independently programmable 0 to 
+15.98 mΩ in steps set by the vc_vavp_lsb_sel register and each segment slope will become effective when the 
+load current exceeds the programmable current thresholds a shown in Figure 25.  
+Linear DC load line is used to reduce peak overshoot voltages during load transient and helps reduce the 
+required output capacitance. The non-linear load line shape shown in Figure 25 is typically used in applications 
+whose transient load currents normally operate within the segment2 load line slope region. This allows for 
+added overshoot margin during a load release typically seen in traditional DC load line applications, but it also 
+limits both the maximum and minimum output voltage over the entire load range. 
+Table 34  
+Vc_vavp_lsb_sel Resolution Comments 
+0 5/256 mΩ 19.53125 µΩ 
+1 5/512 mΩ 9.765625 µΩ 
+2 5/1024 mΩ 4.8828125 µΩ 
+3 5/2048 mΩ 2.44140625 µΩ 
+ 
+--- PAGE 51 ---
+  
+ 
+Final Datasheet 51 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+VOUT_DROOP 
+(Rll Segment1)
+Rll Segment2
+Rll Segment3
+Load
+Vout
+Segment2 Current Threshold
+Segment3 Current Delta
+Linear DC Loadline
+Non-linear DC Loadline
+Vout @ 0 A
+Vout @ 0 A
+Vmax
+Vmin
+ 
+Figure 25 Linear and Non-linear DC Load line slopes 
+The total current is filtered with a programmable single pole filter to set the AVP bandwidth. This bandwidth 
+can be independently set between 7.8 kHz and 2.2 MHz in 8.3 kHz steps for the load step and the load release. 
+For applications which cannot tolerate the DC voltage drop introduced by the load line at heavy loads, the 
+controller can still provide some load line benefits with its AC load line feature. Instead of dropping the DC 
+target based on the load current, AC load line temporarily adds this load line offset through a programmable 
+band pass filter. At either low or very high load transient frequencies, the load line is blocked by the filter. At 
+near midband, a non-zero load line is in effect. Figure 26 illustrates the responses to a load step/release 
+sequence with different load line settings. 
+--- PAGE 52 ---
+  
+ 
+Final Datasheet 52 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+ 
+ 
+Figure 26 No load line vs DC load line vs AC load line 
+When using the non-linear load line feature, each segment could have different enough load lines that it could 
+affect the required loop compensation coefficients that make for a stable loop. Separate Kp and Kd terms are 
+available to allow the user to optimize the loop compensation for each segment. Drastic differences in load 
+line, i.e. Rll = 0 mΩ versus Rll = 1 mΩ, will typically require different Kd terms, where Kd is much less for the 1 
+mΩ load line case. In contrast, shallow load lines, i.e. Rll = 0.25 mΩ, will typically have Kp and Kd terms set to be 
+the same as for a 0 mΩ load line case. 
+ 
+8.14 Multi-function pins 
+The controller provides various digital IO pins that can be configurable to support several controller interface 
+input and output signals.  In addition to the input/output functionality being configurable, the output type 
+(driven vs. open drain) and polarity are also user-programmable. Table 35 shows the available multi-functional 
+pins and their described functions. 
+Table 35 Multi-functional pin descriptions 
+Pin Name/Function Description 
+SMBALERT# (pin 17) 
+SMBALERT# Alert output for PMBus fault and warning flags 
+LPM# Low Power Mode output. Used to de-assert power stage enable to place VR is low 
+power state when VR_EN is low or in lower power state 
+FAULT# Mapped indicator for generic fault.  See Table 32 and Table 33 
+EN_L1 (pin 19) 
+EN_L1 VR enable for loopA 
+Common Enable Common VR enable for loopA and loopB 
+TSEN2 (pin 50) 
+TSEN2 Second temperature sense 
+VAUX Auxiliary voltage sense 
+Not used No connection 
+GPIO (pin51) 
+
+--- PAGE 53 ---
+  
+ 
+Final Datasheet 53 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Pin Name/Function Description 
+GPIO Loop A LPM# 
+Loop B LPM# 
+Loop B Power Good 
+Not used no connection 
+ 
+8.15 PMBus interface 
+All operating parameters in the XDPE1A2G5 controller are configurable via the SMBus/I2C serial interface (SDA, 
+SCL). The digital interface also allows for monitoring of fault status, as well as voltage, current, power, and 
+temperature telemetry. The XDPE1A2G5 controller supports I2C bus speeds of 1 MHz and logic levels of 1.8 V or 
+3.3 V.  The default serial address of the XDPE1A2G5 controller I2C port is resistor programmable through XADDR 
+pin as shown in Table 36. Other serial address options are available and can be programmed into device. 
+ 
+Table 36 Device PMBus Target Address ( ADDR pin 48 Resistor 1% -to-GND) 
+RXADDR 
+Device address 
+<7-bit Addr + 0> 
+(default +2 stride)  
+Device address 
+<7-bit Addr + 0> 
+ +1 stride 
+Device address 
+<7-bit Addr> 
+(default +2 stride) 
+Device address 
+<7-bit Addr + 0> 
+ +1 stride 
+≥  49.9 kW 0xB0 0xB0 0x58 0x58 
+38.3 kW 0xB4 0xB2 0x5A 0x59 
+29.4 kW 0xB8 0xB4 0x5C 0x5A 
+22.6 kW 0xBC 0xB6 0x5E 0x5B 
+17.4 kW 0xC0 0xB8 0x60 0x5C 
+13.3 kW 0xC4 0xBA 0x62 0x5D 
+10.2 kW 0xC8 0xBC 0x64 0x5E 
+7.87 kW 0xCC 0xBE 0x66 0x5F 
+6.04 kW 0xD0 0xC0 0x68 0x60 
+4.64 kW 0xD4 0xC2 0x6A 0x61 
+3.57 kW 0xD8 0xC4 0x6C 0x62 
+2.67 kW 0xDC 0xC6 0x6E 0x63 
+2 kW 0xE0 0xC8 0x70 0x64 
+1.47 kW 0xE4 0xCA 0x72 0x65 
+1.07 kW 0xE8 0xCC 0x74 0x66 
+≤ 680 Ω 0xEC 0xCE 0x76 0x67 
+ 
+The serial interface supports the following protocols as defined in the System Management Bus (SMBus) 
+Specification (version 2.0 August 3, 2000). 
+• Write byte • Read byte • Send byte 
+• Write word • Read word • Read block 
+• Write block   
+ 
+--- PAGE 54 ---
+  
+ 
+Final Datasheet 54 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+8.16 PMBus protocol 
+Infineon’s XDPTM controllers are compliant to PMBusTM Power System Management Protocol Specification, 
+revision 1.4.  
+To access the device’s configuration and monitoring registers, 4 different protocols are required: 
+• the PMBus Send Byte protocol with/without PEC (for CLEAR_FAULTS) 
+• the PMBus Read/Write Byte/Word protocol with/without PEC 
+• the PMBus Block Read and Block Write protocols with Byte Count = 2, 4, 6, 8, 14, 16, and 31 
+• the PMBus Block Read Process call (for SMBALERT Mask) 
+An explanation of which command codes and protocols are required to access them is given in Table 37. 
+In addition, the XDPE1A2G5 supports: 
+• Alert Response Address (ARA) 
+• Bus timeout (30ms) 
+Note: Clock stretching may occur during a fault 
+ 
+S: Start Condition
+A: Acknowledge (0')
+N: Not Acknowledge (1')
+Sr: 
+P: Stop Condition
+R: Read (1')
+W: Write (0')
+PEC:
+*:
+: Master to Slave
+:  Slave to Master
+Calculated from Command 
+Data is optional
+Repeated Start Condition 
+ 
+Figure 27 PMBus Protocol Legend 
+ 
+ 
+P  PEC* 
+8  
+S Slave
+Address
+ 
+ W  Command
+Code
+ 
+ 
+1  7  1  8  
+A  A* A  
+1  1  1  1  
+ 
+Figure 28 PMBus Send Bytes 
+--- PAGE 55 ---
+  
+ 
+Final Datasheet 55 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+S Slave 
+Address W Command 
+Code Data Byte
+1 7 1 8
+S
+1
+Slave 
+Address
+7
+W
+1
+A
+A
+A A P
+8 1 111
+Command 
+Code
+Data Byte 
+High
+8
+A
+8
+1
+Data Byte 
+Low A
+8 1
+PEC* 
+81
+A*
+A P
+1 1
+PEC* 
+81
+A*
+BYTE
+WORD
+…
+ 
+ 
+Figure 29 PMBus Write Byte/Word 
+ 
+ 
+P  Sr   
+ 
+7 
+R  
+8  
+Data Byte S  Slave
+Address
+ 
+ W  Command
+Code
+ 
+1  7  1  8  
+A  N A  A  
+1  1  1  1  1  1  1  
+P  N  
+Data Byte
+Low
+ 
+1  1  
+Data Byte
+High
+ 
+8  
+Sr   
+ 
+7  
+R  S   
+ W   
+ 
+1  7  1 8  
+A  A  A  
+1 1  1  1  1  8  
+PEC*  
+8  
+A*  
+1  
+ 
+1  
+…  
+PEC*  
+8 
+A*  
+1  
+BYTE
+WORD  
+Slave
+Address
+Slave
+Address
+Command
+Code
+Slave
+Address A
+ 
+Figure 30 PMBus Read Byte/Word 
+ 
+S PMBus
+Address W Command
+P
+Sr PMBus
+Address R AA A
+Data Byte1 A PEC* N
+...
+Cnt = N A Data ByteN A*...
+ 
+Figure 31 PMBus Block Read with Byte Count = N 
+ 
+S PMBus
+Address W Command Cnt = NA A A Data Byte1 A Data ByteN A* PPEC* A...
+ 
+Figure 32 PMBus Block Write with Byte Count = N 
+ 
+S PMBus
+Address W Command 1
+PSr PMBus
+Address R A
+A A A
+Data Byte A* PEC* N
+CommandA ...
+1 A
+ 
+Figure 33 Block Read Process Call 
+--- PAGE 56 ---
+  
+ 
+Final Datasheet 56 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+8.16.1 PMBus command set 
+Table 37 PMBus command set 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+PAGE Read/Write 
+Byte 00h Allows access of each loop via paging. Page 0 = 
+LoopA, Page 1 = LoopB, Page FF = all pages 
+OPERATION Read/Write 
+Byte 01h 
+Enables or disables the output and controls 
+margining. Ignores OVP on Margin High, UVP on 
+Margin Low.  Controls if VOUT_COMMAND or 
+High-speed Interface controls the output voltage. 
+ON_OFF_CONFIG Read/Write 
+Byte 02h 
+Configures the combination of CONTROL pin and 
+OPERATION command needed to turn the unit on 
+and off. 
+CLEAR FAULTS Send Byte 03h Clear contents of Fault registers 
+WRITE_PROTECT Read/Write 
+Byte 10h Provides protection from accidental changes 
+STORE_DEFAULT_ALL Send Byte 11h 
+Copy the entire contents of the Operating 
+Memory to the matching locations in the non-
+volatile Default Store memory. 
+RESTORE_DEFAULT_ALL Send Byte 12h 
+Copy the entire contents of the non-volatile 
+Default Store memory to the matching locations 
+in the Operating Memory. 
+STORE_USER_ALL Send Byte 15h 
+Copy the entire contents of the Operating 
+Memory to the matching locations in the non-
+volatile User Store memory. 
+RESTORE_USER_ALL Send Byte 16h 
+Copy the entire contents of the non-volatile User 
+Store memory to the matching locations in the 
+Operating Memory. 
+STORE_USER_CODE Write Byte 17h 
+Copy the parameter whose Command Code 
+matches the value in the data byte from the 
+Operating Memory to the matching location in 
+the non-volatile User Store memory. 
+RESTORE_USER_CODE Write Byte 18h 
+Copy the parameter whose Command Code 
+matches the value in the data byte from the 
+nonvolatile User Store memory to the matching 
+location in the Operating Memory. The value in 
+the Operating Memory is overwritten by the value 
+retrieved from the User Store. 
+CAPABILITY Read Byte 19h 
+Returns 0xD0 to indicate Packet Error Checking is 
+supported, Maximum bus speed is 1000 kHz, and 
+the device does have a SMBALERT# pin and does 
+support the SMBus Alert Response protocol 
+SMBALERT_MASK 
+Block Write/ 
+Block Read 
+Process Call 
+1Bh 
+Set to prevent warning or fault conditions from 
+asserting the SMBALERT# signal. Write command 
+code for STATUS register to be masked in the low 
+byte, the bit to be masked in the High byte. 
+--- PAGE 57 ---
+  
+ 
+Final Datasheet 57 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+VOUT_MODE Read/Write 
+Byte 20h Sets the resolution for VOUT related commands. 
+ 
+VOUT_COMMAND Read/Write 
+Word 21h Sets the voltage to which the device should set 
+the output. Format according to VOUT_MODE. 
+VOUT_TRIM Read/Write 
+Word 22h 
+Applies a fixed offset to the output voltage 
+command value. Typically used by the end user. 
+Format according to VOUT_MODE. 
+VOUT_CAL_OFFSET Read/Write 
+Word 23h 
+Applies a fixed offset to the output voltage 
+command value. Typically used by the PMBus 
+device manufacturer to calibrate a device in the 
+factory. Format according to VOUT_MODE. 
+VOUT_MAX Read/Write 
+Word 24h 
+Sets an upper limit on the output voltage the unit 
+can command. Commands above this level are 
+clamped to the setting. Format according to 
+VOUT_MODE. 
+VOUT_MARGIN_HIGH Read/Write 
+Word 25h 
+Sets the margin high voltage when commanded 
+by OPERATION. Must be in format determined by 
+VOUT_MODE. 
+VOUT_MARGIN_LOW Read/Write 
+Word 26h 
+Sets the margin low voltage when commanded 
+by OPERATION. Must be in format determined by 
+VOUT_MODE. 
+VOUT_TRANSITION_RATE Read/Write 
+Word 27h 
+Sets the rate at which the output changes voltage 
+during regulation due to VOUT_COMMAND or 
+MARGIN_HIGH/LOW commands. mV/µs; exp = -3 
+VOUT_DROOP Read/Write 
+Word 28h 
+Sets the slope at which the output voltage 
+decreases or increases with increasing or 
+decreasing output current for use with Adaptive 
+Voltage Positioning. 5/256 mΩ per LSB. 
+VOUT_MIN Read/Write 
+Word 2Bh 
+Sets a lower limit on the output voltage the unit 
+can command. Commands below this level are 
+clamped to the setting. Format according to 
+VOUT_MODE. 
+MFR_OVP_RELATIVE_THRESH Read/Write 
+Word 2Ch Sets the over-voltage fault relative to the set 
+point in mV from 50 to 400. Q = 50 mV 
+MFR_UVP_RELATIVE_THRESH Read/Write 
+Word 2Dh Sets the under-voltage fault relative to the set 
+point in mV from -50 to -400. Q = 50 mV 
+FREQUENCY_SWITCH Read/Write 
+Word 33h Sets the switching frequency in kHz from 200 to 
+3000; Exp = 0, 1 
+POWER_MODE Read/Write 
+Word 34h 
+In PMBus mode, sets the device power state for 
+Max Efficiency (Auto PS Mode), Max Power (PS0), 
+or MFR Specific power state PS1 (1 or 2 phases) or 
+PS2 (Diode Emulation). 
+VIN_ON Read/Write 
+Word 35h Sets the value of the input voltage at which the 
+unit should begin power conversion. Exp = -2. 
+VIN_OFF Read/Write 36h Sets the value of the input voltage that the unit, 
+--- PAGE 58 ---
+  
+ 
+Final Datasheet 58 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+Word once operation has started, should stop power 
+conversion.  
+Exp = -2. 
+IOUT_CAL_GAIN Read/Write 
+Word 38h Set the current sense gain for Total Iout. 2’s 
+complement with exp = -7. 
+IOUT_CAL_OFFSET Read/Write 
+Word 39h 
+Used to null out any offsets in the output current 
+sensing circuitry for Total Iout. 2’s complement 
+Exp = -3. 
+VOUT_OV_FAULT_LIMIT Read/Write 
+Word 40h 
+Sets the value of the output voltage measured at 
+the sense or output pins that causes an output 
+over-voltage fault. Format according to 
+VOUT_MODE.  
+VOUT_OV_FAULT_RESPONSE Read/Write 
+Byte 41h 
+Instructs the device on what action to take in 
+response to an output over-voltage fault. Only 
+shutdown and ignore are supported. 
+VOUT_OV_WARN_LIMIT Read/Write 
+Word 42h 
+Sets the value of the output voltage, measured at 
+the sense or output pins, that causes an output 
+over-voltage warning. Format as determined by 
+VOUT_MODE. 
+VOUT_UV_WARN_LIMIT Read/Write 
+Word 43h 
+Sets the value of the output voltage, measured at 
+the sense or output pins, that causes an output 
+voltage low warning. Format as determined by 
+VOUT_MODE. 
+VOUT_UV_FAULT_LIMIT Read/Write 
+Word 44h 
+Sets the value of the output voltage, measured at 
+the sense or output pins, that causes an output 
+under-voltage fault. Format according to 
+VOUT_MODE.  
+VOUT_UV_FAULT_RESPONSE Read/Write 
+Byte 45h 
+Instructs the device on what action to take in 
+response to an output under-voltage fault. Only 
+shutdown and ignore are supported. 
+IOUT_OC_FAULT_LIMIT Read/Write 
+Word 46h 
+Sets the value of the output current, in amperes, 
+that causes the over-current detector to indicate 
+an over-current fault condition. Exp = 1, 2. 
+IOUT_OC_FAULT_RESPONSE Read/Write 
+Byte 47h 
+Instructs the device on what action to take in 
+response to an output over-current fault. 
+Shutdown immediately no retry, and retry 1 to 6 
+times and continuously are supported. 
+IOUT_OC_LV_FAULT_LIMIT Read/Write 
+Word 48h 
+Sets the minimum operating output voltage 
+when the response to an over-current condition 
+is set to constant current mode. Format 
+according to VOUT_MODE 
+IOUT_OC_LV_FAULT_RESPONSE Read/Write 
+Word 49h 
+Instructs the device on what action to take in 
+response to an output over-current low voltage 
+fault. Shutdown immediately no retry, and retry 1 
+to 6 times and continuously are supported. 
+IOUT_OC_WARN_LIMIT Read/Write 4Ah Sets the value of the output current that causes 
+--- PAGE 59 ---
+  
+ 
+Final Datasheet 59 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+Word an output over-current warning. Exp = 1, 2. 
+OT_FAULT_LIMIT Read/Write 
+Word 4Fh 
+Sets the temperature, in degrees Celsius, of the 
+unit at which it should indicate an over-
+temperature fault. 
+Exp = 0. 
+OT_FAULT_RESPONSE Read/Write 
+Byte 50h 
+Instructs the device on what action to take in 
+response to an over-temperature fault. 
+Shutdown, resume when fault is no longer 
+present, and Ignore are supported. 
+OT_WARN_LIMIT Read/Write 
+Word 51h 
+Sets the temperature, in degrees Celsius, of the 
+unit at which it should indicate an Over-
+temperature Warning alarm. Exp = 0. 
+VIN_OV_FAULT_LIMIT Read/Write 
+Word 55h Sets the value of the input voltage that causes an 
+input over-voltage fault. Exp = -4. 
+VIN_OV_FAULT_RESPONSE Read/Write 
+Byte 56h 
+Instructs the device on what action to take in 
+response to an input over-voltage fault. Only 
+shutdown and ignore are supported. 
+VIN_OV_WARN_LIMIT Read/Write 
+Byte 57h Sets the value of the input voltage that causes an 
+input over-voltage warning. Exp = -4. 
+VIN_UV_WARN_LIMIT Read/Write 
+Word 58h Sets the value of the input voltage that causes an 
+input voltage low warning. Exp = -4. 
+IIN_OC_FAULT_LIMIT Read/Write 
+Word 5Bh Sets the value of the input current, in Amperes, 
+that causes an Input Overcurrent Fault. Exp = -3. 
+IIN_OC_FAULT_RESPONSE Read/Write 
+Word 5Ch 
+Instructs the device on what action to take in 
+response to an input over-current fault. 
+Shutdown immediately no retry, and retry 1 to 6 
+times and continuously are supported. 
+IIN_OC_WARN_LIMIT Read/Write 
+Word 5Dh 
+Sets the value of the input current, in amperes, 
+That causes a warning that the input current is 
+high. Exp = -3. 
+POWER_GOOD_ON Read/Write 
+Word 5Eh 
+Sets the output voltage at which an optional 
+POWER_GOOD signal should be asserted. 
+Format according to VOUT_MODE. 
+POWER_GOOD_OFF Read/Write 
+Word 5Fh 
+Sets the output voltage at which an optional 
+POWER_GOOD signal should be negated. 
+Format according to VOUT_MODE. 
+TON_DELAY Read/Write 
+Word 60h 
+Sets the time, in milliseconds, from when a start 
+condition is received (as programmed by the 
+ON_OFF_CONFIG command) until the output 
+voltage starts to rise. Exp = 0, -1, -2. 
+TON_RISE Read/Write 
+Word 61h 
+Sets the time, in milliseconds, from when the 
+output starts to rise until the voltage has entered 
+the regulation band. Exp = 0, -1, -2. 
+TON_MAX_FAULT_LIMIT Read/Write 62h Sets an upper limit, in milliseconds, on how long 
+the unit can attempt to power up the output. Exp 
+--- PAGE 60 ---
+  
+ 
+Final Datasheet 60 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+Word = 0, -1, -2. 
+TON_MAX_FAULT_RESPONSE Read/Write 
+Byte 63h 
+Instructs the device on what action to take in 
+response to a TON_MAX fault. Only shutdown 
+and ignore are supported. 
+TOFF_DELAY Read/Write 
+Word 64h 
+Sets the time, in milliseconds, from when a stop 
+condition is received (as programmed by the 
+ON_OFF_CONFIG command) until the unit stops 
+transferring energy to the output. Exp = 0, -1, -2. 
+TOFF_FALL Read/Write 
+Word 65h 
+Sets the time, in milliseconds, from the end of the 
+turn-off delay time until the voltage is 
+commanded to zero. Exp = 0, -1, -2. 
+TOFF_MAX_WARN_LIMIT Read/Write 
+Word 66h 
+Sets an upper limit, in milliseconds, on how long 
+the unit can attempt to power down the output 
+without reaching 12.5% of the output voltage 
+programmed at the time the unit is turned off. 
+Exp = 0, -1, -2. 
+POUT_OP_WARN_LIMIT Read/Write 
+Word 6Ah 
+Sets the value of the output power, in watts, that 
+causes a warning that the output power is high.  
+Exp = 0, 1, 2. 
+PIN_OP_WARN_LIMIT Read/Write 
+Word 6Bh 
+Sets the value of the input power, in watts, that 
+causes a warning that the input power is high.  
+Exp = 0, 1, 2. 
+STATUS_BYTE Read/Write 
+Byte 78h 
+Returns 1 byte where the bit meanings are: 
+Bit <7> Busy 
+Bit <6> Output off (due to fault or enable) 
+Bit <5> Output over-voltage fault 
+Bit <4> Output over-current fault 
+Bit <3> Input Under-voltage fault 
+Bit <2> Temperature fault 
+Bit <1> Communication/Memory/Logic fault 
+Bit <0>: None of the Above 
+STATUS_WORD Read/Write 
+Word 79h 
+Returns 2 bytes where the Low byte is the same 
+as the STATUS_BYTE data. The High byte has bit 
+meanings are: 
+Bit <7> VOUT fault 
+Bit <6> IOUT/POUT fault 
+Bit <5> INPUT fault 
+Bit <4> MFR_SPECIFIC 
+Bit <3> POWER_GOOD# 
+Bit <2> FANS 
+Bit <1> OTHER 
+Bit <0> UNKNOWN 
+STATUS_VOUT Read/Write 
+Byte 7Ah Bit <7>  Output Over-voltage Fault 
+Bit <6>  Output Over-voltage Warning 
+--- PAGE 61 ---
+  
+ 
+Final Datasheet 61 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+Bit <5>  Output Under-voltage Warning 
+Bit <4>  Output Under-voltage Fault 
+Bit <3>  VOUT_MAX_MIN Warning 
+Bit <2>  TON_MAX_FAULT 
+Bit <1>  TOFF_MAX_WARNING 
+Bit <0>  Reserved 
+STATUS_IOUT Read/Write 
+Byte 7Bh 
+Bit <7>  Output Over-current Fault 
+Bit <6>  Output Over-current & Low Voltage Fault 
+Bit <5>  Output Over-current Warning 
+Bit <4:1>  Reserved 
+Bit <0> Output Power Warning 
+STATUS_INPUT Read/Write 
+Byte 7Ch 
+Bit <7>  Input Over-voltage Fault 
+Bit <6>  Input Over-voltage Warning 
+Bit <5>  Input Under-voltage Warning 
+Bit <4>  Reserved  
+Bit <3>  Unit Off for Insufficient Input Voltage 
+Bit <2>  Input Over-current Fault 
+Bit <1>  Input Over-current Warning 
+Bit <0>  Input Over-power Warning 
+STATUS_TEMPERATURE Read/Write 
+Byte 7Dh 
+Bit <7> Over-Temperature Fault 
+Bit <6> Over-Temperature Warning 
+Bit <5:0> Reserved 
+STATUS_CML Read/Write 
+Byte 7Eh 
+Returns 1 byte where the bit meanings are: 
+Bit <7> Invalid or unsupported  command 
+Bit <6> Invalid or unsupported data 
+Bit <5> Packet Error Check (PEC) fault 
+Bit <4> Memory Fault 
+Bit <3> Processor Fault 
+Bit <2> Reserved 
+Bit <1> Other communication fault not listed here 
+Bit <0> Reserved 
+STATUS_OTHER Read/Write 
+Byte 7Fh 
+Returns 1 byte where the bit meanings are: 
+Bit <7:1> Reserved 
+Bit <0> First to assert SMBALERT# 
+STATUS_MFR_SPECIFIC Read/Write 
+Byte 80h 
+Returns 1 byte where the bit meanings are: 
+ 
+No power stage Fault ID 
+Bit <7:6> Reserved 
+Bit <5> Common Fault (see C7h and C9h) 
+Bit <4:2> Reserved 
+Bit <1> TSEN High Fault  
+Bit <0> Reserved 
+--- PAGE 62 ---
+  
+ 
+Final Datasheet 62 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+ 
+With power stage Fault ID 
+Bit <7> PS VDRV UV Fault 
+Bit <6> Reserved 
+Bit <5> Common Fault (see C7h and C9h) 
+Bit <4> Reserved 
+Bit <3> PS Over-temperature Fault 
+Bit <2> PS High-side FET short Fault 
+Bit <1> PS Over-current Fault  
+Bit <0> PS Boot UV Fault 
+STATUS_MFR_FANS_1_2 Read/Write 
+Byte 81h Reserved 
+READ_EIN Block Read 
+Cnt = 6 86h 
+Returns 6 bytes consisting of Energy Count (2 
+bytes), Rollover Count (1 byte), and Sample 
+Count (3 bytes) 
+READ_EOUT Block Read 
+Cnt = 6 87h Reserved 
+READ_VIN Read Word 88h Returns the input voltage in Volts. Exp = -5 
+READ_IIN Read Word 89h Returns the input current in amperes. Loop1 Exp 
+= -3. Loop2 Exp = -4 
+READ_VOUT Read Word 8Bh Returns the output voltage in the format set by 
+VOUT_MODE 
+READ_IOUT Read Word 8Ch Returns the output current in amperes. Exp = 2, 1, 
+0, -1, -2 
+READ_TEMPERATURE_1 Read Word 8Dh 
+Returns sensor 1 temperature in degrees Celsius. 
+Senor input configured with 
+MFR_SELECT_TEMPERATURE_SENSOR. Exp = 0. 
+READ_TEMPERATURE_2 Read Word 8Eh 
+Returns sensor 2 temperature in degrees Celsius. 
+Senor input configured with 
+MFR_SELECT_TEMPERATURE_SENSOR. Exp = 0. 
+READ_DUTY_CYCLE Read Word 94h Returns the duty cycle of the PMBus device’s 
+main power converter in percent. Exp = -3 
+READ_POUT Read Word 96h Returns the output power in watts. Exp = -2, 0, 1, 
+2 
+READ_PIN Read Word 97h Returns the input power in watts. Loop1 Exp =1, 
+0, or -1. Loop2 Exp 0 or -1 
+PMBus_REVISION Read Byte 98h Reports PMBus Part I, Part II & Part III Rev 1.4 
+(55h) 
+MFR_ID 
+Block 
+Read/Write 
+Cnt = 2 
+99h 
+The MFR_ID command is used to either set or 
+read the manufacturer's ID (IF - ASCII 0x4649). 
+MFR_ID is typically only set once, at the time of 
+manufacture. 
+MFR_MODEL Block 
+Read/Write 9Ah The MFR_MODEL command is used to either set 
+or read the manufacturer's model number. 
+--- PAGE 63 ---
+  
+ 
+Final Datasheet 63 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+Cnt = 2 MFR_MODEL is typically set once, at the time of 
+manufacture. 
+MFR_REVISION Block Read, 
+Cnt = 2 9Bh 
+The MFR_REVISION command is used to either 
+set or read the manufacturer's revision number. 
+Each manufacturer uses the format of their 
+choice for the revision number. MFR_REVISION is 
+typically set at the time of manufacture or if the 
+device is updated to a later revision. 
+MFR_DATE 
+Block 
+Read/Write 
+Cnt = 2 
+9Dh 
+The MFR_DATE command is used to either set or 
+read the date the device was manufactured. 
+While each manufacturer uses the format of their 
+choice for the revision number, the 
+recommended MFR_DATE format is YYMMDD 
+where Y, M and D are integer values from 0 to 9, 
+inclusive. MFR_DATE is typically only set once, at 
+the time of manufacture 
+MFR_PIN_MAX Read Word A3h Returns the maximum rated value, in watts, of 
+the input power. Exp = 3 
+MFR_VOUT_MIN Read Word A4h Returns the minimum rated value, in Volts, to 
+which the output voltage may be set. Exp = -8 
+MFR_VOUT_MAX Read Word A5h Returns the maximum rated value, in Volts, to 
+which the output voltage may be set. Exp = -8 
+MFR_IOUT_MAX Read Word A6h Returns the maximum rated value, in Amperes, to 
+which the output may be loaded. Exp = 1 
+MFR_POUT_MAX Read Word A7h Returns the maximum rated output power, in 
+watts, that the unit is rated to supply. Exp = 3 
+MFR_TAMBIENT_MAX Read Word A8h 
+Returns the maximum rated ambient 
+temperature, in degrees Celsius, in which the unit 
+may be operated. Exp = 0 
+IC_DEVICE_ID Block Read 
+Cnt = 2 ADh Returns a 1 byte code with the following values: 
+9Eh = XDPE1A2G5 
+IC_DEVICE_REV Block Read 
+Cnt = 2 AEh The IC revision that is stored inside the IC 
+MFR_IOUT_MIN Read Word AFh Returns the minimum rated value, in Amperes, to 
+which the output may be loaded. Exp = 1 
+USER_DATA_00 
+Block 
+Read/Write 
+Cnt = 2 
+B0h General Purpose USER Scratchpad 
+USER_DATA_01 
+Block 
+Read/Write 
+Cnt = 2 
+B1h General Purpose USER Scratchpad 
+FW_CONFIG_REGULATION 
+Block 
+Read/Write 
+Cnt = 14 
+C5h 
+Read or Write 14 bytes for regulation controls: 
+Bit <111:96> MFR_RDROOP_IDELTA_SEG3 
+Bit <95:80> MFR_RDROOP_ITHR_SEG2 
+Bit <79:72> FATR_PID_KD_UV 
+--- PAGE 64 ---
+  
+ 
+Final Datasheet 64 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+Bit <71:64> FATR_PID_KP_UV 
+Bit <63:48> FATR_PID_KD_UV 
+Bit <47:32> MFR_RDROOP_RLL_SEG3 
+Bit <31:24> MFR_RDROOP_RLL_SEG2 
+Bit <23:16> CURRENT_LIMIT_AT_STARTUP 
+Bit <15:12> Reserved 
+Bit <11> EN_RAMP_SWITCHING_FREQ 
+Bit <10> Reserved 
+Bit <9> EN_IOUT_APC_TEMP_COMP 
+Bit <8:6> Reserved 
+Bit <5> EN_ILIM_STARTUP 
+Bit <4> EN_C_ESTIMATE 
+Bit <3> Reserved 
+Bit <2:1> FSW_MAX_PERIOD 
+Bit <0> Reserved 
+FW_CONFIG_TELEMETRY 
+Block 
+Read/Write 
+Cnt = 4 
+C6h 
+Read or Write 4 bytes for telemetry controls: 
+Bit <31:24> Reserved 
+Bit <23:20> READ_DUTY_EXP 
+Bit <19:16> READ_IIN_EXP 
+Bit <15:12> READ_IOUT_EXP 
+Bit <11:8> READ_VIN_EXP 
+Bit <7:5> Reserved 
+Bit <4> DISABLE_AUTO_EXPONENT 
+Bit <3> FW_FILTER_EN 
+Bit <2:0> READ_POWER_EXP 
+MFR_COMMON_FAULT_STATUS1 
+Block Read 
+Cnt = 4 C7h 
+Returns additional status information when the 
+STATUS_MFR_SPECIFIC Bit 5 is set: 
+Bit <31:24> Reserved 
+Bit <23:8> FAULTED_PHASE 
+Bit <7> TSEN_HI Fault 
+Bit <6> P2CL, NCL 
+Bit <5> FAST_VMODE_EVENT 
+Bit <4> CURRENT_LIMITED 
+Bit <3> Autophase Detect Short or VDRV UVLO 
+Bit <2> Autophase Detect Open 
+Bit <1> MIN_TMON_CHK_NOT_OK_AFTER_TON_DELAY 
+Bit <0> VAUX_UV 
+FW_CONFIG_FAULTS Read/Write 
+Byte C8h 
+Sets the Delay time unit for the fault retry 
+response: 
+Bit <7:6> VOUT_DELAY_UNIT 
+Bit <5:4> VIN_DELAY_UNIT 
+Bit <3:2> IOUT_DELAY_UNIT 
+Bit <1:0> TEMP_DELAY_UNIT 
+--- PAGE 65 ---
+  
+ 
+Final Datasheet 65 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+MFR_COMMON_FAULT_STATUS2 Block Read 
+Cnt = 4 C9h 
+Returns additional status information when the 
+STATUS_MFR_SPECIFIC Bit 5 is set: 
+Bit <31:29> Reserved 
+Bit <28> OTHER_LOOP_FAULT 
+Bit <27:5> Reserved 
+Bit <4> VDD UVLO 
+Bit <3> TSEN_PI_CAL_FAULT 
+Bit <2> SLOT_ASSIGN_FAULT 
+Bit <1> PWR_IN_ALERT 
+Bit <0> Reserved 
+MFR_SETUP_PASSWORD 
+Block 
+Read/Write 
+Cnt = 4 
+CAh 
+Password setup command. This can only be 
+modified when disable security once has the 
+same matching setup password. 
+MFR_DISABLE_SECURITY_ONCE 
+Block 
+Read/Write 
+Cnt = 4 
+CBh 
+Password try location. If correct value is used the 
+setup password command is unlocked. 
+Command Masking is set in D2h and D3h. Returns 
+the access state: 0 = unlocked, 1 = locked, 2 = 
+deadlocked (requires reset to unlock) 
+MFR_SELECT_TEMPERATURE_SENSOR Read/Write 
+Word CCh 
+This sets the temperature source used by Iout 
+Temp Comp, Fault and Telemetry. 
+Bit <5> Iout Temp Comp Select: 
+0 = READ_TEMPERATURE_2,  
+1 = READ_TEMPERATURE_1 
+Bit <4:3> Fault Source Select 
+0 = TSEN1, 1 = TSEN2, 2 = TSEN Internal 
+Bit <2:0> READ Temperature 1 and 2 select: 
+0 = TSEN1, TSEN2 
+1 = TSEN1, TSEN Internal 
+2 = TSEN2, TSEN1 
+3 = TSEN2, TSEN Internal 
+4 = TSEN Internal, TSEN1 
+5 = TSEN Internal, TSEN2 
+MFR_GAMER 
+Block 
+Read/Write 
+Cnt = 4 
+CDh Gamer Mode Commands 
+MFR_AHB_ADDRESS 
+Block 
+Read/Write 
+Cnt = 4 
+CEh 
+Used in conjunction with MFR_REG_WRITE and 
+MFR_REG_READ PMBus commands as the 
+address pointer, will auto increment after each 
+write/read 
+MFR_DEBUG_BUFF Block Read 
+Cnt = 8 CFh 
+Provides internal access to the microprocessor 
+Debug Buffer. Used to determine what type of 
+processor faults are occurring. 
+MFR_SECURITY_BIT_MASK_LOW Block 
+Read/Write D2h Mask bits for Command Codes 0-127, a 1 in the 
+bit position is protected, and a 0 in the bit 
+--- PAGE 66 ---
+  
+ 
+Final Datasheet 66 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+COMMAND PMBus 
+PROTOCOL 
+COMMAND 
+CODE DESCRIPTION 
+Cnt = 16 position is unprotected. 
+MFR_SECURITY_BIT_MASK_HIGH 
+Block 
+Read/Write 
+Cnt = 16 
+D3h 
+Mask bits for Command Codes 128-255, a 1 in the 
+bit position is protected, and a 0 in the bit 
+position is unprotected. 
+MFR_ REG_WRITE Block Write 
+Cnt = 4 DEh Used in conjunction with address provided in 
+MFR_AHB_ADDRESS for AHB write 
+MFR_REG_READ Block Read 
+Cnt = 4 DFh Used in conjunction with address provided in 
+MFR_AHB_ADDRESS for AHB read 
+MFR_PID 
+Block 
+Read/Write 
+Cnt = 31 
+F2h PID settings registers for 3 states: soft start, 
+steady state, high frequency load oscillation. 
+MFR_COUT_CONFIG Read/Write 
+Word F4h Reserved 
+MFR_READ_COUT Read Byte F5h Reserved 
+MFR_FIRMWARE_COMMAND_DATA 
+Block 
+Read/Write 
+Cnt = 4 
+FDh 
+MFR_FIRMWARE_COMMAND protocol always 
+involves a block write to 
+MFR_FIRMWARE_COMMAND_DATA (0xFD) then a 
+byte write to MFR_FIRMWARE_COMMAND (0xFE) 
+then a block read of 
+MFR_FIRMWARE_COMMAND_DATA (0xFE). 
+MFR_FIRMWARE_COMMAND Write Byte FEh 
+Used in conjunction with 
+MFR_FIRMWARE_COMMAND_DATA when 
+required 
+ 
+8.16.2 11-bit Linear Format 
+Monitored parameters use the Linear Data Format (Figure 34) encoding into 1 Word (2 bytes), where: 
+NYValue 2=
+ 
+Note N and Y are “signed” values. All commands, other than those using the format described by VOUT_MODE, 
+use this format unless otherwise noted. 
+ 
+ 
+7 6 5 4 3 2 1 0 7 6 5 4 3 2 1 0
+High Data Byte Low Data Byte
+N Y
+ 
+Figure 34 11-bit Data format 
+8.16.3 16-bit Linear Format 
+This format is only used for VOUT related commands (i.e. READ_VOUT, VOUT_COMMAND, VOUT_MARGIN_HIGH, 
+VOUT_MARGIN_LOW, POWER_GOOD_ON, and POWER_GOOD_OFF): 
+--- PAGE 67 ---
+  
+ 
+Final Datasheet 67 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+NYValue 2=
+ 
+Note N and Y are “signed” values. If VOUT is set to linear format (by VOUT_MODE), then N is set by the 
+VOUT_MODE command and only Y is returned in the data-field as a 16-bit unsigned number. 
+ 
+ 
+ 
+16-bit Data format 
+8.17 Configuration management 
+The XDPE1A2G5 provides non-volatile memory (NVM) for storage of most of the programmable registers in the 
+device. This includes all trim and configuration registers, and patch space for firmware updates. Thus, the 
+controller can startup and operate autonomously after power-on reset of the device, without user or system 
+intervention. 
+The memory macro is a one-time programmable (OTP) device that consists of 64 Kbytes of memory space. The 
+memory is split into 5 partitions as shown in Figure 35.  Partition 0 stores trim and user configuration space.  
+Partition 1 stores the patch errata that is used to update the firmware stored in ROM.  Partition 2 can be used to 
+store a cutomer specific patch.  Partition 4 stores up to ten black box data packets.  Partitioning and Patch 
+Loading tools are available in the Infineon XDPTM Designer GUI and Gang Programmer Software. 
+ 
+• Trim
+• Config User
+• PMBus User
+• AVS User
+• Patch Errata
+Partition0
+Partition1
+Partition2 • Custom Patch
+ Partitioning
+• Black Box Data
+Partition3
+Partition4
+32 Kbytes
+26 Kbytes
+4 Kbytes
+0 Kbytes
+2 Kbytes
+ 
+Figure 35 OTP partitioning 
+ 
+The memory macro is inherently a one-time programmable device. However, multiple-time programming is 
+provided by dividing the macro into multiple “Base” or “Partial” configurations. Table 38 shows the amount of 
+memory space required for the first base configuration plus trim, and also the size of all subsequent base config 
+
+--- PAGE 68 ---
+  
+ 
+Final Datasheet 68 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+updates. If memory was programmed with all 3 User sections every time an update was made, the number of 
+re-writes would be limited to 22. 
+Table 38 Size of first base configuration plus trim and maximum re-writes (Note 19) 
+Section # Section Type Size (bytes) 
+1 Trim (one-time write) 340 
+2 Config User 748 
+3 PMBus User 576 
+4 AVS User 48 
+Memory size for first write (Section 1+2+3+4) 1,712 
+Memory size for all subsequent based configs (Section 2+3+4) 1,372 
+Number re-writes to memory (Base Configs Only) 22 times 
+ 
+Note:  
+19. These sizes are based on a typical configuration. Use the OTP tools provided in the XDP TM Designer GUI to 
+validate sizes for each design. 
+ 
+Memory space can be conserved and thus allow for more re-writes, if updates are limited to 1 User Section, or if 
+“Partial” configurations are used. A Partial configuration can be used for each User Section to only store the 
+differences from the base configuration. The Partial storage size is approximately 10 to 20 bytes per difference 
+depending on which Partial section is being stored (Config = 10 bytes per, PMBus = 20 bytes per). This would 
+allow for 1000’s of re-writes after the initial programming of the base configuration plus trim. 
+The memory space can be configured to store multiple configurations that are selectable by the external 
+resistor connected to the XADDR pin. This capability is referred to as “multi-config”.  This allows customers to 
+order one part number that can support multiple types of rails & applications. The XDPE1A2G5 controller is 
+capable of storing up to 16 configurations. Table 39 shows an example of 4 multi-configs programmed into the 
+device; one example using all Base Configs and one using Partial Configs. Both types of programming are valid 
+and programming files can be configured using the OTP Tools provided in the XDPTM Designer GUI. 
+Table 39 4x Multi-config – Base Config versus Partials 
+Raddr Xvalent Config (Note 20) Size (Bytes) Config (Note 21) Size (Bytes) 
+49.9 kW XV0 Base0 + Trim 1,712 Base0 + Trim 1,712 
+38.3 kW XV1 Base1 1,372 Partial Config1 80 
+22.6 kW XV2 Base2 1,372 Partial Config2 80 
+29.4 kW XV3 Base3 1,372 Partial Config3 80 
+ Total Size: 5,828 Total Size: 1,952 
+ Size Remaining: 26,940 Size Remaining: 30,816 
+ 
+Note:  
+20. Each Base Config consists of 2x User Sections (Config, and PMBus) 
+21. Each Partial Config has 8 register differences totaling 80 bytes. 
+ 
+--- PAGE 69 ---
+  
+ 
+Final Datasheet 69 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+For additional and more in depth information on configuration management, refer to application note AN001-
+XDPE1x2xx. 
+8.18 Security 
+8.18.1 Write Protect  
+The WRITE_PROTECT (10h) command is used to control writing to the PMBus device. The intent of this 
+command is to provide protection against accidental changes. The command settings of 0x20, 0x40, and 0x80 
+are not intended to provide protection against deliberate or malicious changes to a device's configuration or 
+operation. The command setting of 0x01 will provide an additional level of protection against deliberate or 
+malicious changes because once set it cannot be changed until device reset. Available settings are shown in 
+Table 40 below. STATUS_CML (7Eh) [6] "Invalid/Unsupported Data" is asserted when a protected command is 
+written to. 
+Table 40 WRITE_PROTECT (10h) 
+Value Description 
+0x00 No Write Protection 
+0x01 Write Protect All. Will lock once written until Reset 
+0x20 Write Protection except for WRITE_PROTECT, OPERATION, PAGE, ON_OFF_CONFIG, and 
+VOUT_COMMAND commands 
+0x40 Write Protection except for WRITE_PROTECT, OPERATION, and PAGE commands 
+0x80 Write Protection except for WRITE_PROTECT 
+Note: The WRITE_PROTECT command is not valid if password protection is used.  Read PMBUS 
+command 0xCB.  If 0xCB = 1, password protection is enabled 
+8.18.2 Password Protect 
+The XDPE controller provides a PMBus password protection feature, which prevents selected PMBus 
+commands from being accidentally modified by unauthorized users. A password can be set up with the 
+MFR_SETUP_PASSWORD (CAh) to protect PMBus commands selected in the MFR_SECURITY_BIT_MASK_LOW 
+(D2h) and MFR_SECURITY_BIT_MASK_HIGH (D3h) commands. The length of the password is 4-bytes. A read of 
+the MFR_SETUP_PASSWORD will return a hashed value of the set password. The password protection will 
+remain disabled as long as there is no write to the MFR_SETUP_PASSWORD command and storage to OTP. The 
+MFR_DISABLE_SECURITY_ONCE (CBh) command is used to disable the protection once the protection is 
+enabled with a write to the MFR_SETUP_PASSWORD command. Entering the correct password at this 
+command will unlock the protection. Reading MFR_DISABLE_SECURITY_ONCE command will provide the 
+status of the security: 0 - Security Unlocked, 1 - Security Locked, 2 - Security Deadlocked (incorrect password 
+enter 4x, reset to try again). STATUS_CML (7Eh) [6] "Invalid/Unsupported Data" is asserted when a protected 
+command is written to. 
+ 
+Table 41 PMBus password protection commands 
+Command Code Command Name Description 
+CAh MFR_SETUP_PASSWORD A Write to this command sets up 
+the password protection. A Read 
+of the command returns a Hash 
+--- PAGE 70 ---
+  
+ 
+Final Datasheet 70 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+Command Code Command Name Description 
+Code of the set password. 
+CBh MFR_DISABLE_SECURITY_ONCE Writing the correct password to 
+this command unlocks the 
+password protection. A Read of 
+this command provides password 
+protection status. 
+0 - no protection 
+1 - protection enabled 
+2 - to many incorrect passwords 
+entered (4x). Must reset to try 
+again. 
+D2h MFR_SECURITY_BIT_MASK_LOW Selects command codes 0x00 to 
+0x7F to be protected. 
+D3h MFR_SECURITY_BIT_MASK_HIGH Selects command codes 0x80 to 
+0xFF to be protected. 
+ 
+ 
+8.19 Blackbox feature 
+The XDPE1A2G5C allows the user to save key telemetry data and fault status registers during a fault off 
+shutdown event.   
+8.19.1 User configuration 
+The user needs to enable the blackbox feature using the Infineon XDPTM Designer GUI. The blackbox feature is 
+disabled in the default configuration file programmed at the factory 
+ 
+ 
+Figure 36   Blackbox enable 
+The user needs to set the faults that will cause the blackbox data to be written to OTP.  The following faults can 
+be set to force an OTP upload; 
+• PWM Short 
+• TON_MAX_FAULT (PMBUS) 
+• Power stage fault 
+• Over temperature fault 
+• Input over current 
+
+--- PAGE 71 ---
+  
+ 
+Final Datasheet 71 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+• Relative output over voltage 
+• Relative output under voltage 
+• Output over current 
+• Input over voltage 
+• Fixed output under voltage 
+• Fixed output over voltage 
+ 
+ 
+ 
+Figure 37 Configuration settings to trigger a blackbox OTP upload event  
+These blackbox configuration bits are all part of the config file that gets stored in OTP 
+8.19.2 Stored blackbox data 
+The blackbox data is stored in 200 byte increments.  There is enough storage to allow for the data from 10 
+shutdown events to be stored in OTP.  The user can look at the data from any individual event by using the 
+Infineon XDPTM Designer GUI.  The Infineon XDPTM Designer GUI also allows the user to store the OTP contents to 
+a file and view the contents of a stored file. The blackbox function requires that the 3.3V VCC voltage be 
+available for at least 20ms after a fault to store the data to OTP  
+ 
+
+--- PAGE 72 ---
+  
+ 
+Final Datasheet 72 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+ 
+Figure 38 OTP blackbox image selection drop down 
+The blackbox stores; 
+• Periodic telemetry (updated every 1ms)  
+• The fault that cause the OTP upload 
+• Telemetry immediately after the fault 
+• Timestamp that indicates the length of time from 3.3V POR to when the fault occurred.   
+The timestamp range is 0 to 20 years in 1ms increments.   
+ 
+
+--- PAGE 73 ---
+  
+ 
+Final Datasheet 73 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+ 
+ 
+Figure 39 Sample of decoded blackbox OTP data  
+8.20 TLVR secondary open and short detection 
+The controller has a detection mechanism to determine if the output inductor is open or short during the 
+manufacturing process and before systems are shipped to the field. Based upon the measured output voltage 
+and phase current during the detection process, it can be determined if the output inductors are good or bad. 
+More precisely, it can be determined if there is an open or short, and also determine which phase has been 
+shorted. 
+ 
+ 
+Power Stage
+1
+Power Stage
+n
+Iphase1
+Iphasen
+Lo1
+Lon
+.
+.
+.
+PWM1
+PWMn
+Short
+Open
+Digital Controller Lc  
+ 
+Figure 40 Shorted or open secondary on TLVR inductors 
+
+--- PAGE 74 ---
+  
+ 
+Final Datasheet 74 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+The TLVR Open and Short Commands are only allowed when the controller is in the inactive state (VREN is de-
+asserted). The user will setup the Open and Short commands based upon the design and the expected “Good” 
+Vout and Iout thresholds. The setup parameters will be written to the MFR_FIRMWARE_COMMAND_DATA before 
+the Open or Short command is executed with the MFR_FIRMWARE_COMMAND. Required parameters for each 
+command are shown in Table 42 and Table 43. 
+Table 42 Open Command – MFR_FIRMWARE_COMMAND = 0x33/0x50 for bank 0/1 
+Setup Parameters Bit Location Description 
+Pulse Count Bit [3:0] Sets the number of pulses fired during the test. 0 to 15 pulses 
+Pulse Width Bit [7:4] Sets the pulse width of the fired pulse. 50 to 275 ns, 15 ns resolution 
+Vout Threshold Bit [15:8] Sets the output voltage threshold level. 0 to 2 V, 5 mV resolution 
+Iout Threshold Bit [23:9] Sets the output current threshold level. 0 to 510 A, 2 A resolution 
+PWM Firing Map Bit [27:24] Sets the PWM firing location. 0 = PWM1, 1 = PWM2… 15 = PWM16 
+Reserved Bit [31:28]  
+Table 43 Short Command – MFR_FIRMWARE_COMMAND = 0x34/0x51 for bank 0/1 
+Setup Parameters Bit Location Description 
+Pulse Count Bit [3:0] Sets the number of pulses fired during the test. 0 to 15 pulses 
+Pulse Width Bit [7:4] Sets the pulse width of the fired pulse. 50 to 275 ns, 15 ns resolution 
+Vout Threshold Bit [15:8] Sets the output voltage threshold level. 0 to 2 V, 5 mV resolution 
+Iout Threshold Bit [23:16] Sets the output current threshold level. 0 to 510 A, 2 A resolution 
+PWM Firing Map Bit [27:24] Firing Map is ignored and automatically one phase at one time based 
+on total phase map at the rate of about 20KHz 
+Auto Complete Bit [28] Set to 1 to ignore set PWM firing location and auto detect each phase 
+in the phase map 
+ 
+Following the execution of each command, the pass/fail, and measured Vout and Iout results can be returned 
+by performing a read on the MFR_FIRMWARE_COMMAND_DATA. Configuration of the returned data is shown in 
+Table 44 below. 
+Table 44 TLVR Open, short and missing decoding 
+TLVR Open test results decoding 
+Bit location FDh returned value Bit count Definition 
+Bit [0] Pass/ fail result 1 0: Pass 
+1: Fail 
+Note: If Vout and Iout are greater than Vout and Iout 
+threshold, then FDh returns 0 (Pass); otherwise returns 1(Fail) 
+Bit [15:1] Iout measurement 15 Reports peak total Iout 
+Range 0 ~ 2048A with LSB= 1/8 (125 mA) 
+Bit [26:16] Delta Vout measurement 10 Range 0 ~ 8V with LSB = 1/128V (8 mV) 
+Bit [31:27] Not used 15  
+ Total bit count 32  
+TLVR short/ missing test results decoding 
+Bit location FDh returned value Bit count Definition 
+Bit [0] Pass/ fail result 1 0: Pass 
+--- PAGE 75 ---
+  
+ 
+Final Datasheet 75 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Application information 
+R e s t r i c t e d 
+TLVR Open test results decoding 
+1: Fail 
+Note: 
+Short: If Vout and Iout are greater than Vout and Iout 
+threshold, then FDh returns 1 (Fail); otherwise returns 0(Pass) 
+Missing phase: If Vout and Iout are both smaller than Vout and 
+Iout threshold, then FDh returns 1 (Fail); otherwise returns 
+0(Pass) 
+Bit [15:1] Iph measurement 15 Short: Reports the highest phase peak current 
+Missing: Reports the lowest phase peak current 
+Range 0~2048A with LSB = 1/8(125mA) 
+Bit [31:16] Shorted phase location 16 Shorted/missing phase location if auto detect is 
+enabled 
+0~15: Phase 1~phase 16 is short (note: same definition 
+as phase map. The associated bit will be set for faulted phase) 
+ Total bit count 32  
+ 
+--- PAGE 76 ---
+  
+ 
+Final Datasheet 76 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Physical characteristics (56-lead QFN package, 7 mm x 7 mm) 
+R e s t r i c t e d 
+9 Physical characteristics (56-lead QFN package, 7 mm x 7 mm) 
+ 
+ 
+Figure 41 Package 
+
+--- PAGE 77 ---
+  
+ 
+Final Datasheet 77 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Package layout guidelines 
+R e s t r i c t e d 
+10 Package layout guidelines 
+The XDPE1A2G5C is built in a 56-lead QFN package which uses a solid ring frame.  The thermal pad design on 
+the board should be based on the exposed paddle area as shown below. 
+ 
+ 
+Figure 42 PCB PAD Dimensions 
+ 
+ 
+Figure 43 Paste Mask Dimensions 
+
+--- PAGE 78 ---
+  
+ 
+Final Datasheet 78 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Layout considerations 
+R e s t r i c t e d 
+11 Layout considerations 
+In order to optimize voltage regulator performance, it is important to minimize the effects of printed circuit 
+board (PCB) parasitic impedances on the digital controller and power stages. The following layout techniques 
+highlight important practices which should be incorporated during design to optimize the heat-dissipating 
+capabilities of the PCB. For additional layout guidelines and component placement tips, refer to AN002-
+XDPE122xx. 
+11.1 Component placement 
+Within the allotted implementation area, orient the switching components first. The switching components are 
+the most critical because they carry large amounts of energy and tend to generate high levels of noise. The 
+power dissipation of those components should also be taken into consideration during PCB placement. Align 
+the output inductors and power stages such that space between the components is minimized. It is 
+recommended that the same placement is duplicated for all phases. 
+The XDPE1A2G5C controller can be placed off to one side or centered relative to the individual phase switching 
+components. Critical small signal components including the ISEN resistors, TSEN capacitors and voltage 
+feedback RC filters should be placed near the controller. 
+11.2 Routing of AVS signals 
+AVS signal lines are very sensitive to noise sources and should be kept away from switching components. AVS 
+signals need to be ground referenced and routed away from all noise sources such as power stages and switch 
+nodes. 
+ 
+--- PAGE 79 ---
+  
+ 
+Final Datasheet 79 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Package marking 
+R e s t r i c t e d 
+12 Package marking 
+ 
+ 
+ 
+Infineon
+Part number
+Date code
+Pin 1 indicator
+Lot number
+Assembly number
+Additional marking 
+per customer request
+ 
+Figure 44 Package marking 
+--- PAGE 80 ---
+  
+ 
+Final Datasheet 80 of 80 Rev 1.0  
+  2026-02-25  
+XDPE1A2G5C Digital Multi-phase Controller 
+16-phase Dual Loop Voltage Regulator 
+Environmental qualifications 
+R e s t r i c t e d 
+13 Environmental qualifications 
+ 
+Table 45  
+Qualification Level Industrial 
+Moisture Sensitivity QFN Package MSL3 
+ESD 
+Human Body Model JS-001, Class 2 
+Charged Device Model JS-002, Class C3 
+Latch-up JESD78, Class 2 
+RoHS Compliant Yes 
+ 
+ 
+ 
+ 
+ 
+Table 46  History 
+rev date Descrption 
+1.0 02/25/2026 Page 15, Add 333 Ω accuracy to EC table 
+Page 24, section 8.3, add tables 9 & 10 for phase current max/min 
+Page 24, add section 8.3.1 to show support for currents above 2048 A  
+Page 32, add table of MFR specific AVS commands 
+Page 33, add tables for AVS telemetry resolution 
+Page 39, update IOUT max in Table 28 
+Page 50, section 8.13, update load line LSB description 
+Page 51, update table 35 pin 51 descritption from VAUX to GPIO 
+Page 52, add +1 stride values to table 36 
+Page 54, update PMBUS 1.3.1 to 1.4 
+Page 62, update command 0x98h to 0x55 (rev 1.4) 
+Page 67, update section 8.17 with new size values 
+Page 70, add section 8.19, Black Box feature 
+Page 73, add section 8.20, TLVR fault detection 
+ 

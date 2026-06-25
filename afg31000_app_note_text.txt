@@ -1,0 +1,315 @@
+
+--- PAGE 1 ---
+USB Control of the AFG31000 
+Arbitrary Function Generator Using 
+the 4200A-SCS Parameter Analyzer
+––
+APPLICATION NOTE
+
+
+--- PAGE 2 ---
+Introduction
+The AFG31000 Series Arbitrary Function Generators (AFGs), 
+shown in Figure 1, are high-performance instruments with 
+built-in waveform generation applications and real-time 
+waveform monitoring. The AFG31000 Series provide pulse 
+and function generation with arbitrary waveform capability. 
+Depending on the model in the family of function generators, 
+they can be either one or two channels and can range in 
+output frequency from 25 MHz to 250 MHz depending on 
+what mode is used.
+To automate waveform generation, the AFG31000 can be 
+remotely controlled via USB. Remote control can be done 
+through sending commands via USB using NI VISA. The 
+commands for the AFG31000 follow the SCPI standard. For 
+a list of available commands please refer to the AFG31000 
+Series Arbitrary Function Generator Programmer’s Manual  
+at tek.com.
+Starting with Clarius V1.11, the AFG31000 can now be 
+remotely controlled with the Keithley 4200A-SCS Parameter 
+Analyzer using USB communication and the 4200A-SCS’s 
+built-in interactive software, Clarius.  Adding an AFG31000 
+to the system configuration can be useful if a device that is 
+being tested by the Parameter Analyzer may also need to be 
+stimulated by pulsing or other waveform generation.  This 
+application note will explain how to set-up and control the 
+AFG31000 with the 4200A-SCS.
+Figure 1. AFG31000 Series Arbitrary Function Generator (AFG31102).
+2  |  WWW.TEK.COM
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 3 ---
+Making Connection from the AFG31000 to the 4200A-SCS
+The AFG31000 can be connected to the 4200A-SCS through a USB A to USB B cable. The USB B side of the cable gets 
+connected to the respective port on the rear pannel of the AFG31000. The USB A side of the cable is then connected to any of 
+the USB A ports on the 4200A-SCS, which has four USB A ports on the rear panel of the 4200A-SCS and four USB A ports on 
+the front panel of the 4200A-SCS. These USB connections are shown in Figure 2 .
+4200A-SCS Parameter Analyzer Rear Panel AFG31000 Rear Panel
+Figure 2. USB connections from the 4200A-SCS to the AFG31000.
+WWW.TEK.COM  |  3
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 4 ---
+Adding an AFG31000 in the Keithley Configuration Utility, KCon
+Once the AFG31000 is connected to the 4200A-SCS via USB, the AFG31000 needs to be added into the Keithley Configuration 
+Utility, or KCon. The KCon application manages the configuration and interconnections between the test system components 
+that are controlled by the Clarius software. The KCon application can be found on the desktop of the 4200A-SCS. To add an 
+AFG31000 in KCon, press the Update button at the top of the screen as highlighted in Figure 3 .
+Figure 3. KCon Update button highlighted.
+4  |  WWW.TEK.COM
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 5 ---
+By selecting Update, the AFG31000 will be autodetected and added to the system configuration. If there is only one AFG31000 
+connected, an instrument named AFG1 will appear as seen in Figure 4 . KCon supports up to four AFG31000s, so if four 
+AFG31000s are connected AFG1-AFG4 will appear in the system configuration. Once the AFG31000 is added in KCon, it will be 
+available to use remotely through Clarius.
+Figure 4. KCon System Configuration with AFG1 present.
+WWW.TEK.COM  |  5
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 6 ---
+Using the AFG31000 user library
+An AFG31000 user library was added to Clarius V1.11 to configure the AFG31000 to different waveforms and then output those 
+waveforms. This user library, called AFG31000_examples_ulib , provides an example of controlling an AFG31000 through Clarius. 
+Table 1 shows a description and settable parameters of the four user modules in AFG31000_exam ples_ulib.
+User Module Description Settable Parameters
+afg31000_config_2ch Configures and outputs an 
+arbitrary waveform to each 
+channel of an AFG31000. 
+Both channels are set to burst 
+mode with both channels 
+being triggered simultaneously. 
+The list of possible arbitrary 
+waveforms to configure and 
+output to each channel are sine, 
+square, ramp, pulse, sin(x)/x, dc, 
+Gaussian, Lorentz, exponential 
+rise, exponential decay, and 
+haversine.
+• AFG_ID  – AFG ID from KCon
+• Channel1, Channel2 – waveform type for each channel
+• LoadCh2, LoadCh2  – load for each channel
+• FrequencyCh1, FrequencyCh2  – frequency for each channel
+• AmplitudeCh1, AmplitudeCh2  – amplitude for each channel
+• OffsetCh1, OffsetCh2  – offset for each channel
+• Num_CyclesCh1, Num_CyclesCh2  – number of cycles to output 
+waveform for each channel
+• DC_RuntimeCh1, DC_RuntimeCh2  – amount of time to output DC 
+waveform for each channel
+• SymmetryCh1, SymmetryCh2  – ramp waveform symmetry for 
+each channel
+• Duty_CycleCh1, Duty_CycleCh2  – pulse waveform duty cycle for 
+each channel
+afg31000_config_1ch Configures and outputs an 
+arbitrary waveform to channel 
+1 of an AFG31000. Channel 1 
+is set to burst mode. The list of 
+possible arbitrary waveforms to 
+configure and output to channel 
+1 are sine, square, ramp, pulse, 
+sin(x)/x, dc, Gaussian, Lorentz, 
+exponential rise, exponential 
+decay, and haversine.
+• AFG_ID  – AFG ID from KCon
+• Channel1 – waveform type
+• Load – load for channel 1
+• Frequency – frequency for channel 1
+• Amplitude – amplitude for channel 1
+• Offset – offset for channel 1
+• Num_Cycles – number of cycles to output waveform
+• DC_Runtime  – amount of time to output DC waveform
+• Symmetry – ramp waveform symmetry
+• Duty_Cycle – pulse waveform duty cycle
+afg31000_segarb_file_load_2ch Configures and outputs created 
+arbitrary waveform files (.twfx), 
+from either the internal storage 
+of an AFG31000 or an USB drive 
+connected to an AFG31000, to 
+each channel of an AFG31000. 
+Both channels of an AFG31000 
+are set to burst mode with 
+both channels being triggered 
+simultaneously. 
+• AFG_ID  – AFG ID from KCon
+• Channel1, Channel2 – channel on or off
+• LoadCh1, LoadCh2 – load for each channel
+• FilenameCh1, FilenameCh2  – filename of the arbitrary waveform file 
+to load for each channel
+• StorageCh1, StorageCh2  – storage location of file for each channel
+• FrequencyCh1, FrequencyCh2  – frequency for each channel
+• Num_CyclesCh1, Num_CyclesCh2  – number of cycles to output 
+waveform for each channel
+afg31000_segarb_file_load_1ch Configures and outputs a 
+created arbitrary waveform file 
+(.twfx), from either the internal 
+storage of an AFG31000 or an 
+USB drive connected to an 
+AFG31000, to channel 1 of an 
+AFG31000. Channel 1 is set to 
+burst mode.
+• AFG_ID  – AFG ID from KCon
+• Channel1 – channel on or off
+• Load – load for channel 1
+• Filename – filename of the arbitrary waveform file to load to channel 1
+• Storage – storage location of file
+• Frequency – frequency for channel 1
+• Num_Cycles – number of cycles to output waveform for channel 1
+Table 1. User modules in the AFG31000_examples_ulib  User Library.
+6  |  WWW.TEK.COM
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 7 ---
+The afg31000_segarb_file_load_Xch  user modules both take 
+filenames as inputs for the arbitrary waveform files to load 
+to the AFG31000 and output. To see the available files on 
+the internal or USB drive storage of the AFG31000, go to the 
+ArbBuilder app from the home screen of the AFG31000 as 
+seen in the blue highlighted icon in Figure 5 .
+Figure 5. AFG31000 Home Screen ArbBuilder highlighted.
+Once in the ArbBuilder app, select open located in the 
+bottom left corner, and all the available files, on both the 
+internal storage and the USB drive attached to the AFG31000, 
+will appear on the screen of the AFG31000 as seen in 
+Figure 6. Available files stored on a USB drive can also be 
+seen by connecting the USB drive to a computer and looking 
+for files with the tfwx file extension.
+Figure 6. View of available files in Internal Storage (top), and 
+USB storage (bottom).
+To create and save arbitrary waveform files to use with the 
+afg31000_segarb_file_load_Xch  user modules, the ArbBuilder 
+app can also be used. For instructions on how to be use the 
+ArbBuilder app to create arbitrary waveforms, please refer 
+to the AFG3100 Series Arbitrary Function Generator User’s 
+Manual at tek.com.
+WWW.TEK.COM  |  7
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 8 ---
+Using the built-in library tests and project
+For convenience, four AFG31000 tests and a project have been added to Clarius’ extensive built-in Library. These tests were 
+created using the AFG31000_examples_ulib  user library. The project, called afg31000-config-output , has four tests with each 
+test corresponding to one of the four user modules previously described. Table 2  shows the user modules used for each test in 
+the project.
+Test User Module
+afg31000-config-2ch afg31000_config_2ch
+afg31000-config-1ch afg31000_config_1ch
+afg31000-segarb-2ch afg31000-segarb_file_load_2ch
+afg31000-segarb-1ch afg31000-segarb_file_load_1ch
+Table 2. User Modules for each test.
+These tests and the project can easily be found in their respective sections of the Select view by entering the keywords 
+AFG31000, AFG, 31000, Arbitrary Function Generator, Arbitrary Waveform, or Function Generator into the search bar as seen 
+in Figure 7.
+Figure 7. AFG test search.
+8  |  WWW.TEK.COM
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 9 ---
+The default view of the afg31000-config-2ch  test’s Configure view in the afg31000-config-output  project can be seen in 
+Figure 8. The settable parameters that apply for each channel are shown in groups labeled after their respective channel. The 
+available AFGs, as configured in KCon, can be selected under the Instrument group.
+Figure 8. afg31000-config-2ch  Test Configure view.
+After you Run one of these tests, a return value of 0 is returned to the Clarius sheet in the Analyze view, if the test ran 
+successfully. If any other value is returned, then the test failed to send the waveforms as set up in the Configure view of the 
+selected test. Figure 9 shows the results after a successful output from the AFG31000.
+Figure 9. Return value after successful test.
+WWW.TEK.COM  |  9
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 10 ---
+An example of the afg31000-config-2ch  test being ran can be seen below. The configure view of the afg31000-config-2ch  
+test running can be seen in Figure 10 . The waveform configured to channel 1 is a square wave with a frequency of 50 kHz, an 
+amplitude of 5 Vpp, and an offset of 0 V. This waveform is set to output for 5 cycles. The waveform configured to channel 2 is a 
+sine wave with a frequency of 50 kHz, an amplitude of 5 Vpp, an offset of 0 V. This waveform is set to output for 10 cycles.
+Figure 10. Configure view of afg-config-2ch  test running.
+When the test runs, the settings are sent to the AFG31000 channels by SCPI commands through NI Visa via USB. The result of 
+the setup seen in Figure 10  can be seen on the AFG31000’s screen in Figure 11.
+Figure 11. AFG31000 Basic Mode after settings sent.
+10  |  WWW.TEK.COM
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 11 ---
+Once the settings are applied to the AFG31000’s channels and the outputs are turned on, the channels are triggered 
+simultaneously. The resulting output of these waveforms, from the AFG31000, can be seen in the scope screen capture in 
+Figure 12. A Tektronix MSO56 oscilloscope was used to capture the arbitrary waveforms.
+Figure 12. MSO56 Oscilloscope capture of waveforms output by the AFG31000.
+Each channel of the AFG31000’s output is shut off, once the channel is done sending its configured waveform. Once each 
+channel output of the AFG31000 is shut off after a successful run, a 0 is returned to the Clarius sheet as shown earlier in Figure 
+9. The Help pane lists descriptions of Returned Values for numbers other than 0.
+Conclusion
+Using Clarius V1.11 or higher, the 4200A-SCS can remotely control an AFG31000 through USB communication via NI VISA. A 
+new user library has been created to enable the Clarius software to easily control the AFG31000. Tests have been added to the 
+Library that can be added to a project to automate waveform generation.
+WWW.TEK.COM  |  11
+USB Control of the AFG31000 Arbitrary Function Generator 
+Using the 4200A-SCS Parameter Analyzer
+APPLICATION NOTE
+
+--- PAGE 12 ---
+Contact Information:
+ Australia 1 800 709 465
+Austria* 00800 2255 4835
+Balkans, Israel, South Africa and other ISE Countries +41 52 675 3777
+Belgium* 00800 2255 4835
+Brazil +55 (11) 3530-8901
+Canada 1 800 833 9200
+Central East Europe / Baltics +41 52 675 3777
+Central Europe / Greece +41 52 675 3777
+Denmark +45 80 88 1401
+Finland +41 52 675 3777
+France* 00800 2255 4835
+Germany* 00800 2255 4835
+Hong Kong 400 820 5835
+India 000 800 650 1835
+Indonesia 007 803 601 5249
+Italy 00800 2255 4835
+Japan 81 (3) 6714 3086
+Luxembourg +41 52 675 3777
+Malaysia 1 800 22 55835
+Mexico, Central/South America and Caribbean 52 (55) 88 69 35 25
+Middle East, Asia, and North Africa +41 52 675 3777
+The Netherlands* 00800 2255 4835
+New Zealand 0800 800 238
+Norway 800 16098
+People’s Republic of China 400 820 5835
+Philippines 1 800 1601 0077
+Poland +41 52 675 3777
+Portugal 80 08 12370
+Republic of Korea +82 2 565 1455
+Russia / CIS +7 (495) 6647564
+Singapore 800 6011 473
+South Africa +41 52 675 3777
+Spain* 00800 2255 4835
+Sweden* 00800 2255 4835
+Switzerland* 00800 2255 4835
+Taiwan 886 (2) 2656 6688
+Thailand 1 800 011 931
+United Kingdom / Ireland* 00800 2255 4835
+USA 1 800 833 9200
+Vietnam 12060128
+* European toll-free number. If not  
+accessible, call: +41 52 675 3777
+Rev. 02.2022
+Find more valuable resources at TEK.COM
+Copyright © Tektronix. All rights reserved. Tektronix products are covered by U.S. and foreign patents, issued and pending. Information in this publication supersedes that  
+in all previously published material. Specification and price change privileges reserved. TEKTRONIX and TEK are registered trademarks of Tektronix, Inc. All other trade names 
+referenced are the service marks, trademarks or registered trademarks of their respective companies. 
+050322 SBG 1KW-73917-0
