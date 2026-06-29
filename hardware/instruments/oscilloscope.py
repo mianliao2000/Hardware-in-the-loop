@@ -66,6 +66,16 @@ class TektronixOscilloscope(VisaInstrument):
     def set_waveform_source(self, source: str = "CH1") -> None:
         self.write(f"DATA:SOURCE {source}")
 
+    def set_channel_display(self, source: str = "CH1", enabled: bool = True) -> None:
+        self.write(f"DISPLAY:WAVEVIEW1:{source}:STATE {1 if enabled else 0}")
+
+    def read_immediate_measurement(self, source: str = "CH1", measurement: str = "MEAN") -> float:
+        self.write("HEADER OFF")
+        self.write("VERBOSE OFF")
+        self.write(f"MEASU:IMM:SOU1 {source}")
+        self.write(f"MEASU:IMM:TYP {measurement}")
+        return self._parse_numeric_response(self.query("MEASU:IMM:VAL?"))
+
     def capture_ascii_waveform(self, source: str = "CH1", start: int = 1, stop: int = 10000) -> WaveformCapture:
         """Capture waveform data as scaled ASCII points.
 
@@ -78,7 +88,7 @@ class TektronixOscilloscope(VisaInstrument):
         self.set_waveform_source(source)
         self.write("HEADER OFF")
         self.write("VERBOSE OFF")
-        self.write(f"DISPLAY:WAVEVIEW1:{source}:STATE 1")
+        self.set_channel_display(source, True)
         self.write("DATA:ENCdg ASCii")
         self.write("DATA:WIDTH 1")
         self.write(f"DATA:START {int(start)}")

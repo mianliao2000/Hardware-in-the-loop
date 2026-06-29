@@ -55,6 +55,11 @@ class PmbusDevice:
         data = self.adapter.write_read(self.address, bytes([command & 0xFF]), 2)
         return data[0] | (data[1] << 8)
 
+    def write_block(self, command: int, data: bytes) -> None:
+        if len(data) > 255:
+            raise PmbusError(f"PMBus block payload is too long: {len(data)} bytes.")
+        self.adapter.write(self.address, bytes([command & 0xFF, len(data) & 0xFF]) + bytes(data))
+
     def read_block(self, command: int, max_length: int = 255) -> bytes:
         data = self.adapter.write_read(self.address, bytes([command & 0xFF]), max_length + 1)
         if not data:

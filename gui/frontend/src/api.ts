@@ -1,4 +1,4 @@
-import type { InstrumentKey, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback } from "./types";
+import type { BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceReadback, InstrumentKey, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -43,6 +43,144 @@ export function setVout(address: string, page: number, adapter: string, voltage:
   return requestJson<VoutReadback>("/api/vout", {
     method: "POST",
     body: JSON.stringify({ address, page, adapter, voltage })
+  });
+}
+
+export function readInductance(address: string, page: number, adapter: string): Promise<InductanceReadback> {
+  const params = new URLSearchParams({ address, page: String(page), adapter });
+  return requestJson<InductanceReadback>(`/api/inductance?${params.toString()}`);
+}
+
+export function setInductance(
+  address: string,
+  page: number,
+  adapter: string,
+  values: { output_inductance_nh?: number; effective_lc_inductance_nh?: number }
+): Promise<InductanceReadback> {
+  return requestJson<InductanceReadback>("/api/inductance", {
+    method: "POST",
+    body: JSON.stringify({ address, page, adapter, ...values })
+  });
+}
+
+export function readXdpPid(address: string, page: number, adapter: string): Promise<XdpPidReadback> {
+  const params = new URLSearchParams({ address, page: String(page), adapter });
+  return requestJson<XdpPidReadback>(`/api/xdp-pid?${params.toString()}`);
+}
+
+export function setXdpPid(
+  address: string,
+  page: number,
+  adapter: string,
+  values: Record<string, number>
+): Promise<XdpPidReadback> {
+  return requestJson<XdpPidReadback>("/api/xdp-pid", {
+    method: "POST",
+    body: JSON.stringify({ address, page, adapter, values })
+  });
+}
+
+export function readPmbusOutput(address: string, page: number, adapter: string): Promise<PmbusOutputReadback> {
+  const params = new URLSearchParams({ address, page: String(page), adapter });
+  return requestJson<PmbusOutputReadback>(`/api/pmbus-output?${params.toString()}`);
+}
+
+export function setPmbusOutput(
+  address: string,
+  page: number,
+  adapter: string,
+  action: PmbusOutputAction
+): Promise<PmbusOutputReadback> {
+  return requestJson<PmbusOutputReadback>("/api/pmbus-output", {
+    method: "POST",
+    body: JSON.stringify({ address, page, adapter, action })
+  });
+}
+
+export function readXdpOutput(address: string, page: number, adapter: string): Promise<XdpOutputReadback> {
+  const params = new URLSearchParams({ address, page: String(page), adapter });
+  return requestJson<XdpOutputReadback>(`/api/xdp-output?${params.toString()}`);
+}
+
+export function setXdpOutput(
+  address: string,
+  page: number,
+  adapter: string,
+  action: XdpOutputAction
+): Promise<XdpOutputReadback> {
+  return requestJson<XdpOutputReadback>("/api/xdp-output", {
+    method: "POST",
+    body: JSON.stringify({ address, page, adapter, action })
+  });
+}
+
+export function runBodeSweep(config: BodeSweepConfig): Promise<BodeSweepReadback> {
+  return fetch("/api/bode/sweep", {
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+    body: JSON.stringify(config)
+  }).then(async (response) => {
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : { ok: false, error: `Request failed: ${response.status}` };
+    if (!response.ok && !payload.error) {
+      payload.error = `Request failed: ${response.status}`;
+    }
+    return payload as BodeSweepReadback;
+  });
+}
+
+export function captureScope(config: {
+  resource?: string;
+  channels: string[];
+  measurements: string[];
+  points: number;
+}): Promise<ScopeCaptureReadback> {
+  return requestJson<ScopeCaptureReadback>("/api/scope", {
+    method: "POST",
+    body: JSON.stringify(config)
+  });
+}
+
+export function readPowerSupply(resource?: string): Promise<PowerSupplyReadback> {
+  const params = new URLSearchParams();
+  if (resource) params.set("resource", resource);
+  return requestJson<PowerSupplyReadback>(`/api/power-supply?${params.toString()}`);
+}
+
+export function setPowerSupply(config: {
+  resource?: string;
+  voltage_v?: number;
+  current_limit_a?: number;
+}): Promise<PowerSupplyReadback> {
+  return requestJson<PowerSupplyReadback>("/api/power-supply", {
+    method: "POST",
+    body: JSON.stringify(config)
+  });
+}
+
+export function readFunctionGenerator(resource?: string, channel = 1): Promise<FunctionGeneratorReadback> {
+  const params = new URLSearchParams({ channel: String(channel) });
+  if (resource) params.set("resource", resource);
+  return requestJson<FunctionGeneratorReadback>(`/api/function-generator?${params.toString()}`);
+}
+
+export function setFunctionGenerator(config: {
+  resource?: string;
+  channel: number;
+  mode: string;
+  frequency_hz?: number;
+  high_v?: number;
+  low_v?: number;
+  duty_percent?: number;
+  pulse_width_s?: number | null;
+  dc_level_v?: number;
+  amplitude_vpp?: number;
+  offset_v?: number;
+  phase_deg?: number | null;
+}): Promise<FunctionGeneratorReadback> {
+  return requestJson<FunctionGeneratorReadback>("/api/function-generator", {
+    method: "POST",
+    body: JSON.stringify(config)
   });
 }
 

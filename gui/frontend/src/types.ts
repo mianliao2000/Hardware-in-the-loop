@@ -79,9 +79,218 @@ export type VoutReadback = {
   address?: string;
   page?: number;
   loop?: string;
+  operation?: string | null;
+  status_word?: string | null;
   vout_command_v?: number;
   read_vout_v?: number;
+  exponent?: number;
   vout_mode?: string;
+  timestamp?: number;
+  read_iout_a?: number;
+};
+
+export type InductanceField = {
+  name: string;
+  memory_address: string;
+  bitfield: string;
+  word: string;
+  raw: number;
+  raw_hex: string;
+  value_nh: number | null;
+  requested_nh?: number;
+  actual_nh?: number | null;
+  word_before?: string;
+  word_after?: string;
+  changed?: boolean;
+};
+
+export type InductanceReadback = {
+  ok: boolean;
+  error?: string;
+  address?: string;
+  page?: number;
+  loop?: string;
+  output_inductance?: InductanceField;
+  effective_lc_inductance?: InductanceField;
+  writes?: Record<string, InductanceField>;
+  timestamp?: number;
+};
+
+export type XdpPidField = {
+  name: string;
+  memory_address: string;
+  bitfield: string;
+  word: string;
+  raw: number;
+  raw_hex: string;
+  min: number;
+  max: number;
+  step: number;
+};
+
+export type XdpPidRegisterBlock = {
+  name: string;
+  memory_address: string;
+  word: string;
+  fields: Record<string, XdpPidField>;
+};
+
+export type XdpPidReadback = {
+  ok: boolean;
+  error?: string;
+  address?: string;
+  page?: number;
+  loop?: string;
+  pid_registers?: XdpPidRegisterBlock;
+  write?: {
+    name: string;
+    memory_address: string;
+    word_before: string;
+    word_after: string;
+    changed: boolean;
+    writes: Record<string, XdpPidField>;
+    readback: XdpPidRegisterBlock;
+  };
+  timestamp?: number;
+};
+
+export type PmbusOutputAction = "on" | "off";
+export type XdpOutputAction = "enable" | "disable" | "release";
+
+export type PmbusOutputReadback = {
+  ok: boolean;
+  error?: string;
+  address?: string;
+  page?: number;
+  loop?: string;
+  operation?: string | null;
+  operation_before?: string | null;
+  operation_after?: string | null;
+  operation_written?: string | null;
+  operation_bit7_before?: number;
+  operation_bit7_after?: number;
+  preserved_bits_6_0?: string | null;
+  on_off_config?: string | null;
+  status_word?: string | null;
+  requested?: string;
+  standard_commands?: Record<string, string>;
+  note?: string;
+  timestamp?: number;
+};
+
+export type XdpOutputReadback = {
+  ok: boolean;
+  error?: string;
+  address?: string;
+  page?: number;
+  loop?: string;
+  method?: string;
+  requested?: string;
+  state?: string;
+  state_written?: string;
+  operation?: string | null;
+  status_word?: string | null;
+  readback?: {
+    name?: string;
+    memory_address?: string;
+    bitfield?: string;
+    page?: number;
+    word?: string;
+    byte?: string;
+    raw?: number;
+    raw_binary?: string;
+    state?: string;
+    bit5_sw_enable_pin_value?: number;
+    bit4_enable_sw_enable_pin?: number;
+  };
+  write?: Record<string, unknown>;
+  timestamp?: number;
+};
+
+export type BodeSweepConfig = {
+  host?: string;
+  port?: number;
+  start_hz: number;
+  stop_hz: number;
+  points: number;
+  bandwidth_hz: number;
+  source_dbm?: number | null;
+  timeout_ms?: number;
+};
+
+export type BodeSweepReadback = {
+  ok: boolean;
+  error?: string;
+  identity?: string;
+  host?: string;
+  port?: number;
+  config?: BodeSweepConfig;
+  frequency_hz?: number[];
+  magnitude_db?: number[];
+  phase_deg?: number[];
+  system_error?: string;
+  duration_s?: number;
+  timestamp?: number;
+};
+
+export type ScopeWaveform = {
+  source: string;
+  x: number[];
+  y: number[];
+  x_unit: string;
+  y_unit: string;
+};
+
+export type ScopeMeasurementValue = {
+  source: string;
+  measurement: string;
+  value: number | null;
+  ok: boolean;
+  error?: string;
+};
+
+export type ScopeCaptureReadback = {
+  ok: boolean;
+  error?: string;
+  resource?: string;
+  identity?: string;
+  channels?: string[];
+  measurements?: string[];
+  waveforms?: ScopeWaveform[];
+  measurement_values?: ScopeMeasurementValue[];
+  timestamp?: number;
+};
+
+export type PowerSupplyReadback = {
+  ok: boolean;
+  error?: string | null;
+  resource?: string;
+  identity?: string;
+  output_enabled?: boolean | null;
+  voltage_setpoint_v?: number | null;
+  current_limit_a?: number | null;
+  measured_voltage_v?: number | null;
+  measured_current_a?: number | null;
+  timestamp?: number;
+};
+
+export type FunctionGeneratorReadback = {
+  ok: boolean;
+  error?: string;
+  resource?: string;
+  channel?: number;
+  identity?: string;
+  function?: string | null;
+  frequency_hz?: number | null;
+  amplitude_vpp?: number | null;
+  offset_v?: number | null;
+  high_v?: number | null;
+  low_v?: number | null;
+  phase_deg?: number | null;
+  duty_percent?: number | null;
+  pulse_width_s?: number | null;
+  output?: string | null;
+  system_error?: string | null;
   timestamp?: number;
 };
 

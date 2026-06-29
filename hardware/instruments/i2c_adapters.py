@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 from ctypes import POINTER, WinDLL, c_int, c_ubyte, c_ushort
 from dataclasses import dataclass, field
 from importlib.util import find_spec
 import json
 from pathlib import Path
 import subprocess
+import threading
 from typing import Literal
 
 
@@ -125,6 +127,7 @@ class XdpNodeUsbI2cAdapter:
     address_mode: Literal["xdp_8bit", "7bit"] = "xdp_8bit"
     node_exe: str = "node"
     bridge_path: str | None = None
+    persistent: bool = True
     opened: bool = False
 
     def open(self) -> None:
@@ -146,8 +149,81 @@ class XdpNodeUsbI2cAdapter:
         self._require_open()
         return self._transfer(address, bytes(write_data), int(read_length))
 
+    def read_memory_word(self, address: int, memory_address: int, word_size: int = 4) -> int:
+        self._require_open()
+        result = self._run_bridge(
+            [
+                "memory-read",
+                "--address",
+                str(address),
+                "--memory-address",
+                str(memory_address),
+                "--word-size",
+                str(word_size),
+                "--timeout-ms",
+                str(self.timeout_ms),
+            ],
+            {
+                "command": "memory-read",
+                "address": address,
+                "memoryAddress": memory_address,
+                "wordSize": word_size,
+            },
+        )
+        value = result.get("value")
+        if value is None:
+            data = _parse_hex_bytes(result.get("data", ""))
+            return _little_endian_to_int(data)
+        return int(value)
+
+    def write_memory_word(self, address: int, memory_address: int, value: int, word_size: int = 4) -> None:
+        self._require_open()
+        self._run_bridge(
+            [
+                "memory-write",
+                "--address",
+                str(address),
+                "--memory-address",
+                str(memory_address),
+                "--value",
+                str(value),
+                "--word-size",
+                str(word_size),
+                "--timeout-ms",
+                str(self.timeout_ms),
+            ],
+            {
+                "command": "memory-write",
+                "address": address,
+                "memoryAddress": memory_address,
+                "value": value,
+                "wordSize": word_size,
+            },
+        )
+
+    def update_memory_bits(
+        self,
+        address: int,
+        memory_address: int,
+        start: int,
+        length: int,
+        field_value: int,
+        word_size: int = 4,
+    ) -> tuple[int, int]:
+        if start < 0 or length <= 0 or start + length > 8 * word_size:
+            raise I2cAdapterError(f"Invalid memory bitfield start={start}, length={length}.")
+        max_field = (1 << length) - 1
+        if not 0 <= field_value <= max_field:
+            raise I2cAdapterError(f"Field value 0x{field_value:X} does not fit in {length} bits.")
+        before = self.read_memory_word(address, memory_address, word_size=word_size)
+        mask = max_field << start
+        after = (before & ~mask) | ((field_value & max_field) << start)
+        if after != before:
+            self.write_memory_word(address, memory_address, after, word_size=word_size)
+        return before, after
+
     def identify_dongle(self) -> bytes:
-        result = self._run_bridge(["identify"])
+        result = self._run_bridge(["identify"], {"command": "identify"})
         return _parse_hex_bytes(result.get("data", ""))
 
     def _transfer(self, address: int, write_data: bytes, read_length: int) -> bytes:
@@ -164,15 +240,24 @@ class XdpNodeUsbI2cAdapter:
                 self.address_mode,
                 "--timeout-ms",
                 str(self.timeout_ms),
-            ]
+            ],
+            {
+                "command": "transfer",
+                "address": address,
+                "write": write_data.hex(),
+                "read": int(read_length),
+                "addressMode": self.address_mode,
+            },
         )
         if not result.get("ok", False):
             status = result.get("status")
             raise I2cAdapterError(f"XDP USB I2C transfer failed with status {status}.")
         return _parse_hex_bytes(result.get("data", ""))
 
-    def _run_bridge(self, args: list[str]) -> dict:
+    def _run_bridge(self, args: list[str], persistent_payload: dict | None = None) -> dict:
         bridge = Path(self.bridge_path) if self.bridge_path else Path(__file__).with_name("xdp_usb_bridge.js")
+        if self.persistent and persistent_payload is not None:
+            return _get_persistent_xdp_bridge(self.node_exe, bridge, self.timeout_ms).request(persistent_payload)
         command = [self.node_exe, str(bridge), *args]
         completed = subprocess.run(
             command,
@@ -193,6 +278,132 @@ class XdpNodeUsbI2cAdapter:
     def _require_open(self) -> None:
         if not self.opened:
             raise I2cAdapterError("XDP USB adapter is not open.")
+
+
+class _PersistentXdpBridge:
+    def __init__(self, node_exe: str, bridge_path: Path, timeout_ms: int):
+        self.node_exe = node_exe
+        self.bridge_path = bridge_path
+        self.timeout_ms = int(timeout_ms)
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen | None = None
+
+    def request(self, payload: dict) -> dict:
+        retryable = _is_retryable_xdp_payload(payload)
+        with self._lock:
+            try:
+                return self._request_once_locked(payload)
+            except I2cAdapterError:
+                if not retryable:
+                    raise
+                return self._request_once_locked(payload)
+
+    def _request_once_locked(self, payload: dict) -> dict:
+        try:
+            self._ensure_started()
+            assert self._process is not None
+            self._process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            self._process.stdin.flush()
+            line = self._process.stdout.readline()
+        except Exception as exc:
+            self.stop()
+            raise I2cAdapterError(f"XDP persistent bridge request failed: {exc}") from exc
+        if not line:
+            error = self._collect_process_error()
+            self.stop()
+            raise I2cAdapterError(f"XDP persistent bridge exited unexpectedly. {error}".strip())
+        try:
+            result = json.loads(line)
+        except Exception as exc:
+            self.stop()
+            raise I2cAdapterError(f"XDP persistent bridge returned invalid output: {line.strip()}") from exc
+        if not result.get("ok", False):
+            self.stop()
+            raise I2cAdapterError(result.get("error", line.strip()))
+        return result
+
+    def stop(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        try:
+            if process.stdin:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=1.0)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def _ensure_started(self) -> None:
+        if self._process is not None and self._process.poll() is None:
+            return
+        self.stop()
+        command = [
+            self.node_exe,
+            str(self.bridge_path),
+            "serve",
+            "--timeout-ms",
+            str(self.timeout_ms),
+        ]
+        self._process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+    def _collect_process_error(self) -> str:
+        process = self._process
+        if process is None or process.stdout is None:
+            return ""
+        try:
+            return process.stdout.read().strip()
+        except Exception:
+            return ""
+
+
+def _is_retryable_xdp_payload(payload: dict) -> bool:
+    """Allow reconnect retries only for read-only bridge commands."""
+    command = payload.get("command")
+    if command in {"identify", "memory-read"}:
+        return True
+    if command == "transfer":
+        return int(payload.get("read") or 0) > 0
+    return False
+
+
+_PERSISTENT_XDP_BRIDGES: dict[tuple[str, str, int], _PersistentXdpBridge] = {}
+_PERSISTENT_XDP_BRIDGES_LOCK = threading.Lock()
+
+
+def _get_persistent_xdp_bridge(node_exe: str, bridge_path: Path, timeout_ms: int) -> _PersistentXdpBridge:
+    key = (node_exe, str(bridge_path.resolve()), int(timeout_ms))
+    with _PERSISTENT_XDP_BRIDGES_LOCK:
+        bridge = _PERSISTENT_XDP_BRIDGES.get(key)
+        if bridge is None:
+            bridge = _PersistentXdpBridge(node_exe, bridge_path, timeout_ms)
+            _PERSISTENT_XDP_BRIDGES[key] = bridge
+        return bridge
+
+
+def _stop_persistent_xdp_bridges() -> None:
+    with _PERSISTENT_XDP_BRIDGES_LOCK:
+        bridges = list(_PERSISTENT_XDP_BRIDGES.values())
+        _PERSISTENT_XDP_BRIDGES.clear()
+    for bridge in bridges:
+        bridge.stop()
+
+
+atexit.register(_stop_persistent_xdp_bridges)
 
 
 @dataclass
@@ -361,6 +572,13 @@ def _parse_hex_bytes(text: str) -> bytes:
     if not text:
         return b""
     return bytes(int(part, 16) for part in text.replace(",", " ").split())
+
+
+def _little_endian_to_int(data: bytes) -> int:
+    value = 0
+    for index, byte in enumerate(data):
+        value |= int(byte) << (8 * index)
+    return value
 
 
 class _AardvarkDll:

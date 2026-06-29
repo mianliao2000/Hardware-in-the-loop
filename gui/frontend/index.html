@@ -3,10 +3,26 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PID Auto-Tuner Workbench</title>
+    <title>Google Power Auto-Tuner</title>
+    <script>
+      window.addEventListener("error", function (event) {
+        var root = document.getElementById("root");
+        if (!root || root.childElementCount) return;
+        root.innerHTML = "<pre style='padding:16px;color:#b00020;font:14px Consolas,monospace;white-space:pre-wrap'>Frontend error: " +
+          String(event.message || "unknown error") + "</pre>";
+      });
+      window.addEventListener("unhandledrejection", function (event) {
+        var root = document.getElementById("root");
+        if (!root || root.childElementCount) return;
+        root.innerHTML = "<pre style='padding:16px;color:#b00020;font:14px Consolas,monospace;white-space:pre-wrap'>Frontend rejection: " +
+          String(event.reason || "unknown rejection") + "</pre>";
+      });
+    </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div style="padding:16px;font:14px Arial,sans-serif;color:#5f6368">Loading Google Power Auto-Tuner...</div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

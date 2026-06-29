@@ -99,7 +99,9 @@ class BodeScpiClient(VisaInstrument):
         bandwidth_hz: float = 1000.0,
         source_dbm: float | None = None,
     ) -> None:
-        self.write(":CALC:PAR:DEF GAIN")
+        # Gain/phase mode must be created before sweep settings; defining a
+        # measurement resets the suite to its defaults.
+        self.write(":CALC:PAR:DEF GAIN, DEF")
         self.write(f":SENS:FREQ:STAR {start_hz:.12g}")
         self.write(f":SENS:FREQ:STOP {stop_hz:.12g}")
         self.write(f":SENS:SWE:POIN {int(points)}")
