@@ -7,11 +7,13 @@ import argparse
 import json
 import mimetypes
 from pathlib import Path
-import subprocess
 import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
+import uuid
+
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,20 +26,20 @@ if str(ROOT) not in sys.path:
 
 from hardware.instruments.board_controller import BoardControllerConfig, create_board_controller
 from hardware.instruments.bode_analyzer import BodeScpiClient
+from hardware.instruments.bode100 import Bode100Driver, Bode100Error, DEFAULT_BODE100_SCPI_RUNNER_PATH
 from hardware.instruments.function_generator import FunctionGenerator
 from hardware.instruments.i2c_adapters import create_i2c_adapter
 from hardware.instruments.oscilloscope import TektronixOscilloscope
 from hardware.instruments.power_supply import KeysightN5700PowerSupply
 from hardware.instruments.self_test import (
     DEFAULT_AFG_RESOURCE,
-    DEFAULT_BODE_SCPI_RUNNER,
-    DEFAULT_BODE_SERIAL,
     DEFAULT_POWER_SUPPLY_RESOURCE,
     DEFAULT_SCOPE_RESOURCE,
     InstrumentSelfTestConfig,
     run_instrument_self_test,
     run_single_instrument_self_test,
 )
+from hardware.instruments.visa_resource import VisaConnectionError
 from hardware.tuning import (
     PidAutotuneSession,
     PlantParams,
@@ -50,6 +52,32 @@ from hardware.tuning import (
 DEVICE_LOCK = threading.Lock()
 TUNING_SESSION = PidAutotuneSession()
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
+SCOPE_CONNECTIONS: dict[str, TektronixOscilloscope] = {}
+SCOPE_CAPTURE_DIR = ROOT / "data" / "scope_captures"
+BODE_SWEEP_DIR = ROOT / "data" / "bode_sweeps"
+RESULTS_DIR = ROOT / "results"
+LATEST_SCOPE_PNG = RESULTS_DIR / "latest_scope_capture.png"
+LATEST_BODE_PNG = RESULTS_DIR / "latest_bode_sweep.png"
+SCOPE_CAPTURE_CACHE: dict[str, dict] = {}
+SCOPE_CAPTURE_CACHE_LIMIT = 1
+SCOPE_DISPLAY_MAX_POINTS = 200_000
+SCOPE_TRIGGER_OFFSET_FROM_LEFT_S = 2e-6
+DEFAULT_SCOPE_AXIS_SETTINGS = {
+    "leftMin": -0.5,
+    "leftMax": 3.0,
+    "rightMin": 0.7,
+    "rightMax": 1.1,
+    "channelAxes": {
+        "CH1": "left",
+        "CH2": "left",
+        "CH3": "right",
+        "CH4": "right",
+        "CH5": "left",
+        "CH6": "left",
+        "CH7": "right",
+        "CH8": "right",
+    },
+}
 
 
 def main() -> int:
@@ -111,6 +139,12 @@ class GuiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/scope":
             self._handle_scope_capture(parsed.query)
             return
+        if parsed.path.startswith("/api/scope/capture/") and parsed.path.endswith("/full"):
+            self._handle_scope_capture_full(parsed.path, parsed.query)
+            return
+        if parsed.path == "/api/instruments/bode100/idn":
+            self._handle_bode100_idn(parsed.query)
+            return
         if parsed.path == "/api/tuning/status":
             self._send_json({"ok": True, **TUNING_SESSION.status()})
             return
@@ -119,6 +153,9 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/self-test":
             self._handle_self_test(parsed.query)
+            return
+        if parsed.path.startswith("/results/"):
+            self._serve_result_file(parsed.path)
             return
         self._serve_static(parsed.path)
 
@@ -147,6 +184,12 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/scope":
             self._handle_scope_capture_post()
+            return
+        if parsed.path == "/api/scope/acquisition":
+            self._handle_scope_acquisition()
+            return
+        if parsed.path == "/api/scope/warmup":
+            self._handle_scope_warmup()
             return
         if parsed.path == "/api/tuning/start":
             self._handle_tuning_start()
@@ -359,6 +402,16 @@ class GuiHandler(BaseHTTPRequestHandler):
         )
         self._send_json(result, status=200 if result.get("ok", False) else 202)
 
+    def _handle_bode100_idn(self, query: str) -> None:
+        params = parse_qs(query)
+        host = params.get("host", [None])[0]
+        port = _optional_int_param(params, "port")
+        serial = params.get("serial", [None])[0]
+        runner_path = params.get("scpi_runner_path", [None])[0]
+        visa_resource = params.get("visa_resource", [None])[0]
+        timeout = _optional_float_param(params, "timeout")
+        self._send_json(_read_bode100_idn(host, port, serial, runner_path, visa_resource, timeout))
+
     def _handle_read_power_supply(self, query: str) -> None:
         params = parse_qs(query)
         resource = params.get("resource", [DEFAULT_POWER_SUPPLY_RESOURCE])[0]
@@ -370,10 +423,11 @@ class GuiHandler(BaseHTTPRequestHandler):
             resource = str(payload.get("resource", DEFAULT_POWER_SUPPLY_RESOURCE))
             voltage = payload.get("voltage_v")
             current = payload.get("current_limit_a")
+            output_enabled = payload.get("output_enabled")
         except Exception as exc:
             self._send_json({"ok": False, "error": f"Invalid request: {exc}"}, status=400)
             return
-        self._send_json(_set_power_supply(resource, voltage, current))
+        self._send_json(_set_power_supply(resource, voltage, current, output_enabled))
 
     def _handle_read_function_generator(self, query: str) -> None:
         params = parse_qs(query)
@@ -396,21 +450,50 @@ class GuiHandler(BaseHTTPRequestHandler):
         params = parse_qs(query)
         resource = params.get("resource", [DEFAULT_SCOPE_RESOURCE])[0]
         channels = _list_param(params, "channels", ["CH1"])
-        measurements = _list_param(params, "measurements", ["MEAN", "PK2PK"])
-        points = _int_param(params, "points", 2000)
-        self._send_json(_capture_scope(resource, channels, measurements, points))
+        measurements = _list_param(params, "measurements", [])
+        points = _optional_int_param(params, "points")
+        fg_frequency_hz = _optional_float_param(params, "function_generator_frequency_hz")
+        self._send_json(_capture_scope(resource, channels, measurements, points, fg_frequency_hz))
 
     def _handle_scope_capture_post(self) -> None:
         try:
             payload = self._read_json_body()
             resource = str(payload.get("resource", DEFAULT_SCOPE_RESOURCE))
             channels = [str(item).upper() for item in payload.get("channels", ["CH1"])]
-            measurements = [str(item).upper() for item in payload.get("measurements", ["MEAN", "PK2PK"])]
-            points = int(payload.get("points", 2000))
+            measurements = [str(item).upper() for item in payload.get("measurements", [])]
+            points = None if payload.get("points") is None else int(payload.get("points"))
+            fg_frequency_hz = None if payload.get("function_generator_frequency_hz") is None else float(payload.get("function_generator_frequency_hz"))
+            scope_axis_settings = _normalize_scope_axis_settings(payload.get("scope_axis_settings"))
         except Exception as exc:
             self._send_json({"ok": False, "error": f"Invalid request: {exc}"}, status=400)
             return
-        self._send_json(_capture_scope(resource, channels, measurements, points))
+        self._send_json(_capture_scope(resource, channels, measurements, points, fg_frequency_hz, scope_axis_settings))
+
+    def _handle_scope_capture_full(self, path: str, query: str) -> None:
+        capture_id = path.removeprefix("/api/scope/capture/").removesuffix("/full").strip("/")
+        params = parse_qs(query)
+        channel = params.get("channel", [None])[0]
+        inline = params.get("inline", ["0"])[0].lower() in {"1", "true", "yes"}
+        self._send_json(_get_full_scope_capture(capture_id, channel=channel, inline=inline))
+
+    def _handle_scope_acquisition(self) -> None:
+        try:
+            payload = self._read_json_body()
+            resource = str(payload.get("resource", DEFAULT_SCOPE_RESOURCE))
+            running = bool(payload.get("running"))
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"Invalid request: {exc}"}, status=400)
+            return
+        self._send_json(_set_scope_acquisition(resource, running))
+
+    def _handle_scope_warmup(self) -> None:
+        try:
+            payload = self._read_json_body()
+            resource = str(payload.get("resource", DEFAULT_SCOPE_RESOURCE))
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"Invalid request: {exc}"}, status=400)
+            return
+        self._send_json(_warm_scope_connection(resource))
 
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -437,6 +520,24 @@ class GuiHandler(BaseHTTPRequestHandler):
                 return
             if not target.exists():
                 target = self._fallback_static_asset(static_dir, path) or static_dir / "index.html"
+        if not target.exists() or not target.is_file():
+            self.send_error(404)
+            return
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self._send_cors_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_result_file(self, path: str) -> None:
+        target = (RESULTS_DIR / path.removeprefix("/results/")).resolve()
+        if RESULTS_DIR.resolve() not in target.parents:
+            self.send_error(403)
+            return
         if not target.exists() or not target.is_file():
             self.send_error(404)
             return
@@ -839,15 +940,18 @@ def _run_bode_sweep(
     if not 2 <= points <= 2001:
         return {"ok": False, "error": "Bode sweep points must be between 2 and 2001."}
 
-    if not _ensure_bode_listener(host, port):
+    bode_driver = Bode100Driver(host=host, port=port, startup_timeout_s=max(timeout_ms / 1000.0, 5.0))
+    try:
+        bode_driver.ensure_scpi_server()
+    except Exception as exc:
         return {
             "ok": False,
             "error": (
-                f"No Bode SCPI TCP listener is reachable at {host}:{port}. "
-                "Open Bode Analyzer Suite or verify the SCPI runner path/serial."
+                f"No Bode SCPI TCP listener is reachable at {host}:{port}: {exc}"
             ),
             "host": host,
             "port": port,
+            "resource": bode_driver.resource_name,
             "config": {
                 "start_hz": start_hz,
                 "stop_hz": stop_hz,
@@ -861,7 +965,7 @@ def _run_bode_sweep(
 
     bode = None
     try:
-        bode = BodeScpiClient(host=host, port=port, timeout_ms=timeout_ms)
+        bode = BodeScpiClient(resource_name=bode_driver.resource_name, timeout_ms=timeout_ms)
         bode.connect()
         identity = bode.idn()
         try:
@@ -876,6 +980,35 @@ def _run_bode_sweep(
             source_dbm=source_dbm,
         )
         data = bode.run_sweep()
+        margins = data.stability_margins.as_dict()
+        timestamp = time.time()
+        sweep_id = uuid.uuid4().hex[:12]
+        BODE_SWEEP_DIR.mkdir(parents=True, exist_ok=True)
+        data_file_path = BODE_SWEEP_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{sweep_id}.npz"
+        np.savez_compressed(
+            data_file_path,
+            frequency_hz=np.asarray(data.frequency_hz, dtype=np.float64),
+            magnitude_db=np.asarray(data.magnitude_db, dtype=np.float64),
+            phase_deg=np.asarray(data.phase_deg, dtype=np.float64),
+            start_hz=float(start_hz),
+            stop_hz=float(stop_hz),
+            points=int(points),
+            bandwidth_hz=float(bandwidth_hz),
+            source_dbm=np.nan if source_dbm is None else float(source_dbm),
+            identity=str(identity),
+            timestamp=float(timestamp),
+        )
+        bode_png = None
+        bode_png_error = None
+        try:
+            bode_png = _plot_full_bode_sweep_png(
+                frequency_hz=data.frequency_hz,
+                magnitude_db=data.magnitude_db,
+                phase_deg=data.phase_deg,
+                margins=margins,
+            )
+        except Exception as exc:
+            bode_png_error = str(exc)
         system_error = ""
         try:
             system_error = bode.get_error()
@@ -886,6 +1019,7 @@ def _run_bode_sweep(
             "identity": identity,
             "host": host,
             "port": port,
+            "resource": bode_driver.resource_name,
             "config": {
                 "start_hz": start_hz,
                 "stop_hz": stop_hz,
@@ -896,9 +1030,16 @@ def _run_bode_sweep(
             "frequency_hz": data.frequency_hz,
             "magnitude_db": data.magnitude_db,
             "phase_deg": data.phase_deg,
+            "margins": margins,
+            "sweep_id": sweep_id,
+            "data_file": str(data_file_path.relative_to(ROOT)),
+            "original_points": len(data.frequency_hz),
+            "display_points": len(data.frequency_hz),
+            "bode_png": bode_png,
+            "bode_png_error": bode_png_error,
             "system_error": system_error,
             "duration_s": round(time.perf_counter() - started, 3),
-            "timestamp": time.time(),
+            "timestamp": timestamp,
         }
     except Exception as exc:
         return {
@@ -906,6 +1047,7 @@ def _run_bode_sweep(
             "error": str(exc),
             "host": host,
             "port": port,
+            "resource": bode_driver.resource_name,
             "config": {
                 "start_hz": start_hz,
                 "stop_hz": stop_hz,
@@ -928,93 +1070,55 @@ def _run_bode_sweep(
                 pass
 
 
-def _ensure_bode_listener(host: str, port: int) -> bool:
-    if _tcp_listener_present(port):
-        return True
-    runner = Path(DEFAULT_BODE_SCPI_RUNNER)
-    if not runner.exists():
-        return False
+def _read_bode100_idn(
+    host: str | None,
+    port: int | None,
+    serial: str | None,
+    runner_path: str | None,
+    visa_resource: str | None,
+    timeout_s: float | None,
+) -> dict:
+    driver = Bode100Driver(
+        serial_number=serial,
+        host=host or "127.0.0.1",
+        port=port or 5025,
+        scpi_runner_path=runner_path or DEFAULT_BODE100_SCPI_RUNNER_PATH,
+        startup_timeout_s=timeout_s or 30.0,
+        visa_resource=visa_resource,
+    )
     try:
-        _start_bode_scpi_runner(host, port)
-    except Exception:
-        return False
-    deadline = time.time() + 8.0
-    while time.time() < deadline:
-        if _tcp_listener_present(port):
-            return True
-        time.sleep(0.25)
-    return False
-
-
-def _tcp_listener_present(port: int) -> bool:
-    command = (
-        "Get-NetTCPConnection "
-        f"-LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue | "
-        "Select-Object -First 1 -ExpandProperty LocalPort"
-    )
-    completed = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    return completed.returncode == 0 and completed.stdout.strip() == str(int(port))
-
-
-def _start_bode_scpi_runner(host: str, port: int) -> None:
-    args = [
-        "--ip-address",
-        host,
-        "--port",
-        str(int(port)),
-        "--serial",
-        DEFAULT_BODE_SERIAL,
-        "--logging-level",
-        "Warning",
-    ]
-    command = (
-        "Start-Process "
-        f"-FilePath {_ps_quote(DEFAULT_BODE_SCPI_RUNNER)} "
-        f"-ArgumentList @({', '.join(_ps_quote(arg) for arg in args)}) "
-        "-WindowStyle Hidden"
-    )
-    completed = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if completed.returncode != 0:
-        message = (completed.stderr or completed.stdout or f"exit code {completed.returncode}").strip()
-        raise RuntimeError(message)
-
-
-def _ps_quote(value: str) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
+        driver.connect()
+        identity = driver.identify()
+        return {
+            "ok": True,
+            "status": "connected",
+            "idn": identity,
+            "host": driver.host,
+            "port": driver.port,
+            "resource": driver.resource_name,
+            "timestamp": time.time(),
+        }
+    except (Bode100Error, VisaConnectionError) as exc:
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": str(exc),
+            "host": driver.host,
+            "port": driver.port,
+            "resource": driver.resource_name,
+            "timestamp": time.time(),
+        }
+    finally:
+        driver.close()
 
 
 def _read_power_supply(resource: str) -> dict:
     with DEVICE_LOCK:
         supply = None
         try:
-            supply = KeysightN5700PowerSupply(resource, timeout_ms=5000)
+            supply = KeysightN5700PowerSupply(resource, timeout_ms=1500)
             supply.connect()
-            readback = supply.readback()
-            error = _visible_instrument_error(readback.error)
-            return {
-                "ok": True,
-                "resource": resource,
-                "identity": readback.identity,
-                "output_enabled": readback.output_enabled,
-                "voltage_setpoint_v": readback.voltage_setpoint_v,
-                "current_limit_a": readback.current_limit_a,
-                "measured_voltage_v": readback.measured_voltage_v,
-                "measured_current_a": readback.measured_current_a,
-                "error": error,
-                "timestamp": time.time(),
-            }
+            return _power_supply_snapshot(supply, resource)
         except Exception as exc:
             return {"ok": False, "resource": resource, "error": str(exc), "timestamp": time.time()}
         finally:
@@ -1022,44 +1126,60 @@ def _read_power_supply(resource: str) -> dict:
                 supply.close()
 
 
-def _set_power_supply(resource: str, voltage: object, current: object) -> dict:
-    if voltage is None and current is None:
-        return {"ok": False, "resource": resource, "error": "No voltage or current limit was provided."}
+def _set_power_supply(resource: str, voltage: object, current: object, output_enabled: object = None) -> dict:
+    if voltage is None and current is None and output_enabled is None:
+        return {"ok": False, "resource": resource, "error": "No voltage, current limit, or output state was provided."}
     with DEVICE_LOCK:
         supply = None
         try:
-            supply = KeysightN5700PowerSupply(resource, timeout_ms=5000)
+            supply = KeysightN5700PowerSupply(resource, timeout_ms=1500)
             supply.connect()
+            if output_enabled is not None:
+                if bool(output_enabled):
+                    supply.output_on()
+                else:
+                    supply.output_off()
             if voltage is not None:
                 supply.set_voltage(float(voltage))
             if current is not None:
                 supply.set_current_limit(float(current))
-            readback = supply.readback()
-            error = _visible_instrument_error(readback.error)
-            return {
-                "ok": True,
-                "resource": resource,
-                "identity": readback.identity,
-                "output_enabled": readback.output_enabled,
-                "voltage_setpoint_v": readback.voltage_setpoint_v,
-                "current_limit_a": readback.current_limit_a,
-                "measured_voltage_v": readback.measured_voltage_v,
-                "measured_current_a": readback.measured_current_a,
-                "error": error,
-                "timestamp": time.time(),
-            }
+            return _power_supply_snapshot(supply, resource, include_error=True)
         except Exception as exc:
             return {"ok": False, "resource": resource, "error": str(exc), "timestamp": time.time()}
         finally:
             if supply is not None:
                 supply.close()
+
+
+def _power_supply_snapshot(supply: KeysightN5700PowerSupply, resource: str, include_error: bool = False) -> dict:
+    output_raw = _safe_query(supply, "OUTP?")
+    output_enabled = None
+    if output_raw is not None:
+        normalized_output = output_raw.strip().upper()
+        if normalized_output in {"1", "ON"}:
+            output_enabled = True
+        elif normalized_output in {"0", "OFF"}:
+            output_enabled = False
+    error = _visible_instrument_error(_safe_query(supply, "SYST:ERR?")) if include_error else None
+    return {
+        "ok": True,
+        "resource": resource,
+        "identity": None,
+        "output_enabled": output_enabled,
+        "voltage_setpoint_v": _safe_float_query(supply, "VOLT?"),
+        "current_limit_a": _safe_float_query(supply, "CURR?"),
+        "measured_voltage_v": _safe_float_query(supply, "MEAS:VOLT?"),
+        "measured_current_a": _safe_float_query(supply, "MEAS:CURR?"),
+        "error": error,
+        "timestamp": time.time(),
+    }
 
 
 def _read_function_generator(resource: str, channel: int) -> dict:
     with DEVICE_LOCK:
         fg = None
         try:
-            fg = FunctionGenerator(resource, timeout_ms=5000, output_channel=channel)
+            fg = FunctionGenerator(resource, timeout_ms=1500, output_channel=channel)
             fg.connect()
             return _function_generator_snapshot(fg, resource, channel)
         except Exception as exc:
@@ -1074,14 +1194,22 @@ def _set_function_generator(resource: str, channel: int, mode: str, payload: dic
     with DEVICE_LOCK:
         fg = None
         try:
-            fg = FunctionGenerator(resource, timeout_ms=5000, output_channel=channel)
+            fg = FunctionGenerator(resource, timeout_ms=1500, output_channel=channel)
             fg.connect()
+            if "output_enabled" in payload:
+                if bool(payload.get("output_enabled")):
+                    fg.output_on(channel=channel)
+                else:
+                    fg.output_off(channel=channel)
+                return _function_generator_snapshot(fg, resource, channel)
+            voltage_unit = str(payload.get("voltage_unit", "VPP"))
+            if voltage_unit:
+                fg.set_voltage_unit(voltage_unit, channel=channel)
             if mode_name == "square":
                 fg.configure_square_levels(
                     frequency_hz=float(payload.get("frequency_hz", 100000.0)),
                     low_v=float(payload.get("low_v", 0.365)),
                     high_v=float(payload.get("high_v", 2.0)),
-                    duty_percent=float(payload.get("duty_percent", 50.0)),
                     channel=channel,
                 )
             elif mode_name == "pulse":
@@ -1090,7 +1218,6 @@ def _set_function_generator(resource: str, channel: int, mode: str, payload: dic
                     low_v=float(payload.get("low_v", 0.365)),
                     high_v=float(payload.get("high_v", 2.0)),
                     width_s=_optional_float(payload.get("pulse_width_s")),
-                    duty_percent=_optional_float(payload.get("duty_percent")),
                     channel=channel,
                 )
             elif mode_name == "dc":
@@ -1114,22 +1241,30 @@ def _set_function_generator(resource: str, channel: int, mode: str, payload: dic
 
 
 def _function_generator_snapshot(fg: FunctionGenerator, resource: str, channel: int) -> dict:
+    fg.clear_status()
+    function = _safe_query(fg, f"SOUR{channel}:FUNC?")
+    frequency_hz = _safe_float_query(fg, f"SOUR{channel}:FREQ?")
+    voltage_unit = _safe_query(fg, f"SOUR{channel}:VOLT:UNIT?")
+    high_v = _safe_float_query(fg, f"SOUR{channel}:VOLT:HIGH?")
+    low_v = _safe_float_query(fg, f"SOUR{channel}:VOLT:LOW?")
+    output = _safe_query(fg, f"OUTP{channel}?")
     system_error = _visible_instrument_error(_safe_query(fg, "SYST:ERR?"))
     return {
         "ok": True,
         "resource": resource,
         "channel": channel,
-        "identity": fg.idn(),
-        "function": _safe_query(fg, f"SOUR{channel}:FUNC?"),
-        "frequency_hz": _safe_float_query(fg, f"SOUR{channel}:FREQ?"),
-        "amplitude_vpp": _safe_float_query(fg, f"SOUR{channel}:VOLT?"),
-        "offset_v": _safe_float_query(fg, f"SOUR{channel}:VOLT:OFFS?"),
-        "high_v": _safe_float_query(fg, f"SOUR{channel}:VOLT:HIGH?"),
-        "low_v": _safe_float_query(fg, f"SOUR{channel}:VOLT:LOW?"),
-        "phase_deg": _safe_float_query(fg, f"SOUR{channel}:PHAS?"),
-        "duty_percent": _safe_float_query(fg, f"SOUR{channel}:FUNC:SQU:DCYC?"),
-        "pulse_width_s": _safe_float_query(fg, f"SOUR{channel}:PULS:WIDT?"),
-        "output": _safe_query(fg, f"OUTP{channel}?"),
+        "identity": None,
+        "function": function,
+        "frequency_hz": frequency_hz,
+        "voltage_unit": voltage_unit,
+        "amplitude_vpp": None,
+        "offset_v": None,
+        "high_v": high_v,
+        "low_v": low_v,
+        "phase_deg": None,
+        "duty_percent": None,
+        "pulse_width_s": None,
+        "output": output,
         "system_error": system_error,
         "timestamp": time.time(),
     }
@@ -1141,55 +1276,566 @@ def _visible_instrument_error(message: str | None) -> str | None:
     normalized = message.strip().lower()
     if "no error" in normalized or normalized in {"0", "+0"}:
         return None
+    if "query unterminated" in normalized:
+        return None
     return message
 
 
-def _capture_scope(resource: str, channels: list[str], measurements: list[str], points: int) -> dict:
-    safe_channels = [ch for ch in (item.strip().upper() for item in channels) if ch.startswith("CH")][:8] or ["CH1"]
+def _get_scope_connection(resource: str, timeout_ms: int) -> tuple[TektronixOscilloscope, bool]:
+    scope = SCOPE_CONNECTIONS.get(resource)
+    if scope is not None and scope.is_connected:
+        if getattr(scope, "_inst", None) is not None:
+            scope._inst.timeout = timeout_ms
+        return scope, False
+    if scope is not None:
+        _drop_scope_connection(resource)
+    scope = TektronixOscilloscope(resource, timeout_ms=timeout_ms)
+    scope.connect()
+    SCOPE_CONNECTIONS[resource] = scope
+    return scope, True
+
+
+def _drop_scope_connection(resource: str) -> None:
+    scope = SCOPE_CONNECTIONS.pop(resource, None)
+    if scope is not None:
+        scope.close()
+
+
+def _is_stale_scope_session_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "invalid session" in message
+        or "session handle" in message
+        or "resource might be closed" in message
+    )
+
+
+def _edge_focused_scope_display(
+    x_values: list[float],
+    y_values: list[float],
+    max_points: int = SCOPE_DISPLAY_MAX_POINTS,
+) -> tuple[list[float], list[float], str]:
+    total = min(len(x_values), len(y_values))
+    if total == 0:
+        return [], [], "edge-focused"
+    if total <= max_points or max_points < 2:
+        return x_values[:total], y_values[:total], "edge-focused"
+
+    x_array = np.asarray(x_values[:total], dtype=np.float64)
+    y_array = np.asarray(y_values[:total], dtype=np.float64)
+    diff = np.abs(np.diff(y_array))
+    finite_diff = diff[np.isfinite(diff)]
+    if finite_diff.size == 0 or float(np.max(finite_diff)) <= 0.0:
+        indices = np.rint(np.linspace(0, total - 1, max_points)).astype(np.int64)
+        return x_array[indices].tolist(), y_array[indices].tolist(), "edge-focused"
+
+    median = float(np.median(finite_diff))
+    mad = float(np.median(np.abs(finite_diff - median)))
+    percentile = float(np.percentile(finite_diff, 99.7))
+    threshold = max(percentile, median + 10.0 * mad, float(np.max(finite_diff)) * 0.05)
+    edge_locations = np.flatnonzero(diff >= threshold) + 1
+    if edge_locations.size == 0:
+        indices = np.rint(np.linspace(0, total - 1, max_points)).astype(np.int64)
+        return x_array[indices].tolist(), y_array[indices].tolist(), "edge-focused"
+
+    window = max(20, min(2_000, total // 200))
+    edge_mask = np.zeros(total, dtype=bool)
+    for location in edge_locations:
+        start = max(0, int(location) - window)
+        stop = min(total, int(location) + window + 1)
+        edge_mask[start:stop] = True
+
+    edge_indices = np.flatnonzero(edge_mask)
+    max_edge_points = max(2, int(max_points * 0.7))
+    if edge_indices.size > max_edge_points:
+        sample = np.rint(np.linspace(0, edge_indices.size - 1, max_edge_points)).astype(np.int64)
+        edge_indices = edge_indices[sample]
+
+    remaining = max(0, max_points - int(edge_indices.size) - 2)
+    steady_indices = np.flatnonzero(~edge_mask)
+    if remaining > 0 and steady_indices.size > 0:
+        steady_count = min(remaining, int(steady_indices.size))
+        sample = np.rint(np.linspace(0, steady_indices.size - 1, steady_count)).astype(np.int64)
+        steady_indices = steady_indices[sample]
+    else:
+        steady_indices = np.array([], dtype=np.int64)
+
+    indices = np.unique(np.concatenate((np.array([0, total - 1], dtype=np.int64), edge_indices, steady_indices)))
+    if indices.size > max_points:
+        sample = np.rint(np.linspace(0, indices.size - 1, max_points)).astype(np.int64)
+        indices = indices[sample]
+    indices.sort()
+    return x_array[indices].tolist(), y_array[indices].tolist(), "edge-focused"
+
+
+def _scope_capture_file_path(capture_id: str, source: str, timestamp: float) -> Path:
+    safe_source = "".join(char for char in source.upper() if char.isalnum() or char in {"_", "-"})
+    time_tag = time.strftime("%Y%m%d_%H%M%S", time.localtime(timestamp))
+    return SCOPE_CAPTURE_DIR / f"{time_tag}_{capture_id}_{safe_source}.npz"
+
+
+def _store_full_scope_waveform(capture_id: str, capture, timestamp: float) -> tuple[str, dict]:
+    SCOPE_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    x_array = np.asarray(capture.x, dtype=np.float64)
+    y_array = np.asarray(capture.y, dtype=np.float64)
+    file_path = _scope_capture_file_path(capture_id, capture.source, timestamp)
+    np.savez(
+        file_path,
+        x=x_array,
+        y=y_array,
+        source=capture.source,
+        x_unit=capture.x_unit,
+        y_unit=capture.y_unit,
+        original_points=int(capture.original_points or len(capture.y)),
+        transfer_encoding=capture.transfer_encoding or "",
+        capture_id=capture_id,
+        timestamp=timestamp,
+    )
+    try:
+        data_file = str(file_path.relative_to(ROOT)).replace("\\", "/")
+    except ValueError:
+        data_file = str(file_path)
+    channel_record = {
+        "source": capture.source,
+        "x": capture.x,
+        "y": capture.y,
+        "x_unit": capture.x_unit,
+        "y_unit": capture.y_unit,
+        "original_points": int(capture.original_points or len(capture.y)),
+        "transfer_encoding": capture.transfer_encoding,
+        "data_file": data_file,
+    }
+    return data_file, channel_record
+
+
+def _remember_scope_capture(capture_id: str, entry: dict) -> None:
+    SCOPE_CAPTURE_CACHE[capture_id] = entry
+    while len(SCOPE_CAPTURE_CACHE) > SCOPE_CAPTURE_CACHE_LIMIT:
+        oldest_key = next(iter(SCOPE_CAPTURE_CACHE))
+        SCOPE_CAPTURE_CACHE.pop(oldest_key, None)
+
+
+def _scope_png_public_path(path: Path) -> str:
+    try:
+        return "/" + str(path.relative_to(ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(path)
+
+
+def _normalize_scope_axis_settings(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return DEFAULT_SCOPE_AXIS_SETTINGS
+    channel_axes = raw.get("channelAxes")
+    if not isinstance(channel_axes, dict):
+        channel_axes = {}
+    normalized_axes = dict(DEFAULT_SCOPE_AXIS_SETTINGS["channelAxes"])
+    for key, value in channel_axes.items():
+        channel = str(key).upper()
+        if channel in normalized_axes:
+            normalized_axes[channel] = "right" if str(value).lower() == "right" else "left"
+    try:
+        left_min = float(raw.get("leftMin", DEFAULT_SCOPE_AXIS_SETTINGS["leftMin"]))
+        left_max = float(raw.get("leftMax", DEFAULT_SCOPE_AXIS_SETTINGS["leftMax"]))
+        right_min = float(raw.get("rightMin", DEFAULT_SCOPE_AXIS_SETTINGS["rightMin"]))
+        right_max = float(raw.get("rightMax", DEFAULT_SCOPE_AXIS_SETTINGS["rightMax"]))
+    except Exception:
+        left_min = float(DEFAULT_SCOPE_AXIS_SETTINGS["leftMin"])
+        left_max = float(DEFAULT_SCOPE_AXIS_SETTINGS["leftMax"])
+        right_min = float(DEFAULT_SCOPE_AXIS_SETTINGS["rightMin"])
+        right_max = float(DEFAULT_SCOPE_AXIS_SETTINGS["rightMax"])
+    if left_min >= left_max:
+        left_min, left_max = float(DEFAULT_SCOPE_AXIS_SETTINGS["leftMin"]), float(DEFAULT_SCOPE_AXIS_SETTINGS["leftMax"])
+    if right_min >= right_max:
+        right_min, right_max = float(DEFAULT_SCOPE_AXIS_SETTINGS["rightMin"]), float(DEFAULT_SCOPE_AXIS_SETTINGS["rightMax"])
+    return {
+        "leftMin": left_min,
+        "leftMax": left_max,
+        "rightMin": right_min,
+        "rightMax": right_max,
+        "channelAxes": normalized_axes,
+    }
+
+
+def _plot_full_bode_sweep_png(
+    *,
+    frequency_hz: list[float],
+    magnitude_db: list[float],
+    phase_deg: list[float],
+    margins: dict | None = None,
+    path: Path = LATEST_BODE_PNG,
+) -> str:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    frequency = np.asarray(frequency_hz, dtype=np.float64)
+    magnitude = np.asarray(magnitude_db, dtype=np.float64)
+    phase = np.asarray(phase_deg, dtype=np.float64)
+    total = min(frequency.size, magnitude.size, phase.size)
+    if total == 0:
+        raise ValueError("No Bode sweep points are available to plot.")
+    frequency = frequency[:total]
+    magnitude = magnitude[:total]
+    phase = phase[:total]
+    mask = np.isfinite(frequency) & np.isfinite(magnitude) & np.isfinite(phase) & (frequency > 0)
+    if not np.any(mask):
+        raise ValueError("No finite Bode sweep points are available to plot.")
+    frequency = frequency[mask]
+    magnitude = magnitude[mask]
+    phase = phase[mask]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.style.use("default")
+    fig, gain_ax = plt.subplots(figsize=(16, 6), dpi=150)
+    phase_ax = gain_ax.twinx()
+    gain_line, = gain_ax.semilogx(frequency, magnitude, color="#ea4335", linewidth=1.2, label="Gain")
+    phase_line, = phase_ax.semilogx(frequency, phase, color="#1a73e8", linewidth=1.2, label="Phase")
+    gain_ax.axhline(0, color="#9aa0a6", linewidth=0.8)
+    phase_ax.axhline(0, color="#9aa0a6", linewidth=0.8, alpha=0.6)
+
+    margins = margins or {}
+    phase_crossover = margins.get("phase_crossover_hz")
+    gain_crossover = margins.get("gain_crossover_hz")
+    if phase_crossover:
+        gain_ax.axvline(float(phase_crossover), color="#1a73e8", linestyle="--", linewidth=0.9, alpha=0.7)
+    if gain_crossover:
+        gain_ax.axvline(float(gain_crossover), color="#ea4335", linestyle="--", linewidth=0.9, alpha=0.7)
+
+    gain_ax.set_xlim(float(np.min(frequency)), float(np.max(frequency)))
+    gain_ax.set_ylim(-100, 100)
+    phase_ax.set_ylim(-200, 200)
+    gain_ax.set_title("Latest Bode 100 Sweep - Full Data")
+    gain_ax.set_xlabel("Frequency (Hz)")
+    gain_ax.set_ylabel("Gain (dB)", color="#ea4335")
+    phase_ax.set_ylabel("Phase (deg)", color="#1a73e8")
+    gain_ax.tick_params(axis="y", colors="#ea4335")
+    phase_ax.tick_params(axis="y", colors="#1a73e8")
+    gain_ax.spines["left"].set_color("#ea4335")
+    phase_ax.spines["right"].set_color("#1a73e8")
+    gain_ax.grid(True, which="both", color="#d9dee7", linewidth=0.7, alpha=0.8)
+    gain_ax.legend([gain_line, phase_line], ["Gain", "Phase"], loc="upper center", ncol=2)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return _scope_png_public_path(path)
+
+
+def _plot_full_scope_capture_png(entry: dict, axis_settings: dict | None = None, path: Path = LATEST_SCOPE_PNG) -> str:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    channels = entry.get("channels", {})
+    if not channels:
+        raise ValueError("No scope channels are available to plot.")
+    axis_settings = _normalize_scope_axis_settings(axis_settings)
+
+    x_values_all = []
+    for record in channels.values():
+        x_array = np.asarray(record.get("x", []), dtype=np.float64)
+        if x_array.size:
+            x_values_all.append(x_array[np.isfinite(x_array)])
+    if not x_values_all:
+        raise ValueError("No finite scope time values are available to plot.")
+
+    finite_x = np.concatenate([values for values in x_values_all if values.size])
+    x0 = float(np.min(finite_x))
+    x1 = float(np.max(finite_x))
+    span_s = max(0.0, x1 - x0)
+    x_unit = "s"
+    x_scale = 1.0
+    if span_s < 1e-3:
+        x_unit = "us"
+        x_scale = 1e6
+    elif span_s < 1.0:
+        x_unit = "ms"
+        x_scale = 1e3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.style.use("default")
+    fig, left_ax = plt.subplots(figsize=(16, 6), dpi=150)
+    right_ax = left_ax.twinx()
+    colors = ["#1a73e8", "#ea4335", "#34a853", "#fbbc04", "#8ab4f8", "#f28b82", "#81c995", "#fde293"]
+    lines = []
+    labels = []
+    for index, (source, record) in enumerate(channels.items()):
+        x_array = np.asarray(record.get("x", []), dtype=np.float64)
+        y_array = np.asarray(record.get("y", []), dtype=np.float64)
+        total = min(x_array.size, y_array.size)
+        if total == 0:
+            continue
+        axis_side = axis_settings["channelAxes"].get(source.upper(), "left")
+        axis = right_ax if axis_side == "right" else left_ax
+        line, = axis.plot(
+            (x_array[:total] - x0) * x_scale,
+            y_array[:total],
+            label=source,
+            linewidth=0.6,
+            color=colors[index % len(colors)],
+            rasterized=True,
+        )
+        lines.append(line)
+        labels.append(source)
+
+    left_color = "#1a73e8"
+    right_color = "#ea4335"
+    left_ax.set_xlim(0, (x1 - x0) * x_scale)
+    left_ax.set_ylim(axis_settings["leftMin"], axis_settings["leftMax"])
+    right_ax.set_ylim(axis_settings["rightMin"], axis_settings["rightMax"])
+    left_ax.set_title("Latest Scope Capture - Full Data")
+    left_ax.set_xlabel(f"Time ({x_unit})")
+    left_ax.set_ylabel("Voltage (V)", color=left_color)
+    right_ax.set_ylabel("Voltage (V)", color=right_color)
+    left_ax.tick_params(axis="y", colors=left_color)
+    right_ax.tick_params(axis="y", colors=right_color)
+    left_ax.spines["left"].set_color(left_color)
+    right_ax.spines["right"].set_color(right_color)
+    left_ax.grid(True, color="#d9dee7", linewidth=0.7, alpha=0.8)
+    if lines:
+        left_ax.legend(lines, labels, loc="upper center", ncol=min(4, max(1, len(labels))))
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return _scope_png_public_path(path)
+
+
+def _get_full_scope_capture(capture_id: str, channel: str | None = None, inline: bool = False) -> dict:
+    entry = SCOPE_CAPTURE_CACHE.get(capture_id)
+    if entry is None:
+        return {"ok": False, "error": f"Scope capture '{capture_id}' is not in the in-memory cache."}
+    channels = entry.get("channels", {})
+    if channel:
+        channel_key = channel.upper()
+        record = channels.get(channel_key)
+        if record is None:
+            return {"ok": False, "error": f"Channel '{channel_key}' is not available in capture '{capture_id}'."}
+        payload = {
+            "ok": True,
+            "capture_id": capture_id,
+            "channel": channel_key,
+            "source": record.get("source"),
+            "x_unit": record.get("x_unit"),
+            "y_unit": record.get("y_unit"),
+            "original_points": record.get("original_points"),
+            "transfer_encoding": record.get("transfer_encoding"),
+            "data_file": record.get("data_file"),
+        }
+        if inline:
+            payload["x"] = record.get("x", [])
+            payload["y"] = record.get("y", [])
+        return payload
+    return {
+        "ok": True,
+        "capture_id": capture_id,
+        "created_at": entry.get("created_at"),
+        "channels": {
+            key: {
+                "source": record.get("source"),
+                "x_unit": record.get("x_unit"),
+                "y_unit": record.get("y_unit"),
+                "original_points": record.get("original_points"),
+                "transfer_encoding": record.get("transfer_encoding"),
+                "data_file": record.get("data_file"),
+            }
+            for key, record in channels.items()
+        },
+    }
+
+
+def _capture_scope(
+    resource: str,
+    channels: list[str],
+    measurements: list[str],
+    points: int | None,
+    function_generator_frequency_hz: float | None = None,
+    scope_axis_settings: dict | None = None,
+) -> dict:
+    started = time.perf_counter()
+    timestamp = time.time()
+    capture_id = uuid.uuid4().hex[:12]
+    safe_channels = [
+        ch
+        for ch in (item.strip().upper() for item in channels)
+        if ch in {f"CH{idx}" for idx in range(1, 9)}
+    ][:8] or ["CH1"]
     safe_measurements = [item.strip().upper() for item in measurements if item.strip()][:8]
-    stop = max(10, min(100000, int(points)))
+    stop = None if points is None else max(10, min(1_000_000, int(points)))
+    scope_window_s = None
+    scope_actual_window_s = None
+    scope_scale_s_per_div = None
+    scope_trigger_position_percent = None
+    if function_generator_frequency_hz is not None and function_generator_frequency_hz > 0:
+        function_generator_period_s = 1.0 / float(function_generator_frequency_hz)
+        scope_window_s = max(1e-9, min(10.0, function_generator_period_s))
     with DEVICE_LOCK:
-        scope = None
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                scope, opened = _get_scope_connection(resource, timeout_ms=6000)
+                waveforms = []
+                measurement_rows = []
+                capture_cache_entry = {
+                    "created_at": timestamp,
+                    "resource": resource,
+                    "channels": {},
+                }
+                selected_channels = set(safe_channels)
+                for index in range(1, 9):
+                    channel = f"CH{index}"
+                    scope.set_channel_display(channel, channel in selected_channels)
+                scope.set_edge_trigger("CH1", "RISE")
+                if scope_window_s is not None:
+                    scope_scale_s_per_div = scope.set_horizontal_window(scope_window_s)
+                    scope_actual_window_s = 10.0 * scope_scale_s_per_div
+                    scope_trigger_position_percent = scope.set_trigger_position_from_left(
+                        SCOPE_TRIGGER_OFFSET_FROM_LEFT_S,
+                        scope_actual_window_s,
+                    )
+                force_after_s = 0.5 if scope_window_s is None else max(0.25, min(2.0, scope_window_s * 1.5))
+                scope.single_acquisition(timeout_s=8.0, force_after_s=force_after_s)
+                for channel in safe_channels:
+                    capture = scope.capture_waveform(channel, start=1, stop=stop, max_plot_points=None)
+                    data_file, full_record = _store_full_scope_waveform(capture_id, capture, timestamp)
+                    capture_cache_entry["channels"][channel] = full_record
+                    display_x, display_y, display_strategy = _edge_focused_scope_display(
+                        capture.x,
+                        capture.y,
+                        max_points=SCOPE_DISPLAY_MAX_POINTS,
+                    )
+                    time_span_s = max(capture.x) - min(capture.x) if capture.x else None
+                    waveforms.append(
+                        {
+                            "source": capture.source,
+                            "x": display_x,
+                            "y": display_y,
+                            "x_unit": capture.x_unit,
+                            "y_unit": capture.y_unit,
+                            "time_span_s": time_span_s,
+                            "original_points": capture.original_points,
+                            "plotted_points": len(display_y),
+                            "display_points": len(display_y),
+                            "display_strategy": display_strategy,
+                            "capture_id": capture_id,
+                            "data_file": data_file,
+                            "transfer_encoding": capture.transfer_encoding,
+                        }
+                    )
+                    for measurement in safe_measurements:
+                        try:
+                            value = scope.read_immediate_measurement(channel, measurement)
+                            measurement_rows.append({"source": channel, "measurement": measurement, "value": value, "ok": True})
+                        except Exception as exc:
+                            measurement_rows.append(
+                                {"source": channel, "measurement": measurement, "value": None, "ok": False, "error": str(exc)}
+                            )
+                _remember_scope_capture(capture_id, capture_cache_entry)
+                scope_png = None
+                scope_png_error = None
+                try:
+                    scope_png = _plot_full_scope_capture_png(capture_cache_entry, scope_axis_settings)
+                except Exception as exc:
+                    scope_png_error = str(exc)
+                return {
+                    "ok": True,
+                    "resource": resource,
+                    "capture_id": capture_id,
+                    "scope_png": scope_png,
+                    "scope_png_error": scope_png_error,
+                    "identity": None,
+                    "channels": safe_channels,
+                    "measurements": safe_measurements,
+                    "waveforms": waveforms,
+                    "measurement_values": measurement_rows,
+                    "acquisition_mode": "single",
+                    "function_generator_frequency_hz": function_generator_frequency_hz,
+                    "scope_window_s": scope_window_s,
+                    "scope_actual_window_s": scope_actual_window_s,
+                    "scope_scale_s_per_div": scope_scale_s_per_div,
+                    "scope_trigger_source": "CH1",
+                    "scope_trigger_slope": "RISE",
+                    "scope_trigger_offset_from_left_s": SCOPE_TRIGGER_OFFSET_FROM_LEFT_S if scope_window_s is not None else None,
+                    "scope_trigger_position_percent": scope_trigger_position_percent,
+                    "acquisition_started": True,
+                    "acquisition_stopped": True,
+                    "session_reused": not opened,
+                    "session_retry": attempt,
+                    "duration_s": round(time.perf_counter() - started, 3),
+                    "timestamp": time.time(),
+                }
+            except Exception as exc:
+                last_error = exc
+                _drop_scope_connection(resource)
+                if attempt == 0 and _is_stale_scope_session_error(exc):
+                    continue
+                break
+        return {
+            "ok": False,
+            "resource": resource,
+            "error": str(last_error) if last_error is not None else "Scope capture failed.",
+            "duration_s": round(time.perf_counter() - started, 3),
+            "timestamp": time.time(),
+        }
+
+
+def _set_scope_acquisition(resource: str, running: bool) -> dict:
+    started = time.perf_counter()
+    with DEVICE_LOCK:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                scope, opened = _get_scope_connection(resource, timeout_ms=3000)
+                if running:
+                    scope.start_acquisition()
+                else:
+                    scope.stop_acquisition()
+                return {
+                    "ok": True,
+                    "resource": resource,
+                    "running": running,
+                    "session_reused": not opened,
+                    "session_retry": attempt,
+                    "duration_s": round(time.perf_counter() - started, 3),
+                    "timestamp": time.time(),
+                }
+            except Exception as exc:
+                last_error = exc
+                _drop_scope_connection(resource)
+                if attempt == 0 and _is_stale_scope_session_error(exc):
+                    continue
+                break
+        return {
+            "ok": False,
+            "resource": resource,
+            "running": None,
+            "error": str(last_error) if last_error is not None else "Scope acquisition command failed.",
+            "duration_s": round(time.perf_counter() - started, 3),
+            "timestamp": time.time(),
+        }
+
+
+def _warm_scope_connection(resource: str) -> dict:
+    started = time.perf_counter()
+    with DEVICE_LOCK:
         try:
-            scope = TektronixOscilloscope(resource, timeout_ms=15000)
-            scope.connect()
-            identity = scope.idn()
-            waveforms = []
-            measurement_rows = []
-            for channel in safe_channels:
-                capture = scope.capture_ascii_waveform(channel, start=1, stop=stop)
-                waveforms.append(
-                    {
-                        "source": capture.source,
-                        "x": capture.x,
-                        "y": capture.y,
-                        "x_unit": capture.x_unit,
-                        "y_unit": capture.y_unit,
-                    }
-                )
-                for measurement in safe_measurements:
-                    try:
-                        value = scope.read_immediate_measurement(channel, measurement)
-                        measurement_rows.append({"source": channel, "measurement": measurement, "value": value, "ok": True})
-                    except Exception as exc:
-                        measurement_rows.append(
-                            {"source": channel, "measurement": measurement, "value": None, "ok": False, "error": str(exc)}
-                        )
+            _, opened = _get_scope_connection(resource, timeout_ms=3000)
             return {
                 "ok": True,
                 "resource": resource,
-                "identity": identity,
-                "channels": safe_channels,
-                "measurements": safe_measurements,
-                "waveforms": waveforms,
-                "measurement_values": measurement_rows,
+                "session_reused": not opened,
+                "duration_s": round(time.perf_counter() - started, 3),
                 "timestamp": time.time(),
             }
         except Exception as exc:
-            return {"ok": False, "resource": resource, "error": str(exc), "timestamp": time.time()}
-        finally:
-            if scope is not None:
-                scope.close()
+            _drop_scope_connection(resource)
+            return {
+                "ok": False,
+                "resource": resource,
+                "error": str(exc),
+                "duration_s": round(time.perf_counter() - started, 3),
+                "timestamp": time.time(),
+            }
 
 
 def _safe_query(instrument, command: str) -> str | None:
@@ -1262,6 +1908,22 @@ def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
         return default
 
 
+def _optional_int_param(params: dict[str, list[str]], name: str) -> int | None:
+    try:
+        raw = params.get(name, [None])[0]
+        return None if raw in {None, ""} else int(raw)
+    except Exception:
+        return None
+
+
+def _optional_float_param(params: dict[str, list[str]], name: str) -> float | None:
+    try:
+        raw = params.get(name, [None])[0]
+        return None if raw in {None, ""} else float(raw)
+    except Exception:
+        return None
+
+
 def _list_param(params: dict[str, list[str]], name: str, default: list[str]) -> list[str]:
     raw_values = params.get(name)
     if not raw_values:
@@ -1299,6 +1961,8 @@ def _config_from_payload(payload: dict | None) -> TuningConfig:
             undershoot_pct=_float_field(targets_payload, "undershoot_pct", 4.0),
             settling_time_s=_float_field(targets_payload, "settling_time_s", 100e-6),
             oscillations=_int_field(targets_payload, "oscillations", 0),
+            phase_margin_deg=_float_field(targets_payload, "phase_margin_deg", 60.0),
+            crossover_frequency_hz=_float_field(targets_payload, "crossover_frequency_hz", 100_000.0),
         ),
         search=SearchSpace(
             wc_min_rad_s=_float_field(search_payload, "wc_min_rad_s", 94_248.0),

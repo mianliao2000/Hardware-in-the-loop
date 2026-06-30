@@ -21,7 +21,7 @@ import {
   Sun,
   Zap
 } from "lucide-react";
-import { captureScope, getTuningStatus, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, runBodeSweep, runSelfTestDevice, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopTuning } from "./api";
+import { captureScope, getTuningStatus, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, runBodeSweep, runSelfTestDevice, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopTuning, warmScope } from "./api";
 import type { BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceField, InductanceReadback, InstrumentKey, InstrumentTestResult, IterationRecord, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 import "./styles.css";
 
@@ -38,7 +38,9 @@ const defaultConfig: TuningConfig = {
     overshoot_pct: 4,
     undershoot_pct: 4,
     settling_time_s: 100e-6,
-    oscillations: 0
+    oscillations: 0,
+    phase_margin_deg: 60,
+    crossover_frequency_hz: 100000
   },
   search: {
     wc_min_rad_s: 94248,
@@ -73,6 +75,10 @@ const defaultVoutExponent = -9;
 const voutDisplayDigits = 4;
 const defaultManualVoutRequest = { address: "0x5E", page: 0, adapter: "xdp", voltage: 0.9296875 };
 const defaultManualInductanceRequest = { output_nh: 100.024, effective_lc_nh: 369.276 };
+const outputInductanceRangeLabel = "14.29-117028.57 nH";
+const effectiveLcInductanceRangeLabel = "229.02-117028.57 nH";
+const outputInductanceLimitText = `Range: ${outputInductanceRangeLabel}`;
+const effectiveLcInductanceLimitText = `Range: ${effectiveLcInductanceRangeLabel}`;
 const defaultManualXdpPidRequest: Record<string, number> = {
   mod0_kp: 165,
   mod0_ki: 220,
@@ -90,15 +96,16 @@ const defaultBodeSweepConfig: BodeSweepConfig = {
   source_dbm: 0,
   timeout_ms: 60000
 };
-const defaultScopeChannels = ["CH1"];
-const defaultScopeMeasurements = ["MEAN", "PK2PK", "FREQ", "RMS"];
+const defaultScopeChannels = ["CH1", "CH3"];
+const defaultScopeMeasurements: string[] = [];
+const scopeFrontendMaxPoints = 200_000;
 const defaultFunctionGeneratorConfig = {
   channel: 1,
   mode: "square",
-  frequency_hz: 100000,
-  low_v: 0.365,
-  high_v: 2,
-  duty_percent: 50,
+  voltage_unit: "VPP",
+  frequency_hz: 25000,
+  low_v: 0,
+  high_v: 1,
   pulse_width_s: 5e-6,
   dc_level_v: 0,
   amplitude_vpp: 1,
@@ -139,6 +146,14 @@ type TelemetryAxisSettings = {
   y2Min: number;
   y2Max: number;
 };
+type ScopeAxisSide = "left" | "right";
+type ScopeAxisSettings = {
+  leftMin: number;
+  leftMax: number;
+  rightMin: number;
+  rightMax: number;
+  channelAxes: Record<string, ScopeAxisSide>;
+};
 const tabStorageKey = "tpu_a1_active_tab";
 const languageStorageKey = "tpu_a1_language";
 const themeStorageKey = "tpu_a1_theme";
@@ -157,6 +172,22 @@ const defaultBodeAxisSettings: ChartAxisSettings = {
   yMax: 100,
   y2Min: -200,
   y2Max: 200
+};
+const defaultScopeAxisSettings: ScopeAxisSettings = {
+  leftMin: -0.5,
+  leftMax: 3,
+  rightMin: 0.7,
+  rightMax: 1.1,
+  channelAxes: {
+    CH1: "left",
+    CH2: "left",
+    CH3: "right",
+    CH4: "right",
+    CH5: "left",
+    CH6: "left",
+    CH7: "right",
+    CH8: "right"
+  }
 };
 
 function getInitialTab(): AppTab {
@@ -182,6 +213,7 @@ const copy = {
   en: {
     platform: "AI Powered Hardware-in-the-loop Platform",
     copyright: "Copyright © Google LLC",
+    author: "Author: Jackson (Mian) Liao",
     backend: "Backend",
     pidProgramming: "PID programming",
     iterations: "Iterations",
@@ -210,6 +242,7 @@ const copy = {
   zh: {
     platform: "AI 驱动的硬件在环平台",
     copyright: "版权 © Google LLC",
+    author: "Author: Jackson (Mian) Liao",
     backend: "后端",
     pidProgramming: "PID 写入",
     iterations: "迭代次数",
@@ -657,6 +690,20 @@ function App() {
     await writeManualSnapshot(buildManualWriteSnapshot());
   };
 
+  const writeAllManualParametersForAcquisition = async () => {
+    await writeManualSnapshot(
+      buildManualWriteSnapshot({
+        selection: {
+          vout: true,
+          output_inductance: true,
+          effective_lc_inductance: true,
+          xdp_pid: true
+        }
+      }),
+      false
+    );
+  };
+
   const handleRealTimeWritingChange = (enabled: boolean) => {
     setManualRealTimeWriting(enabled);
     if (!enabled || activeTab !== "manual") return;
@@ -723,10 +770,12 @@ function App() {
       } else {
         setBodeSweepStatus(next.duration_s ? `Done in ${next.duration_s.toFixed(2)} s` : "Sweep complete");
       }
+      return next;
     } catch (exc) {
       const message = String(exc);
       setError(message);
       setBodeSweepStatus(message);
+      return null;
     } finally {
       setBodeSweepRunning(false);
     }
@@ -796,9 +845,10 @@ function App() {
                 <span className="google-green">l</span>
                 <span className="google-red">e</span>
               </span>{" "}
-              <span className="product-title">Power Auto-Tuner</span>
+              <span className="product-title">Power Auto-Tuner (V1.0)</span>
             </h1>
             <p>{t.platform} ({t.copyright})</p>
+            <p>{t.author}</p>
           </div>
         </div>
         <div className="topbar-actions">
@@ -830,11 +880,6 @@ function App() {
         </div>
       )}
 
-      <section className="notice">
-        <ShieldOff size={18} />
-        <span>{t.pidNotice}</span>
-      </section>
-
       {activeTab === "autotune" ? <AutotuneWorkbench
         config={config}
         setConfig={setConfig}
@@ -843,14 +888,13 @@ function App() {
         best={best}
         history={history}
         vout={vout}
-        voutRequest={voutRequest}
-        setVoutRequest={setVoutRequest}
         inductance={inductance}
         inductanceRequest={inductanceRequest}
         setInductanceRequest={setInductanceRequest}
+        xdpPid={xdpPid}
+        xdpPidRequest={xdpPidRequest}
+        setXdpPidRequest={setXdpPidRequest}
         runAction={runAction}
-        readBoardVout={readBoardVout}
-        writeBoardVout={writeBoardVout}
         readBoardInductance={readBoardInductance}
         writeOutputInductance={writeOutputInductance}
         writeEffectiveLcInductance={writeEffectiveLcInductance}
@@ -875,9 +919,13 @@ function App() {
         bodeSweep={bodeSweep}
         bodeSweepConfig={bodeSweepConfig}
         setBodeSweepConfig={setBodeSweepConfig}
+        setBodeSweep={setBodeSweep}
         bodeSweepRunning={bodeSweepRunning}
+        setBodeSweepRunning={setBodeSweepRunning}
         bodeSweepStatus={bodeSweepStatus}
+        setBodeSweepStatus={setBodeSweepStatus}
         runManualBodeSweep={runManualBodeSweep}
+        setError={setError}
         telemetryHistory={telemetryHistory}
         liveRefresh={manualLiveRefresh}
         setLiveRefresh={setManualLiveRefresh}
@@ -893,6 +941,7 @@ function App() {
         readBoardInductance={readBoardInductance}
         readBoardXdpPid={readBoardXdpPid}
         writeManualTuning={writeManualTuning}
+        writeAllManualParametersForAcquisition={writeAllManualParametersForAcquisition}
         resetManualDefaults={resetManualDefaults}
         labels={t}
       /> : <SelfTestingView
@@ -919,7 +968,7 @@ function HeaderToggles({
 }) {
   return (
     <div className="header-toggles" aria-label="Display controls">
-      <div className="pill-toggle" role="group" aria-label="Language">
+      <div className="pill-toggle language-toggle" role="group" aria-label="Language">
         <button
           type="button"
           className={language === "zh" ? "active" : ""}
@@ -990,14 +1039,13 @@ function AutotuneWorkbench({
   best,
   history,
   vout,
-  voutRequest,
-  setVoutRequest,
   inductance,
   inductanceRequest,
   setInductanceRequest,
+  xdpPid,
+  xdpPidRequest,
+  setXdpPidRequest,
   runAction,
-  readBoardVout,
-  writeBoardVout,
   readBoardInductance,
   writeOutputInductance,
   writeEffectiveLcInductance
@@ -1009,14 +1057,13 @@ function AutotuneWorkbench({
   best: IterationRecord | null;
   history: IterationRecord[];
   vout: VoutReadback | null;
-  voutRequest: { address: string; page: number; adapter: string; voltage: number };
-  setVoutRequest: React.Dispatch<React.SetStateAction<{ address: string; page: number; adapter: string; voltage: number }>>;
   inductance: InductanceReadback | null;
   inductanceRequest: { output_nh: number; effective_lc_nh: number };
   setInductanceRequest: React.Dispatch<React.SetStateAction<{ output_nh: number; effective_lc_nh: number }>>;
+  xdpPid: XdpPidReadback | null;
+  xdpPidRequest: Record<string, number>;
+  setXdpPidRequest: React.Dispatch<React.SetStateAction<Record<string, number>>>;
   runAction: (action: "start" | "stop" | "step") => Promise<void>;
-  readBoardVout: () => Promise<void>;
-  writeBoardVout: () => Promise<void>;
   readBoardInductance: () => Promise<void>;
   writeOutputInductance: () => Promise<void>;
   writeEffectiveLcInductance: () => Promise<void>;
@@ -1027,15 +1074,29 @@ function AutotuneWorkbench({
       <div className="workspace">
         <aside className="control-rail">
           <Panel title="Run Control" icon={<Activity size={17} />}>
-            <div className="button-row">
-              <button className="primary" onClick={() => runAction("start")} disabled={status?.state === "running"}>
-                <Play size={16} /> Start
+            <div className="autotune-controls">
+              <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running"}>
+                Start Auto-Tune
               </button>
-              <button onClick={() => runAction("step")} disabled={status?.state === "running"}>
-                <SkipForward size={16} /> Step
+              <button className="autotune-control-button iterate" onClick={() => runAction("step")} disabled={status?.state === "running"}>
+                Run Single Iteration
               </button>
-              <button onClick={() => runAction("stop")} disabled={status?.state !== "running"}>
-                <StopCircle size={16} /> Stop
+              <div className="autotune-control-grid">
+                <button className="autotune-control-button" disabled>
+                  Pause
+                </button>
+                <button className="autotune-control-button" disabled>
+                  Resume
+                </button>
+                <button className="autotune-control-button" onClick={() => runAction("stop")} disabled={status?.state !== "running"}>
+                  Stop
+                </button>
+              </div>
+              <button className="autotune-control-button" disabled>
+                Save Animation GIF
+              </button>
+              <button className="autotune-control-button reset" onClick={() => setConfig(defaultConfig)}>
+                Reset to Defaults
               </button>
             </div>
             <p className="message-line">{status?.message ?? "Connecting to local backend..."}</p>
@@ -1052,52 +1113,39 @@ function AutotuneWorkbench({
             <NumberField label="Overshoot max (%)" value={config.targets.overshoot_pct} onChange={(value) => updateConfig(setConfig, "targets", "overshoot_pct", value)} />
             <NumberField label="Undershoot max (%)" value={config.targets.undershoot_pct} onChange={(value) => updateConfig(setConfig, "targets", "undershoot_pct", value)} />
             <NumberField label="Settling target (us)" value={config.targets.settling_time_s * 1e6} onChange={(value) => updateConfig(setConfig, "targets", "settling_time_s", value / 1e6)} />
+            <NumberField label="Phase Margin target (deg)" value={config.targets.phase_margin_deg} onChange={(value) => updateConfig(setConfig, "targets", "phase_margin_deg", value)} />
+            <NumberField label="Crossover Frequency target (Hz)" value={config.targets.crossover_frequency_hz} onChange={(value) => updateConfig(setConfig, "targets", "crossover_frequency_hz", value)} />
           </Panel>
 
           <Panel title="Search Space" icon={<RefreshCw size={17} />}>
-            <NumberField label="wc min (rad/s)" value={config.search.wc_min_rad_s} onChange={(value) => updateConfig(setConfig, "search", "wc_min_rad_s", value)} />
-            <NumberField label="wc max (rad/s)" value={config.search.wc_max_rad_s} onChange={(value) => updateConfig(setConfig, "search", "wc_max_rad_s", value)} />
-            <NumberField label="initial phase margin (deg)" value={config.search.initial_phi_deg} onChange={(value) => updateConfig(setConfig, "search", "initial_phi_deg", value)} />
             <NumberField label="max iterations" value={config.search.max_iterations} onChange={(value) => updateConfig(setConfig, "search", "max_iterations", Math.max(1, Math.round(value)))} />
-          </Panel>
-
-          <Panel title="Vout Control" icon={<Zap size={17} />}>
-            <TextField label="Address" value={voutRequest.address} onChange={(value) => setVoutRequest({ ...voutRequest, address: value })} />
-            <NumberField label="Page" value={voutRequest.page} onChange={(value) => setVoutRequest({ ...voutRequest, page: Math.max(0, Math.round(value)) })} />
-            <NumberField
-              label="Set Vout (V)"
-              value={snapVoutToRegister(voutRequest.voltage, voutExponent)}
-              step={voutRegisterStep}
-              displayDigits={voutDisplayDigits}
-              onChange={(value) => setVoutRequest({ ...voutRequest, voltage: snapVoutToRegister(value, voutExponent) })}
-            />
-            <div className="button-row">
-              <button onClick={readBoardVout}><RefreshCw size={16} /> Read</button>
-              <button onClick={writeBoardVout}><Zap size={16} /> Set</button>
-            </div>
-            <p className="readback">{formatVout(vout)}</p>
-          </Panel>
-
-          <Panel title="Current Emulation" icon={<SlidersHorizontal size={17} />}>
+            {xdpPidFieldNames.map((name) => (
+              <NumberField
+                key={name}
+                label={`${name} ${xdpPidLimitLabel(name, xdpPid).replace(`${name} `, "")}`}
+                value={xdpPidRequest[name] ?? 0}
+                step={1}
+                onChange={(value) => {
+                  const limit = xdpPid?.pid_registers?.fields?.[name] ?? defaultXdpPidLimits[name];
+                  setXdpPidRequest({
+                    ...xdpPidRequest,
+                    [name]: clamp(Math.round(value), limit.min, limit.max)
+                  });
+                }}
+              />
+            ))}
             <NumberField
               label="Output Inductance (nH)"
               value={inductanceRequest.output_nh}
               onChange={(value) => setInductanceRequest({ ...inductanceRequest, output_nh: value })}
             />
-            <div className="button-row">
-              <button onClick={readBoardInductance}><RefreshCw size={16} /> Read</button>
-              <button onClick={writeOutputInductance}><Zap size={16} /> Set Output L</button>
-            </div>
-            <InductanceReadout field={inductance?.output_inductance ?? null} />
+            <p className="message-line">{outputInductanceLimitText}</p>
             <NumberField
               label="Effective Lc Inductance (nH)"
               value={inductanceRequest.effective_lc_nh}
               onChange={(value) => setInductanceRequest({ ...inductanceRequest, effective_lc_nh: value })}
             />
-            <div className="button-row">
-              <button onClick={writeEffectiveLcInductance}><Zap size={16} /> Set Effective Lc</button>
-            </div>
-            <InductanceReadout field={inductance?.effective_lc_inductance ?? null} />
+            <p className="message-line">{effectiveLcInductanceLimitText}</p>
           </Panel>
         </aside>
 
@@ -1160,9 +1208,13 @@ function ManualTuningView({
   bodeSweep,
   bodeSweepConfig,
   setBodeSweepConfig,
+  setBodeSweep,
   bodeSweepRunning,
+  setBodeSweepRunning,
   bodeSweepStatus,
+  setBodeSweepStatus,
   runManualBodeSweep,
+  setError,
   telemetryHistory,
   liveRefresh,
   setLiveRefresh,
@@ -1178,6 +1230,7 @@ function ManualTuningView({
   readBoardInductance,
   readBoardXdpPid,
   writeManualTuning,
+  writeAllManualParametersForAcquisition,
   resetManualDefaults,
   labels
 }: {
@@ -1201,9 +1254,13 @@ function ManualTuningView({
   bodeSweep: BodeSweepReadback | null;
   bodeSweepConfig: BodeSweepConfig;
   setBodeSweepConfig: React.Dispatch<React.SetStateAction<BodeSweepConfig>>;
+  setBodeSweep: React.Dispatch<React.SetStateAction<BodeSweepReadback | null>>;
   bodeSweepRunning: boolean;
+  setBodeSweepRunning: React.Dispatch<React.SetStateAction<boolean>>;
   bodeSweepStatus: string;
-  runManualBodeSweep: () => Promise<void>;
+  setBodeSweepStatus: React.Dispatch<React.SetStateAction<string>>;
+  runManualBodeSweep: () => Promise<BodeSweepReadback | null>;
+  setError: React.Dispatch<React.SetStateAction<string>>;
   telemetryHistory: VoutReadback[];
   liveRefresh: boolean;
   setLiveRefresh: React.Dispatch<React.SetStateAction<boolean>>;
@@ -1219,37 +1276,75 @@ function ManualTuningView({
   readBoardInductance: () => Promise<void>;
   readBoardXdpPid: () => Promise<void>;
   writeManualTuning: () => Promise<void>;
+  writeAllManualParametersForAcquisition: () => Promise<void>;
   resetManualDefaults: () => void;
   labels: (typeof copy)[Language];
 }) {
   const voutExponent = voutExponentFromReadback(vout);
   const voutRegisterStep = voutRegisterStepFromExponent(voutExponent);
   const [showConnectionSettings, setShowConnectionSettings] = useState(false);
-  const [axisEditor, setAxisEditor] = useState<"telemetry" | "bode" | null>(null);
+  const [axisEditor, setAxisEditor] = useState<"telemetry" | "scope" | "bode" | null>(null);
   const [telemetryAxisSettings, setTelemetryAxisSettings] = useState<TelemetryAxisSettings>({ ...defaultTelemetryAxisSettings });
+  const [scopeAxisSettings, setScopeAxisSettings] = useState<ScopeAxisSettings>({ ...defaultScopeAxisSettings });
   const [bodeAxisSettings, setBodeAxisSettings] = useState<ChartAxisSettings>({ ...defaultBodeAxisSettings });
   const [scopeChannels, setScopeChannels] = useState<string[]>(defaultScopeChannels);
   const [scopeMeasurements, setScopeMeasurements] = useState<string[]>(defaultScopeMeasurements);
-  const [scopePoints, setScopePoints] = useState(2000);
   const [scopeCapture, setScopeCapture] = useState<ScopeCaptureReadback | null>(null);
+  const [scopeWebPlotOpen, setScopeWebPlotOpen] = useState(true);
+  const [scopePngPlotOpen, setScopePngPlotOpen] = useState(true);
+  const [bodeWebPlotOpen, setBodeWebPlotOpen] = useState(true);
+  const [bodePngPlotOpen, setBodePngPlotOpen] = useState(true);
   const [scopeRunning, setScopeRunning] = useState(false);
+  const [scopeAcquisitionRunning, setScopeAcquisitionRunning] = useState(false);
+  const [scopeAcquisitionBusy, setScopeAcquisitionBusy] = useState(false);
   const [fgConfig, setFgConfig] = useState({ ...defaultFunctionGeneratorConfig });
   const [fgReadback, setFgReadback] = useState<FunctionGeneratorReadback | null>(null);
   const [fgRunning, setFgRunning] = useState(false);
+  const [fullAcquisitionRunning, setFullAcquisitionRunning] = useState(false);
+  const [fullAcquisitionStatus, setFullAcquisitionStatus] = useState("");
+  const [fullAcquisitionDurationS, setFullAcquisitionDurationS] = useState<number | null>(null);
   const [powerSupply, setPowerSupplyState] = useState<PowerSupplyReadback | null>(null);
-  const [powerSupplyRateHz, setPowerSupplyRateHz] = useState(2);
+  const powerSupplyRateHz = 5;
   const [powerSupplyLive, setPowerSupplyLive] = useState(false);
-  const [powerSupplyRequest, setPowerSupplyRequest] = useState({ voltage_v: 10, current_limit_a: 8 });
+  const [powerSupplyRequest, setPowerSupplyRequest] = useState({ voltage_v: 54.5, current_limit_a: 8 });
   const [powerSupplyRunning, setPowerSupplyRunning] = useState(false);
+  const powerSupplyPollInFlight = useRef(false);
+
+  useEffect(() => {
+    warmScope().catch(() => undefined);
+  }, []);
 
   const runScopeCapture = async () => {
     try {
       setScopeRunning(true);
-      setScopeCapture(await captureScope({ channels: scopeChannels, measurements: scopeMeasurements, points: scopePoints }));
+      setScopeCapture(null);
+      setScopeCapture(await captureScope({
+        channels: scopeChannels,
+        measurements: scopeMeasurements,
+        function_generator_frequency_hz: fgConfig.frequency_hz,
+        scope_axis_settings: scopeAxisSettings
+      }));
+      setScopeAcquisitionRunning(false);
     } catch (exc) {
       setScopeCapture({ ok: false, error: String(exc), timestamp: Date.now() / 1000 });
     } finally {
       setScopeRunning(false);
+    }
+  };
+
+  const setScopeRunState = async (running: boolean) => {
+    try {
+      setScopeAcquisitionBusy(true);
+      const result = await setScopeAcquisition(running);
+      if (result.ok) {
+        setScopeAcquisitionRunning(running);
+      } else {
+        setScopeCapture({ ok: false, error: result.error ?? "Scope acquisition command failed.", timestamp: Date.now() / 1000 });
+      }
+    } catch (exc) {
+      setScopeCapture({ ok: false, error: String(exc), timestamp: Date.now() / 1000 });
+    } finally {
+      setScopeAcquisitionBusy(false);
     }
   };
 
@@ -1275,15 +1370,41 @@ function ManualTuningView({
     }
   };
 
-  const readSupply = async () => {
+  const setAfGeneratorOutput = async (output_enabled: boolean) => {
     try {
-      setPowerSupplyRunning(true);
+      setFgRunning(true);
+      setFgReadback(
+        await setFunctionGenerator({
+          channel: fgConfig.channel,
+          mode: fgConfig.mode,
+          output_enabled
+        })
+      );
+    } catch (exc) {
+      setFgReadback({ ok: false, error: String(exc), timestamp: Date.now() / 1000 });
+    } finally {
+      setFgRunning(false);
+    }
+  };
+
+  const readSupply = async (showBusy = true) => {
+    if (!showBusy && powerSupplyPollInFlight.current) return;
+    try {
+      if (showBusy) {
+        setPowerSupplyRunning(true);
+      } else {
+        powerSupplyPollInFlight.current = true;
+      }
       const next = await readPowerSupply();
       setPowerSupplyState(next);
     } catch (exc) {
       setPowerSupplyState({ ok: false, error: String(exc), timestamp: Date.now() / 1000 });
     } finally {
-      setPowerSupplyRunning(false);
+      if (showBusy) {
+        setPowerSupplyRunning(false);
+      } else {
+        powerSupplyPollInFlight.current = false;
+      }
     }
   };
 
@@ -1298,10 +1419,21 @@ function ManualTuningView({
     }
   };
 
+  const setSupplyOutput = async (output_enabled: boolean) => {
+    try {
+      setPowerSupplyRunning(true);
+      setPowerSupplyState(await setPowerSupply({ output_enabled }));
+    } catch (exc) {
+      setPowerSupplyState({ ok: false, error: String(exc), timestamp: Date.now() / 1000 });
+    } finally {
+      setPowerSupplyRunning(false);
+    }
+  };
+
   useEffect(() => {
     if (!powerSupplyLive) return;
-    readSupply();
-    const timer = window.setInterval(readSupply, 1000 / Math.max(1, Math.min(10, powerSupplyRateHz)));
+    readSupply(false);
+    const timer = window.setInterval(() => readSupply(false), 1000 / Math.max(1, Math.min(10, powerSupplyRateHz)));
     return () => window.clearInterval(timer);
   }, [powerSupplyLive, powerSupplyRateHz]);
 
@@ -1311,6 +1443,80 @@ function ManualTuningView({
     await readBoardXdpPid();
     await readBoardPmbusOutput();
     await readBoardXdpOutput();
+  };
+
+  const runFullDataAcquisition = async () => {
+    const started = performance.now();
+    const acquisitionFgConfig = { ...fgConfig };
+    let afgEnabled = false;
+    try {
+      setFullAcquisitionRunning(true);
+      setFullAcquisitionDurationS(null);
+      setError("");
+      setFullAcquisitionStatus("Writing manual parameters to XDP...");
+      await writeAllManualParametersForAcquisition();
+      setFullAcquisitionStatus("Running Bode 100 sweep...");
+      setBodeSweepRunning(true);
+      setBodeSweepStatus("Running Bode 100 sweep...");
+      const bode = await runBodeSweep(bodeSweepConfig);
+      setBodeSweep(bode);
+      if (bode.ok === false) {
+        setBodeSweepStatus(bode.error ?? "Bode sweep failed");
+        throw new Error(bode?.error ?? "Bode sweep failed");
+      }
+      setBodeSweepStatus(bode.duration_s ? `Done in ${bode.duration_s.toFixed(2)} s` : "Sweep complete");
+
+      setFullAcquisitionStatus(`Applying function generator settings on CH${acquisitionFgConfig.channel}...`);
+      setFgRunning(true);
+      setFgReadback(await setFunctionGenerator(acquisitionFgConfig));
+      setFullAcquisitionStatus("Enabling function generator output...");
+      setFgReadback(await setFunctionGenerator({
+        channel: acquisitionFgConfig.channel,
+        mode: acquisitionFgConfig.mode,
+        output_enabled: true
+      }));
+      afgEnabled = true;
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+
+      setFullAcquisitionStatus("Capturing scope waveform...");
+      setScopeRunning(true);
+      setScopeCapture(null);
+      const scope = await captureScope({
+        channels: scopeChannels,
+        measurements: scopeMeasurements,
+        function_generator_frequency_hz: acquisitionFgConfig.frequency_hz,
+        scope_axis_settings: scopeAxisSettings
+      });
+      setScopeCapture(scope);
+      setScopeAcquisitionRunning(false);
+      if (scope.ok === false) {
+        throw new Error(scope.error ?? "Scope capture failed");
+      }
+      setFullAcquisitionStatus("");
+    } catch (exc) {
+      const message = String(exc);
+      setError(message);
+      setFullAcquisitionStatus(message);
+    } finally {
+      setBodeSweepRunning(false);
+      setScopeRunning(false);
+      if (afgEnabled) {
+        try {
+          setFullAcquisitionStatus((current) => current ? `${current} / Disabling AFG...` : "");
+          setFgReadback(await setFunctionGenerator({
+            channel: acquisitionFgConfig.channel,
+            mode: acquisitionFgConfig.mode,
+            output_enabled: false
+          }));
+          setFullAcquisitionStatus((current) => current.replace(" / Disabling AFG...", ""));
+        } catch (exc) {
+          setError(`AFG disable failed: ${String(exc)}`);
+        }
+      }
+      setFgRunning(false);
+      setFullAcquisitionRunning(false);
+      setFullAcquisitionDurationS((performance.now() - started) / 1000);
+    }
   };
 
   const displayTelemetryHistory = smoothTelemetryHistory(telemetryHistory);
@@ -1323,6 +1529,17 @@ function ManualTuningView({
     <section className="manual-page">
       <div className="manual-grid">
         <aside className="manual-controls">
+          <Panel title="Data Acquisition" icon={<Activity size={17} />}>
+            <button className="primary wide-button" type="button" onClick={runFullDataAcquisition} disabled={fullAcquisitionRunning}>
+              {fullAcquisitionRunning ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+              Full Data Acquisition
+            </button>
+            {fullAcquisitionStatus ? (
+              <p className={`micro-readback ${fullAcquisitionRunning ? "running-text" : ""}`}>{fullAcquisitionStatus}</p>
+            ) : null}
+            <p className="micro-readback">Total time: {fullAcquisitionDurationS === null ? "--" : `${fullAcquisitionDurationS.toFixed(2)} s`}</p>
+          </Panel>
+
           <Panel title="XDP Connection" icon={<Activity size={17} />}>
             <div className="connection-summary">
               <span>XDP Address</span>
@@ -1339,9 +1556,6 @@ function ManualTuningView({
               </div>
             ) : null}
             <LiveRefreshButton enabled={liveRefresh} label={labels.liveReadback} onChange={setLiveRefresh} />
-            <div className="button-row">
-              <button className="compact-read-button" onClick={readAllManualBlocks}><RefreshCw size={13} /> Read Outputs/Inductance/PID</button>
-            </div>
           </Panel>
 
           <Panel title="Manual Parameters" icon={<SlidersHorizontal size={17} />}>
@@ -1503,18 +1717,33 @@ function ManualTuningView({
             <div className="instrument-controls">
               <div className="inline-options">
                 {Array.from({ length: 8 }, (_, index) => `CH${index + 1}`).map((channel) => (
-                  <label key={channel} className="chip-check">
-                    <input
-                      type="checkbox"
-                      checked={scopeChannels.includes(channel)}
+                  <div key={channel} className={`scope-channel-chip ${scopeChannels.includes(channel) ? "selected" : ""}`}>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={scopeChannels.includes(channel)}
+                        onChange={(event) => {
+                          setScopeChannels((current) => event.target.checked
+                            ? [...new Set([...current, channel])]
+                            : current.filter((item) => item !== channel));
+                        }}
+                      />
+                      <span>{channel}</span>
+                    </label>
+                    <select
+                      value={scopeAxisSettings.channelAxes[channel] ?? "left"}
                       onChange={(event) => {
-                        setScopeChannels((current) => event.target.checked
-                          ? [...new Set([...current, channel])]
-                          : current.filter((item) => item !== channel));
+                        const side = event.target.value === "right" ? "right" : "left";
+                        setScopeAxisSettings((current) => ({
+                          ...current,
+                          channelAxes: { ...current.channelAxes, [channel]: side }
+                        }));
                       }}
-                    />
-                    {channel}
-                  </label>
+                    >
+                      <option value="left">Left</option>
+                      <option value="right">Right</option>
+                    </select>
+                  </div>
                 ))}
               </div>
               <div className="inline-options">
@@ -1534,7 +1763,11 @@ function ManualTuningView({
                 ))}
               </div>
               <div className="compact-form-row">
-                <NumberField label="Points" value={scopePoints} onChange={(value) => setScopePoints(Math.max(10, Math.round(value)))} />
+                <ScopeAcquisitionToggle
+                  running={scopeAcquisitionRunning}
+                  busy={scopeAcquisitionBusy}
+                  onChange={setScopeRunState}
+                />
                 <button className="primary compact-action" type="button" onClick={runScopeCapture} disabled={scopeRunning}>
                   {scopeRunning ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
                   Read Scope
@@ -1542,10 +1775,44 @@ function ManualTuningView({
               </div>
             </div>
             {scopeCapture?.error ? <p className="message-line bad-text">{scopeCapture.error}</p> : null}
+            <p className={`message-line ${scopeRunning ? "running-text" : scopeCapture?.error ? "bad-text" : ""}`}>
+              {scopeRunning
+                ? "Reading scope..."
+                : scopeCapture?.duration_s !== undefined
+                  ? `Done in ${scopeCapture.duration_s.toFixed(2)} s`
+                  : "Ready"}
+            </p>
             {scopeCapture?.identity ? <p className="message-line">{scopeCapture.identity}</p> : null}
-            <div className="chart-shell">
-              <ReactECharts option={scopeWaveformOption(scopeCapture)} className="chart scope-chart" />
-            </div>
+            <PlotToggleSection
+              title="Scope Web Plot"
+              open={scopeWebPlotOpen}
+              onToggle={() => setScopeWebPlotOpen((current) => !current)}
+            >
+              <div className="chart-shell" onDoubleClick={() => setAxisEditor("scope")}>
+                <ReactECharts
+                  key={scopeChartKey(scopeCapture)}
+                  option={scopeWaveformOption(scopeCapture, scopeAxisSettings)}
+                  className="chart scope-chart"
+                  notMerge
+                />
+              </div>
+            </PlotToggleSection>
+            <PlotToggleSection
+              title="Scope PNG Plot"
+              open={scopePngPlotOpen}
+              onToggle={() => setScopePngPlotOpen((current) => !current)}
+              summary={scopeCapture?.scope_png ? "full data" : "not available"}
+            >
+              {scopeCapture?.scope_png ? (
+                <div className="scope-png-preview">
+                  <img
+                    src={`${scopeCapture.scope_png}?v=${encodeURIComponent(scopeCapture.capture_id ?? String(scopeCapture.timestamp ?? Date.now()))}`}
+                    alt="Latest full scope capture"
+                  />
+                </div>
+              ) : <p className="message-line">No scope PNG yet.</p>}
+            </PlotToggleSection>
+            {scopeCapture?.scope_png_error ? <p className="message-line bad-text">{scopeCapture.scope_png_error}</p> : null}
             <ScopeMeasurementTable capture={scopeCapture} />
           </Panel>
 
@@ -1586,82 +1853,133 @@ function ManualTuningView({
             </p>
             {bodeSweep?.error ? <p className="message-line bad-text">{bodeSweep.error}</p> : null}
             {bodeSweep?.identity ? <p className="message-line">{bodeSweep.identity}</p> : null}
-            <div className="chart-shell" onDoubleClick={() => setAxisEditor("bode")}>
-              <ReactECharts option={bodeSweepOption(bodeSweep, bodeAxisSettings)} className="chart bode-chart" />
-            </div>
+            <BodeMarginReadout sweep={bodeSweep} />
+            <PlotToggleSection
+              title="Bode Web Plot"
+              open={bodeWebPlotOpen}
+              onToggle={() => setBodeWebPlotOpen((current) => !current)}
+            >
+              <div className="chart-shell bode-chart-shell" onDoubleClick={() => setAxisEditor("bode")}>
+                <ReactECharts
+                  option={bodeSweepOption(bodeSweep, bodeAxisSettings)}
+                  className="chart bode-chart"
+                  style={{ height: "100%", width: "100%" }}
+                />
+              </div>
+            </PlotToggleSection>
+            <PlotToggleSection
+              title="Bode PNG Plot"
+              open={bodePngPlotOpen}
+              onToggle={() => setBodePngPlotOpen((current) => !current)}
+              summary={bodeSweep?.bode_png ? "full data" : "not available"}
+            >
+              {bodeSweep?.bode_png ? (
+                <div className="scope-png-preview">
+                  <img
+                    src={`${bodeSweep.bode_png}?v=${encodeURIComponent(bodeSweep.sweep_id ?? String(bodeSweep.timestamp ?? Date.now()))}`}
+                    alt="Latest full Bode 100 sweep"
+                  />
+                </div>
+              ) : <p className="message-line">No Bode PNG yet.</p>}
+            </PlotToggleSection>
+            {bodeSweep?.bode_png_error ? <p className="message-line bad-text">{bodeSweep.bode_png_error}</p> : null}
           </Panel>
 
-          <Panel title="Function Generator" icon={<Activity size={17} />}>
-            <div className="instrument-controls">
-              <div className="instrument-form-grid fg-grid">
-                <NumberField label="CH" value={fgConfig.channel} onChange={(value) => setFgConfig((current) => ({ ...current, channel: Math.max(1, Math.round(value)) }))} />
-                <SelectField label="Mode" value={fgConfig.mode} options={["square", "pulse", "dc", "sine"]} onChange={(value) => setFgConfig((current) => ({ ...current, mode: value }))} />
-                {fgConfig.mode !== "dc" ? (
-                  <NumberField label="Freq (Hz)" value={fgConfig.frequency_hz} onChange={(value) => setFgConfig((current) => ({ ...current, frequency_hz: value }))} />
+          <Panel
+            title="Function Generator"
+            icon={<Activity size={17} />}
+          >
+            <div className="fg-panel-layout">
+              <section className="instrument-subsection fg-apply-section">
+                <h3>Apply Settings</h3>
+                <div className="instrument-form-grid fg-grid">
+                  <SelectField label="Channel" value={String(fgConfig.channel)} options={["1", "2"]} onChange={(value) => setFgConfig((current) => ({ ...current, channel: Number(value) }))} />
+                  <SelectField label="Waveform" value={fgConfig.mode} options={["square", "pulse", "dc", "sine"]} onChange={(value) => setFgConfig((current) => ({ ...current, mode: value }))} />
+                  {fgConfig.mode !== "dc" ? (
+                    <FrequencyField label="Frequency" value={fgConfig.frequency_hz} onChange={(value) => setFgConfig((current) => ({ ...current, frequency_hz: value }))} />
+                  ) : null}
+                  <SelectField label="Voltage Unit" value={fgConfig.voltage_unit} options={["VPP", "VRMS", "DBM"]} onChange={(value) => setFgConfig((current) => ({ ...current, voltage_unit: value }))} />
+                  {fgConfig.mode === "square" || fgConfig.mode === "pulse" ? (
+                    <>
+                      <NumberField label="Low Level" value={fgConfig.low_v} onChange={(value) => setFgConfig((current) => ({ ...current, low_v: value }))} />
+                      <NumberField label="High Level" value={fgConfig.high_v} onChange={(value) => setFgConfig((current) => ({ ...current, high_v: value }))} />
+                    </>
+                  ) : null}
+                  {fgConfig.mode === "pulse" ? (
+                    <NumberField label="Pulse Width" value={fgConfig.pulse_width_s} onChange={(value) => setFgConfig((current) => ({ ...current, pulse_width_s: value }))} />
+                  ) : null}
+                  {fgConfig.mode === "dc" ? (
+                    <NumberField label="DC Level" value={fgConfig.dc_level_v} onChange={(value) => setFgConfig((current) => ({ ...current, dc_level_v: value }))} />
+                  ) : null}
+                  {fgConfig.mode === "sine" ? (
+                    <>
+                      <NumberField label="Amplitude" value={fgConfig.amplitude_vpp} onChange={(value) => setFgConfig((current) => ({ ...current, amplitude_vpp: value }))} />
+                      <NumberField label="Offset" value={fgConfig.offset_v} onChange={(value) => setFgConfig((current) => ({ ...current, offset_v: value }))} />
+                      <NumberField label="Phase" value={fgConfig.phase_deg} onChange={(value) => setFgConfig((current) => ({ ...current, phase_deg: value }))} />
+                    </>
+                  ) : null}
+                  <button className="fg-inline-button" type="button" onClick={readAfGenerator} disabled={fgRunning}><RefreshCw size={14} /> Read</button>
+                  <button className="primary fg-inline-button" type="button" onClick={writeAfGenerator} disabled={fgRunning}>
+                    {fgRunning ? <LoaderCircle className="spin" size={14} /> : <Zap size={14} />}
+                    Write
+                  </button>
+                  <span className={`fg-output-indicator ${isOutputEnabled(fgReadback?.output) ? "on" : "off"}`}>
+                    {formatOutputState(fgReadback?.output)}
+                  </span>
+                  <button className="fg-inline-button output-enable-button" type="button" onClick={() => setAfGeneratorOutput(true)} disabled={fgRunning}>
+                    <PowerIcon size={14} />
+                    Enable
+                  </button>
+                  <button className="fg-inline-button output-disable-button" type="button" onClick={() => setAfGeneratorOutput(false)} disabled={fgRunning}>
+                    <PowerIcon size={14} />
+                    Disable
+                  </button>
+                </div>
+              </section>
+
+              <section className="instrument-subsection fg-state-section">
+                <h3>Current Instrument State</h3>
+                <FunctionGeneratorState readback={fgReadback} />
+                {instrumentErrorText(fgReadback) ? (
+                  <div className="instrument-error-banner">
+                    <AlertTriangle size={16} />
+                    {instrumentErrorText(fgReadback)}
+                  </div>
                 ) : null}
-                {fgConfig.mode === "square" || fgConfig.mode === "pulse" ? (
-                  <>
-                    <NumberField label="Low (V)" value={fgConfig.low_v} onChange={(value) => setFgConfig((current) => ({ ...current, low_v: value }))} />
-                    <NumberField label="High (V)" value={fgConfig.high_v} onChange={(value) => setFgConfig((current) => ({ ...current, high_v: value }))} />
-                    <NumberField label="Duty (%)" value={fgConfig.duty_percent} onChange={(value) => setFgConfig((current) => ({ ...current, duty_percent: value }))} />
-                  </>
-                ) : null}
-                {fgConfig.mode === "pulse" ? (
-                  <NumberField label="Width (s)" value={fgConfig.pulse_width_s} onChange={(value) => setFgConfig((current) => ({ ...current, pulse_width_s: value }))} />
-                ) : null}
-                {fgConfig.mode === "dc" ? (
-                  <NumberField label="Level (V)" value={fgConfig.dc_level_v} onChange={(value) => setFgConfig((current) => ({ ...current, dc_level_v: value }))} />
-                ) : null}
-                {fgConfig.mode === "sine" ? (
-                  <>
-                    <NumberField label="Amp (Vpp)" value={fgConfig.amplitude_vpp} onChange={(value) => setFgConfig((current) => ({ ...current, amplitude_vpp: value }))} />
-                    <NumberField label="Offset (V)" value={fgConfig.offset_v} onChange={(value) => setFgConfig((current) => ({ ...current, offset_v: value }))} />
-                    <NumberField label="Phase (deg)" value={fgConfig.phase_deg} onChange={(value) => setFgConfig((current) => ({ ...current, phase_deg: value }))} />
-                  </>
-                ) : null}
-              </div>
-              <div className="button-row">
-                <button type="button" onClick={readAfGenerator} disabled={fgRunning}><RefreshCw size={14} /> Read AFG</button>
-                <button className="primary" type="button" onClick={writeAfGenerator} disabled={fgRunning}>
-                  {fgRunning ? <LoaderCircle className="spin" size={14} /> : <Zap size={14} />}
-                  Write AFG
-                </button>
-              </div>
+              </section>
+
             </div>
-            <InstrumentReadbackGrid
-              items={{
-                function: fgReadback?.function,
-                frequency_hz: fgReadback?.frequency_hz,
-                high_v: fgReadback?.high_v,
-                low_v: fgReadback?.low_v,
-                offset_v: fgReadback?.offset_v,
-                output: fgReadback?.output,
-                error: fgReadback?.error ?? fgReadback?.system_error
-              }}
-            />
           </Panel>
 
           <Panel title="Power Supply" icon={<PowerIcon size={17} />}>
-            <div className="telemetry-cards compact-cards">
+            <div className="supply-layout">
+            <div className="telemetry-cards compact-cards supply-cards">
               <LiveValue label="MEAS_VOLT" value={powerSupply?.measured_voltage_v ?? undefined} unit="V" />
               <LiveValue label="MEAS_CURR" value={powerSupply?.measured_current_a ?? undefined} unit="A" />
               <LiveValue label="VOLT_SET" value={powerSupply?.voltage_setpoint_v ?? undefined} unit="V" />
-              <RateValue
-                value={powerSupplyRateHz}
-                min={1}
-                max={10}
-                onChange={(value) => setPowerSupplyRateHz(Math.max(1, Math.min(10, value)))}
-              />
+              <LiveValue label="CURR_LIMIT" value={powerSupply?.current_limit_a ?? undefined} unit="A" />
             </div>
             <div className="instrument-form-grid supply-grid">
               <LiveRefreshButton enabled={powerSupplyLive} label="Read Only" onChange={setPowerSupplyLive} />
               <NumberField label="Voltage (V)" value={powerSupplyRequest.voltage_v} onChange={(value) => setPowerSupplyRequest((current) => ({ ...current, voltage_v: value }))} />
               <NumberField label="Current limit (A)" value={powerSupplyRequest.current_limit_a} onChange={(value) => setPowerSupplyRequest((current) => ({ ...current, current_limit_a: value }))} />
-              <button type="button" onClick={readSupply} disabled={powerSupplyRunning}><RefreshCw size={14} /> Read Supply</button>
+              <button type="button" onClick={readSupply} disabled={powerSupplyRunning}><RefreshCw size={14} /> Read</button>
               <button className="primary" type="button" onClick={writeSupply} disabled={powerSupplyRunning}>
                 {powerSupplyRunning ? <LoaderCircle className="spin" size={14} /> : <Zap size={14} />}
-                Write Supply
+                Write
               </button>
+              <span className={`supply-output-indicator ${powerSupply?.output_enabled ? "on" : "off"}`}>
+                {powerSupply?.output_enabled ? "ON" : "OFF"}
+              </span>
+              <button className="output-enable-button" type="button" onClick={() => setSupplyOutput(true)} disabled={powerSupplyRunning}>
+                <PowerIcon size={14} />
+                Enable
+              </button>
+              <button className="output-disable-button" type="button" onClick={() => setSupplyOutput(false)} disabled={powerSupplyRunning}>
+                <PowerIcon size={14} />
+                Disable
+              </button>
+            </div>
             </div>
             {powerSupply?.error ? <p className="message-line bad-text">{powerSupply.error}</p> : null}
             {powerSupply?.identity ? <p className="message-line">{powerSupply.identity}</p> : null}
@@ -1694,7 +2012,92 @@ function ManualTuningView({
           onClose={() => setAxisEditor(null)}
         />
       ) : null}
+      {axisEditor === "scope" ? (
+        <ScopeAxisSettingsDialog
+          title="Scope Axis Settings"
+          settings={scopeAxisSettings}
+          setSettings={setScopeAxisSettings}
+          defaults={defaultScopeAxisSettings}
+          channels={scopeChannels}
+          onClose={() => setAxisEditor(null)}
+        />
+      ) : null}
     </section>
+  );
+}
+
+function ScopeAxisSettingsDialog({
+  title,
+  settings,
+  setSettings,
+  defaults,
+  channels,
+  onClose
+}: {
+  title: string;
+  settings: ScopeAxisSettings;
+  setSettings: React.Dispatch<React.SetStateAction<ScopeAxisSettings>>;
+  defaults: ScopeAxisSettings;
+  channels: string[];
+  onClose: () => void;
+}) {
+  const update = (field: keyof Omit<ScopeAxisSettings, "channelAxes">, value: number) => {
+    setSettings((current) => ({ ...current, [field]: value }));
+  };
+  const setChannelAxis = (channel: string, side: ScopeAxisSide) => {
+    setSettings((current) => ({
+      ...current,
+      channelAxes: { ...current.channelAxes, [channel]: side }
+    }));
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section className="axis-dialog scope-axis-dialog" onClick={(event) => event.stopPropagation()}>
+        <div className="axis-dialog-title">
+          <h2>{title}</h2>
+        </div>
+        <div className="telemetry-axis-grid">
+          <div className="axis-pair-card scope-left-axis-card">
+            <strong>Left Voltage Axis</strong>
+            <div className="axis-pair-inputs">
+              <MiniAxisField label="Min" value={settings.leftMin} onChange={(value) => update("leftMin", value)} />
+              <MiniAxisField label="Max" value={settings.leftMax} onChange={(value) => update("leftMax", value)} />
+            </div>
+          </div>
+          <div className="axis-pair-card scope-right-axis-card">
+            <strong>Right Voltage Axis</strong>
+            <div className="axis-pair-inputs">
+              <MiniAxisField label="Min" value={settings.rightMin} onChange={(value) => update("rightMin", value)} />
+              <MiniAxisField label="Max" value={settings.rightMax} onChange={(value) => update("rightMax", value)} />
+            </div>
+          </div>
+          <div className="axis-pair-card">
+            <strong>Channel Axis</strong>
+            <div className="scope-axis-grid">
+              {(channels.length > 0 ? channels : Array.from({ length: 8 }, (_, index) => `CH${index + 1}`)).map((channel) => (
+                <label key={channel} className="scope-axis-select">
+                  <span>{channel}</span>
+                  <select
+                    value={settings.channelAxes[channel] ?? "left"}
+                    onChange={(event) => setChannelAxis(channel, event.target.value === "right" ? "right" : "left")}
+                  >
+                    <option value="left">Left</option>
+                    <option value="right">Right</option>
+                  </select>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="axis-dialog-actions">
+          <button type="button" onClick={() => setSettings({ ...defaults, channelAxes: { ...defaults.channelAxes } })}>
+            <RotateCcw size={14} /> Reset
+          </button>
+          <button type="button" className="primary" onClick={onClose}>Done</button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1868,26 +2271,6 @@ function SelfTestingView({
           />
         ))}
       </div>
-
-      <div className="split-grid">
-        <Panel title="VISA Resources" icon={<Activity size={17} />}>
-          {result?.visa_resource_error && <p className="message-line bad-text">{result.visa_resource_error}</p>}
-          <div className="resource-list">
-            {(result?.visa_resources ?? []).map((resource) => <code key={resource}>{resource}</code>)}
-            {!result && <p className="muted">Run a connection test to list visible VISA resources.</p>}
-          </div>
-        </Panel>
-        <Panel title="Summary" icon={<CheckCircle2 size={17} />}>
-          <dl className="kv">
-            <dt>Overall</dt>
-            <dd>{running ? "running..." : result ? (result.all_passed ? "passed" : "needs attention") : "--"}</dd>
-            <dt>Duration</dt>
-            <dd>{result ? `${result.duration_s.toFixed(2)} s` : "--"}</dd>
-            <dt>Passed</dt>
-            <dd>{tests.filter((item) => item.status === "passed").length} / {selfTestOrder.length}</dd>
-          </dl>
-        </Panel>
-      </div>
     </section>
   );
 }
@@ -2011,7 +2394,17 @@ function fallbackLabel(key: string) {
   return "Board I2C / XDPE1A2G5C";
 }
 
-function Panel({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) {
+function Panel({
+  title,
+  icon,
+  headerExtra,
+  children
+}: {
+  title: string;
+  icon: React.ReactNode;
+  headerExtra?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   const [open, setOpen] = useState(true);
   return (
     <section className={`panel ${open ? "open" : "collapsed"}`}>
@@ -2020,7 +2413,10 @@ function Panel({ title, icon, children }: { title: string; icon: React.ReactNode
           {icon}
           <h2>{title}</h2>
         </span>
-        <span className="collapse-chevron">{open ? "-" : "+"}</span>
+        <span className="panel-title-actions">
+          {headerExtra}
+          <span className="collapse-chevron">{open ? "-" : "+"}</span>
+        </span>
       </button>
       {open ? <div className="panel-body">{children}</div> : null}
     </section>
@@ -2052,6 +2448,31 @@ function CollapsiblePanel({
         <span className="collapse-chevron">{open ? "−" : "+"}</span>
       </button>
       {open ? <div className="collapsible-body">{children}</div> : null}
+    </section>
+  );
+}
+
+function PlotToggleSection({
+  title,
+  summary,
+  open,
+  onToggle,
+  children
+}: {
+  title: string;
+  summary?: string;
+  open: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className={`plot-toggle-section ${open ? "open" : "collapsed"}`}>
+      <button type="button" className="plot-toggle-title" onClick={onToggle}>
+        <span>{title}</span>
+        <span className="plot-toggle-summary">{summary ?? ""}</span>
+        <span className="collapse-chevron">{open ? "-" : "+"}</span>
+      </button>
+      {open ? <div className="plot-toggle-body">{children}</div> : null}
     </section>
   );
 }
@@ -2287,10 +2708,55 @@ function SelectField({
     <label className="field">
       <span>{label}</span>
       <select value={value} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => <option key={option} value={option}>{option}</option>)}
+        {options.map((option) => <option key={option} value={option}>{formatSelectOption(option)}</option>)}
       </select>
     </label>
   );
+}
+
+function ScopeAcquisitionToggle({
+  running,
+  busy,
+  onChange
+}: {
+  running: boolean;
+  busy: boolean;
+  onChange: (running: boolean) => void;
+}) {
+  return (
+    <div className="scope-acquisition-toggle" aria-label="Scope acquisition control">
+      <span>Live Scope</span>
+      <button
+        type="button"
+        className={running ? "active" : ""}
+        onClick={() => onChange(true)}
+        disabled={busy}
+      >
+        Run
+      </button>
+      <button
+        type="button"
+        className={!running ? "active" : ""}
+        onClick={() => onChange(false)}
+        disabled={busy}
+      >
+        Stop
+      </button>
+    </div>
+  );
+}
+
+function formatSelectOption(option: string) {
+  const labels: Record<string, string> = {
+    square: "Square",
+    pulse: "Pulse",
+    dc: "DC",
+    sine: "Sine",
+    VPP: "Vpp",
+    VRMS: "Vrms",
+    DBM: "dBm"
+  };
+  return labels[option] ?? option;
 }
 
 function CheckboxField({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
@@ -2329,9 +2795,65 @@ function ScopeMeasurementTable({ capture }: { capture: ScopeCaptureReadback | nu
   );
 }
 
-function InstrumentReadbackGrid({ items }: { items: Record<string, unknown> }) {
+function BodeMarginReadout({ sweep }: { sweep: BodeSweepReadback | null }) {
+  const margins = sweep?.margins;
   return (
-    <dl className="compact-kv readback-grid">
+    <div className="bode-margin-grid">
+      <div>
+        <span>Phase Margin</span>
+        <strong>{formatMaybeNumber(margins?.phase_margin_deg, 2)} deg</strong>
+      </div>
+      <div>
+        <span>Gain Crossover</span>
+        <strong>{formatMaybeFrequency(margins?.phase_crossover_hz)}</strong>
+      </div>
+      <div>
+        <span>Gain Margin</span>
+        <strong>{formatMaybeNumber(margins?.gain_margin_db, 2)} dB</strong>
+      </div>
+    </div>
+  );
+}
+
+function FunctionGeneratorState({ readback }: { readback: FunctionGeneratorReadback | null }) {
+  const high = readback?.high_v;
+  const low = readback?.low_v;
+  const hasLevels = typeof high === "number" && typeof low === "number";
+  return (
+    <div className="fg-state-grid">
+      <ReadbackTile label="Waveform" value={formatFunctionGeneratorFunction(readback?.function)} />
+      <ReadbackTile label="Frequency" value={formatFrequencyValue(readback?.frequency_hz)} />
+      <ReadbackTile label="Voltage Unit" value={formatVoltageUnit(readback?.voltage_unit)} />
+      <ReadbackTile label="Low Level" value={formatVoltageValue(low)} />
+      <ReadbackTile label="High Level" value={formatVoltageValue(high)} />
+      <ReadbackTile label="Output State" value={formatOutputState(readback?.output)} emphasis={isOutputEnabled(readback?.output) ? "good" : "neutral"} />
+      {hasLevels ? <ReadbackTile label="Vpp" value={formatVoltageValue(high - low)} /> : null}
+      {hasLevels ? <ReadbackTile label="Offset" value={formatVoltageValue((high + low) / 2)} /> : null}
+      <ReadbackTile label="Instrument Error" value={instrumentErrorText(readback) ?? "No error"} emphasis={instrumentErrorText(readback) ? "bad" : "good"} />
+    </div>
+  );
+}
+
+function ReadbackTile({
+  label,
+  value,
+  emphasis = "neutral"
+}: {
+  label: string;
+  value: string;
+  emphasis?: "neutral" | "good" | "bad";
+}) {
+  return (
+    <div className={`readback-tile ${emphasis}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function InstrumentReadbackGrid({ items, className = "" }: { items: Record<string, unknown>; className?: string }) {
+  return (
+    <dl className={`compact-kv readback-grid ${className}`}>
       {Object.entries(items).map(([key, value]) => (
         <React.Fragment key={key}>
           <dt>{key}</dt>
@@ -2348,8 +2870,92 @@ function formatMaybeValue(value: unknown) {
   return String(value);
 }
 
-function formatMaybeNumber(value: number | null | undefined) {
-  return value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toPrecision(6);
+function formatFunctionGeneratorFunction(value: unknown) {
+  if (value === null || value === undefined || value === "") return "--";
+  const normalized = String(value).trim().replace(/^"|"$/g, "").toUpperCase();
+  const labels: Record<string, string> = {
+    SQU: "Square",
+    SQUARE: "Square",
+    SIN: "Sine",
+    SINE: "Sine",
+    PULS: "Pulse",
+    PULSE: "Pulse",
+    DC: "DC"
+  };
+  return labels[normalized] ?? String(value);
+}
+
+function formatFrequencyValue(value: unknown) {
+  const numeric = coerceNumber(value);
+  if (numeric === null) return "--";
+  const abs = Math.abs(numeric);
+  if (abs >= 1_000_000) return `${trimFixed(numeric / 1_000_000, 3)} MHz`;
+  if (abs >= 1_000) return `${trimFixed(numeric / 1_000, 3)} kHz`;
+  return `${trimFixed(numeric, 3)} Hz`;
+}
+
+function formatVoltageValue(value: unknown) {
+  const numeric = coerceNumber(value);
+  if (numeric === null) return "--";
+  return `${trimFixed(numeric, 3)} V`;
+}
+
+function formatVoltageUnit(value: unknown) {
+  if (value === null || value === undefined || value === "") return "--";
+  const normalized = String(value).trim().replace(/^"|"$/g, "").toUpperCase();
+  const labels: Record<string, string> = {
+    VPP: "Vpp",
+    VRMS: "Vrms",
+    DBM: "dBm"
+  };
+  return labels[normalized] ?? String(value);
+}
+
+function formatOutputState(value: unknown) {
+  if (value === null || value === undefined || value === "") return "--";
+  const normalized = String(value).trim().replace(/^"|"$/g, "").toUpperCase();
+  if (normalized === "1" || normalized === "ON") return "ON";
+  if (normalized === "0" || normalized === "OFF") return "OFF";
+  return String(value);
+}
+
+function isOutputEnabled(value: unknown) {
+  const normalized = String(value ?? "").trim().replace(/^"|"$/g, "").toUpperCase();
+  return normalized === "1" || normalized === "ON";
+}
+
+function instrumentErrorText(readback: FunctionGeneratorReadback | null | undefined) {
+  const raw = readback?.error ?? readback?.system_error;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const text = String(raw).trim();
+  const normalized = text.toLowerCase();
+  if (normalized === "0" || normalized === "+0" || normalized.includes("no error")) return null;
+  return text;
+}
+
+function coerceNumber(value: unknown) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function trimFixed(value: number, digits: number) {
+  return value.toFixed(digits).replace(/\.?0+$/, "");
+}
+
+function formatMaybeNumber(value: number | null | undefined, fixedDigits?: number) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "--";
+  return fixedDigits === undefined ? value.toPrecision(6) : value.toFixed(fixedDigits);
+}
+
+function formatMaybeFrequency(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "--";
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(3)} MHz`;
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(3)} kHz`;
+  return `${value.toFixed(2)} Hz`;
 }
 
 function LiveRefreshButton({ enabled, label, onChange }: { enabled: boolean; label: string; onChange: (enabled: boolean) => void }) {
@@ -2687,46 +3293,206 @@ function bodeSweepOption(sweep: BodeSweepReadback | null, axis: ChartAxisSetting
   };
 }
 
-function scopeWaveformOption(capture: ScopeCaptureReadback | null) {
+function scopeWaveformOption(capture: ScopeCaptureReadback | null, axis: ScopeAxisSettings = defaultScopeAxisSettings) {
   const darkMode = typeof document !== "undefined" && document.body.classList.contains("theme-dark");
   const gridLineColor = darkMode ? "#303030" : "#d9dee7";
   const axisLineColor = darkMode ? "#3a3a3a" : "#9aa0a6";
   const axisTextColor = darkMode ? "#8f8f8f" : "#5f6368";
+  const leftAxisColor = "#1a73e8";
+  const rightAxisColor = "#ea4335";
   const colors = ["#1a73e8", "#ea4335", "#34a853", "#fbbc04", "#8ab4f8", "#f28b82", "#81c995", "#fde293"];
   const waveforms = capture?.waveforms ?? [];
+  const timeScale = scopeTimeScale(waveforms);
+  const seriesData = waveforms.map((waveform, index) => ({
+    name: waveform.source,
+    color: colors[index % colors.length],
+    axisSide: axis.channelAxes[waveform.source] ?? "left",
+    data: scopeSeriesData(waveform, timeScale)
+  }));
   return {
     animation: false,
-    tooltip: { trigger: "axis" },
+    tooltip: {
+      trigger: "axis",
+      formatter: (params: unknown) => scopeTooltipFormatter(params, seriesData, timeScale.unit)
+    },
     legend: { top: 0, textStyle: { color: axisTextColor } },
     grid: { left: 58, right: 24, top: 34, bottom: 42 },
     xAxis: {
       type: "value",
-      name: waveforms[0]?.x_unit ?? "s",
+      name: timeScale.unit,
+      min: timeScale.min,
+      max: timeScale.max,
       nameTextStyle: { color: axisTextColor },
-      axisLabel: { color: axisTextColor },
+      axisLabel: {
+        color: axisTextColor,
+        formatter: (value: number) => formatScopeAxisTick(value, timeScale.unit)
+      },
       axisLine: { lineStyle: { color: axisLineColor } },
       axisTick: { lineStyle: { color: axisLineColor } },
       splitLine: { lineStyle: { color: gridLineColor } }
     },
-    yAxis: {
-      type: "value",
-      name: waveforms[0]?.y_unit ?? "V",
-      nameTextStyle: { color: axisTextColor },
-      axisLabel: { color: axisTextColor },
-      axisLine: { lineStyle: { color: axisLineColor } },
-      axisTick: { lineStyle: { color: axisLineColor } },
-      splitLine: { lineStyle: { color: gridLineColor } }
-    },
-    series: waveforms.map((waveform, index) => ({
-      name: waveform.source,
+    yAxis: [
+      {
+        type: "value",
+        name: "V",
+        min: axis.leftMin,
+        max: axis.leftMax,
+        nameTextStyle: { color: leftAxisColor },
+        axisLabel: { color: leftAxisColor },
+        axisLine: { lineStyle: { color: leftAxisColor } },
+        axisTick: { lineStyle: { color: leftAxisColor } },
+        splitLine: { lineStyle: { color: gridLineColor } }
+      },
+      {
+        type: "value",
+        name: "V",
+        min: axis.rightMin,
+        max: axis.rightMax,
+        nameTextStyle: { color: rightAxisColor },
+        axisLabel: { color: rightAxisColor },
+        axisLine: { lineStyle: { color: rightAxisColor } },
+        axisTick: { lineStyle: { color: rightAxisColor } },
+        splitLine: { show: false }
+      }
+    ],
+    series: seriesData.map((series) => ({
+      name: series.name,
       type: "line",
+      yAxisIndex: series.axisSide === "right" ? 1 : 0,
       showSymbol: false,
       symbol: "circle",
-      data: waveform.x.map((xValue, pointIndex) => [xValue, waveform.y[pointIndex] ?? null]),
-      itemStyle: { color: colors[index % colors.length] },
-      lineStyle: { width: 1.5, color: colors[index % colors.length] }
+      sampling: "lttb",
+      progressive: 5000,
+      progressiveThreshold: 10000,
+      data: series.data,
+      itemStyle: { color: series.color },
+      lineStyle: { width: 1.5, color: series.color }
     }))
   };
+}
+
+type ScopeSeriesDisplay = {
+  name: string;
+  color: string;
+  data: Array<[number, number | null]>;
+};
+
+function scopeTooltipFormatter(params: unknown, seriesData: ScopeSeriesDisplay[], unit: string) {
+  const items = Array.isArray(params) ? params : [params];
+  const first = items[0] as { axisValue?: unknown; data?: unknown } | undefined;
+  const dataPoint = Array.isArray(first?.data) ? first.data : null;
+  const xValue = Number(first?.axisValue ?? dataPoint?.[0]);
+  if (!Number.isFinite(xValue)) return "";
+  const rows = seriesData
+    .map((series) => {
+      const point = nearestScopePoint(series.data, xValue);
+      if (!point || point[1] === null || !Number.isFinite(point[1])) return null;
+      return `<div style="display:flex;align-items:center;gap:8px;justify-content:space-between;min-width:150px;">
+        <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${series.color};margin-right:6px;"></span>${series.name}</span>
+        <strong>${point[1].toFixed(3)}</strong>
+      </div>`;
+    })
+    .filter(Boolean)
+    .join("");
+  return `<div>
+    <div style="margin-bottom:6px;">${formatScopeAxisTick(xValue, unit)} ${unit}</div>
+    ${rows}
+  </div>`;
+}
+
+function nearestScopePoint(data: Array<[number, number | null]>, xValue: number) {
+  if (data.length === 0) return null;
+  let low = 0;
+  let high = data.length - 1;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (data[mid][0] < xValue) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const left = low > 0 ? data[low - 1] : null;
+  const right = data[low] ?? null;
+  if (!left) return right;
+  if (!right) return left;
+  return Math.abs(left[0] - xValue) <= Math.abs(right[0] - xValue) ? left : right;
+}
+
+function scopeSeriesData(
+  waveform: NonNullable<ScopeCaptureReadback["waveforms"]>[number],
+  timeScale: ReturnType<typeof scopeTimeScale>
+) {
+  const total = Math.min(waveform.x.length, waveform.y.length);
+  if (total === 0) return [];
+  const targetPoints = Math.min(total, scopeFrontendMaxPoints);
+  const data: Array<[number, number | null]> = [];
+  let lastIndex = -1;
+  for (let idx = 0; idx < targetPoints; idx += 1) {
+    const sourceIndex = targetPoints === 1 ? 0 : Math.round(idx * (total - 1) / (targetPoints - 1));
+    if (sourceIndex === lastIndex) continue;
+    const xValue = waveform.x[sourceIndex];
+    data.push([scopeRelativeTime(xValue, timeScale.origin, timeScale.scale), waveform.y[sourceIndex] ?? null]);
+    lastIndex = sourceIndex;
+  }
+  return data;
+}
+
+function scopeChartKey(capture: ScopeCaptureReadback | null) {
+  const waveforms = capture?.waveforms ?? [];
+  const signature = waveforms
+    .map((waveform) =>
+      `${waveform.source}:${waveform.x.length}:${waveform.time_span_s ?? ""}:${waveform.original_points ?? ""}:${waveform.display_points ?? ""}:${waveform.capture_id ?? ""}`
+    )
+    .join("|");
+  return `${capture?.timestamp ?? "empty"}:${signature}`;
+}
+
+function scopeTimeScale(waveforms: NonNullable<ScopeCaptureReadback["waveforms"]>) {
+  let minSeconds = Number.POSITIVE_INFINITY;
+  let maxSeconds = Number.NEGATIVE_INFINITY;
+  let hasTime = false;
+  for (const waveform of waveforms) {
+    for (const value of waveform.x) {
+      if (!Number.isFinite(value)) continue;
+      if (value < minSeconds) minSeconds = value;
+      if (value > maxSeconds) maxSeconds = value;
+      hasTime = true;
+    }
+  }
+  if (!hasTime) {
+    minSeconds = 0;
+    maxSeconds = 1;
+  }
+  const spanSeconds = Math.max(0, maxSeconds - minSeconds);
+  let unit = "s";
+  let scale = 1;
+  if (spanSeconds < 1e-3) {
+    unit = "us";
+    scale = 1e6;
+  } else if (spanSeconds < 1) {
+    unit = "ms";
+    scale = 1e3;
+  }
+  const max = (maxSeconds - minSeconds) * scale;
+  const paddedMax = max > 0 ? max : 1;
+  return { unit, scale, origin: minSeconds, min: 0, max: paddedMax };
+}
+
+function scopeRelativeTime(value: number, origin: number, scale: number) {
+  return (value - origin) * scale;
+}
+
+function formatScopeAxisTick(value: number, unit: string) {
+  if (unit === "s") return trimTick(value);
+  if (Math.abs(value) >= 100) return value.toFixed(0);
+  if (Math.abs(value) >= 10) return value.toFixed(1);
+  return value.toFixed(2);
+}
+
+function formatChartTooltipValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value.toFixed(3);
+  return `${value}`;
 }
 
 function formatFrequencyTick(value: number) {
@@ -2761,7 +3527,10 @@ function telemetryOption(history: VoutReadback[], axis: TelemetryAxisSettings = 
   return {
     animation: false,
     animationDuration: 0,
-    tooltip: { trigger: "axis" },
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: formatChartTooltipValue
+    },
     legend: {
       top: 0,
       itemWidth: 24,

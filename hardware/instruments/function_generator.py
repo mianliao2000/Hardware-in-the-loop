@@ -51,7 +51,6 @@ class FunctionGenerator(VisaInstrument):
         self.write(f"SOUR{ch}:FREQ {frequency_hz:.12g}")
         self.write(f"SOUR{ch}:VOLT {amplitude_vpp:.12g}")
         self.write(f"SOUR{ch}:VOLT:OFFS {offset_v:.12g}")
-        self.write(f"SOUR{ch}:FUNC:SQU:DCYC {duty_percent:.12g}")
 
     def configure_square_levels(
         self,
@@ -66,7 +65,6 @@ class FunctionGenerator(VisaInstrument):
         self.write(f"SOUR{ch}:FREQ {frequency_hz:.12g}")
         self.write(f"SOUR{ch}:VOLT:LOW {low_v:.12g}")
         self.write(f"SOUR{ch}:VOLT:HIGH {high_v:.12g}")
-        self.write(f"SOUR{ch}:FUNC:SQU:DCYC {duty_percent:.12g}")
 
     def configure_pulse_levels(
         self,
@@ -84,8 +82,6 @@ class FunctionGenerator(VisaInstrument):
         self.write(f"SOUR{ch}:VOLT:HIGH {high_v:.12g}")
         if width_s is not None:
             self.write(f"SOUR{ch}:PULS:WIDT {width_s:.12g}")
-        if duty_percent is not None:
-            self.write(f"SOUR{ch}:PULS:DCYC {duty_percent:.12g}")
 
     def configure_dc(self, level_v: float, channel: int | None = None) -> None:
         ch = channel or self.output_channel
@@ -107,6 +103,13 @@ class FunctionGenerator(VisaInstrument):
     def set_phase(self, phase_deg: float, channel: int | None = None) -> None:
         ch = channel or self.output_channel
         self.write(f"SOUR{ch}:PHAS {phase_deg:.12g}DEG")
+
+    def set_voltage_unit(self, unit: str, channel: int | None = None) -> None:
+        ch = channel or self.output_channel
+        normalized = unit.strip().upper()
+        if normalized not in {"VPP", "VRMS", "DBM"}:
+            raise ValueError(f"Unsupported voltage unit: {unit}")
+        self.write(f"SOUR{ch}:VOLT:UNIT {normalized}")
 
     def get_frequency(self, channel: int | None = None) -> str:
         ch = channel or self.output_channel

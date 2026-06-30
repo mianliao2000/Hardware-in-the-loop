@@ -133,11 +133,33 @@ export function captureScope(config: {
   resource?: string;
   channels: string[];
   measurements: string[];
-  points: number;
+  points?: number;
+  function_generator_frequency_hz?: number;
+  scope_axis_settings?: {
+    leftMin: number;
+    leftMax: number;
+    rightMin: number;
+    rightMax: number;
+    channelAxes: Record<string, "left" | "right">;
+  };
 }): Promise<ScopeCaptureReadback> {
   return requestJson<ScopeCaptureReadback>("/api/scope", {
     method: "POST",
     body: JSON.stringify(config)
+  });
+}
+
+export function setScopeAcquisition(running: boolean, resource?: string): Promise<{ ok: boolean; running?: boolean | null; error?: string; duration_s?: number }> {
+  return requestJson<{ ok: boolean; running?: boolean | null; error?: string; duration_s?: number }>("/api/scope/acquisition", {
+    method: "POST",
+    body: JSON.stringify({ resource, running })
+  });
+}
+
+export function warmScope(resource?: string): Promise<{ ok: boolean; error?: string; duration_s?: number; session_reused?: boolean }> {
+  return requestJson<{ ok: boolean; error?: string; duration_s?: number; session_reused?: boolean }>("/api/scope/warmup", {
+    method: "POST",
+    body: JSON.stringify({ resource })
   });
 }
 
@@ -151,6 +173,7 @@ export function setPowerSupply(config: {
   resource?: string;
   voltage_v?: number;
   current_limit_a?: number;
+  output_enabled?: boolean;
 }): Promise<PowerSupplyReadback> {
   return requestJson<PowerSupplyReadback>("/api/power-supply", {
     method: "POST",
@@ -168,15 +191,16 @@ export function setFunctionGenerator(config: {
   resource?: string;
   channel: number;
   mode: string;
+  voltage_unit?: string;
   frequency_hz?: number;
   high_v?: number;
   low_v?: number;
-  duty_percent?: number;
   pulse_width_s?: number | null;
   dc_level_v?: number;
   amplitude_vpp?: number;
   offset_v?: number;
   phase_deg?: number | null;
+  output_enabled?: boolean;
 }): Promise<FunctionGeneratorReadback> {
   return requestJson<FunctionGeneratorReadback>("/api/function-generator", {
     method: "POST",

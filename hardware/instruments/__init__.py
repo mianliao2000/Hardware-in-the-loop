@@ -1,6 +1,7 @@
 """Instrument drivers and VISA helpers."""
 
 from .bode_analyzer import BodeScpiClient, BodeSweepData, bode_usb_driver_status
+from .bode100 import Bode100Driver, Bode100Error, bode100_from_environment
 from .board_controller import (
     AdiPowerController,
     BoardController,
@@ -31,6 +32,8 @@ __all__ = [
     "AardvarkI2cAdapter",
     "AdiPowerController",
     "BodeScpiClient",
+    "Bode100Driver",
+    "Bode100Error",
     "BodeSweepData",
     "BoardController",
     "BoardControllerConfig",
@@ -50,6 +53,7 @@ __all__ = [
     "VoutModeError",
     "WaveformCapture",
     "bode_usb_driver_status",
+    "bode100_from_environment",
     "decode_vout_mode",
     "create_i2c_adapter",
     "create_board_controller",

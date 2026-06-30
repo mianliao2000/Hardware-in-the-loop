@@ -4,6 +4,7 @@ __pycache__/
 venv/
 results/
 snapshots/
+data/
 *.log
 gui/frontend/node_modules/
 gui/frontend/dist/

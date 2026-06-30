@@ -7,6 +7,7 @@ setting is exercised, its original value is restored before the test completes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -24,10 +25,13 @@ from .visa_resource import list_visa_resources
 DEFAULT_AFG_RESOURCE = "USB0::0x0699::0x0356::B010652::INSTR"
 DEFAULT_SCOPE_RESOURCE = "USB0::0x0699::0x0522::B010536::INSTR"
 DEFAULT_POWER_SUPPLY_RESOURCE = "USB0::0x0957::0xA407::US17M5136P::INSTR"
-DEFAULT_BODE_HOST = "127.0.0.1"
-DEFAULT_BODE_PORT = 5025
-DEFAULT_BODE_SCPI_RUNNER = r"C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe"
-DEFAULT_BODE_SERIAL = "Bode100R2-PN287H"
+DEFAULT_BODE_HOST = os.environ.get("BODE100_HOST", "127.0.0.1")
+DEFAULT_BODE_PORT = int(os.environ.get("BODE100_PORT", "5025"))
+DEFAULT_BODE_SCPI_RUNNER = os.environ.get(
+    "BODE100_SCPI_RUNNER_PATH",
+    r"C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe",
+)
+DEFAULT_BODE_SERIAL = os.environ.get("BODE100_SERIAL", "")
 DEFAULT_BOARD_ADDRESS = "0x5E"
 DEFAULT_BOARD_PAGE = 0
 DEFAULT_BOARD_ADAPTER = "xdp"
@@ -250,6 +254,9 @@ def _ensure_bode_scpi_runner(config: InstrumentSelfTestConfig, result: dict) -> 
 
     runner = Path(config.bode_runner_path)
     result["details"]["tcp_listener"] = "no"
+    if not config.bode_serial:
+        result["details"]["scpi_runner"] = "serial number missing"
+        return False
     if not runner.exists():
         result["details"]["scpi_runner"] = "runner executable not found"
         return False

@@ -180,3 +180,74 @@ is verified. The Vout panel still uses the XDP USB dongle path and performs
 volatile PMBus writes only: `VOUT_COMMAND` followed by `OPERATION = 0x80`.
 Close XDP Designer before using the Vout controls, because the XDP dongle is
 exclusive and cannot be controlled by both programs at the same time.
+
+## Bode 100 SCPI Server Automation
+
+The OMICRON Lab Bode 100 is not exposed to Python as a normal USBTMC VISA
+instrument. The supported control path is:
+
+```text
+Python backend -> PyVISA TCP socket -> Bode Analyzer Suite ScpiRunner -> USB -> Bode 100
+```
+
+Install Bode Analyzer Suite on Windows. The SCPI runner is normally located at:
+
+```text
+C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe
+```
+
+Python also needs `pyvisa` and a VISA backend such as NI-VISA, Keysight IO
+Libraries, or TekVISA. The dependencies in `requirements.txt` include PyVISA.
+
+Configure the Bode 100 connection with environment variables:
+
+```powershell
+$env:BODE100_SERIAL = "Bode100R2-XXXXXX"
+$env:BODE100_HOST = "127.0.0.1"
+$env:BODE100_PORT = "5025"
+$env:BODE100_SCPI_RUNNER_PATH = "C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe"
+# Optional override:
+$env:BODE100_VISA_RESOURCE = "TCPIP::127.0.0.1::5025::SOCKET"
+```
+
+Find the serial number from the Bode Analyzer Suite device-selection screen, the
+Windows device label, or the device information shown by the suite. Do not
+hard-code a lab-specific serial number in source code.
+
+Manual one-time ScpiRunner test:
+
+```powershell
+& "C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe" -s "Bode100R2-XXXXXX"
+```
+
+Then connect from Python:
+
+```powershell
+python scripts/connect_bode100.py --serial "Bode100R2-XXXXXX"
+```
+
+Or rely on the environment variables:
+
+```powershell
+python scripts/connect_bode100.py
+```
+
+The GUI backend exposes a small IDN endpoint:
+
+```text
+GET http://127.0.0.1:8765/api/instruments/bode100/idn
+```
+
+The Bode sweep API also uses the same automation path, so the Bode Analyzer
+Suite GUI does not need to be opened manually when ScpiRunner can claim the
+device.
+
+Troubleshooting:
+
+- Port 5025 already used: stop the other SCPI server or set `BODE100_PORT`.
+- Wrong serial number: ScpiRunner may start but never expose a listener.
+- Bode 100 not connected: verify USB, power, and Windows Device Manager.
+- Different BAS path: set `BODE100_SCPI_RUNNER_PATH`.
+- VISA backend missing: install NI-VISA, Keysight IO Libraries, or TekVISA.
+- BAS GUI and SCPI server competing: close the GUI if ScpiRunner cannot claim
+  the Bode 100.

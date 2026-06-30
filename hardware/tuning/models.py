@@ -30,6 +30,8 @@ class TuningTargets:
     undershoot_pct: float = 4.0
     settling_time_s: float = 100e-6
     oscillations: int = 0
+    phase_margin_deg: float = 60.0
+    crossover_frequency_hz: float = 100_000.0
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,22 @@ from .visa_resource import VisaConnectionError, VisaInstrument
 
 
 @dataclass
+class BodeStabilityMargins:
+    phase_margin_deg: float | None
+    phase_crossover_hz: float | None
+    gain_margin_db: float | None
+    gain_crossover_hz: float | None
+
+    def as_dict(self) -> dict[str, float | None]:
+        return {
+            "phase_margin_deg": self.phase_margin_deg,
+            "phase_crossover_hz": self.phase_crossover_hz,
+            "gain_margin_db": self.gain_margin_db,
+            "gain_crossover_hz": self.gain_crossover_hz,
+        }
+
+
+@dataclass
 class BodeSweepData:
     frequency_hz: list[float]
     real: list[float]
@@ -41,6 +57,10 @@ class BodeSweepData:
         import math
 
         return [math.degrees(value) for value in self.phase_rad]
+
+    @property
+    def stability_margins(self) -> BodeStabilityMargins:
+        return calculate_stability_margins(self.frequency_hz, self.magnitude_db, self.phase_deg)
 
     def save_csv(self, path: str | Path) -> Path:
         out = Path(path)
@@ -155,6 +175,109 @@ def _db_phase_to_complex(magnitude_db: list[float], phase_deg: list[float]) -> t
         real.append(magnitude * math.cos(radians))
         imag.append(magnitude * math.sin(radians))
     return real, imag
+
+
+def calculate_stability_margins(
+    frequency_hz: list[float],
+    magnitude_db: list[float],
+    phase_deg: list[float],
+) -> BodeStabilityMargins:
+    """Calculate classical gain and phase margins from sampled Bode data.
+
+    Phase margin is evaluated at the 0 dB gain crossover. Classical loop-gain
+    data usually reports phase as a negative angle, so PM = 180 + phase(f_gc).
+    Bode Analyzer Suite can report gain/phase phase as a positive margin-like
+    angle, in which case the displayed phase at 0 dB is already the PM.
+
+    In this lab setup Bode Analyzer Suite reports phase in the positive
+    phase-margin style used by the GUI. Gain margin is therefore evaluated at
+    the 0 deg phase crossover:
+        GM = -gain(f_phase_0)
+
+    Linear interpolation is performed in log-frequency space, which matches
+    logarithmic Bode sweeps better than linear-Hz interpolation.
+    """
+
+    points = [
+        (freq, mag, phase)
+        for freq, mag, phase in zip(frequency_hz, magnitude_db, _unwrap_phase_deg(phase_deg))
+        if freq > 0
+    ]
+    if len(points) < 2:
+        return BodeStabilityMargins(None, None, None, None)
+
+    gain_crossover_hz = None
+    phase_at_gain_crossover = None
+    phase_crossover_hz = None
+    gain_at_phase_crossover = None
+
+    for (f0, m0, p0), (f1, m1, p1) in zip(points, points[1:]):
+        if gain_crossover_hz is None and _crosses(m0, m1, 0.0):
+            gain_crossover_hz, phase_at_gain_crossover = _interpolate_log_frequency(f0, p0, m0, f1, p1, m1, 0.0)
+        if phase_crossover_hz is None and _crosses(p0, p1, 0.0):
+            phase_crossover_hz, gain_at_phase_crossover = _interpolate_log_frequency(f0, m0, p0, f1, m1, p1, 0.0)
+        if gain_crossover_hz is not None and phase_crossover_hz is not None:
+            break
+
+    phase_margin = (
+        _phase_margin_from_gain_crossover_phase(phase_at_gain_crossover)
+        if phase_at_gain_crossover is not None
+        else None
+    )
+    gain_margin = -gain_at_phase_crossover if gain_at_phase_crossover is not None else None
+    return BodeStabilityMargins(
+        phase_margin_deg=phase_margin,
+        phase_crossover_hz=gain_crossover_hz,
+        gain_margin_db=gain_margin,
+        gain_crossover_hz=phase_crossover_hz,
+    )
+
+
+def _phase_margin_from_gain_crossover_phase(phase_deg: float) -> float:
+    if phase_deg >= 0.0:
+        return phase_deg
+    return 180.0 + phase_deg
+
+
+def _unwrap_phase_deg(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    unwrapped = [values[0]]
+    offset = 0.0
+    previous = values[0]
+    for value in values[1:]:
+        delta = value - previous
+        if delta > 180.0:
+            offset -= 360.0
+        elif delta < -180.0:
+            offset += 360.0
+        unwrapped.append(value + offset)
+        previous = value
+    return unwrapped
+
+
+def _crosses(a: float, b: float, target: float) -> bool:
+    return (a - target) == 0.0 or (b - target) == 0.0 or (a - target) * (b - target) < 0.0
+
+
+def _interpolate_log_frequency(
+    f0: float,
+    y0: float,
+    x0: float,
+    f1: float,
+    y1: float,
+    x1: float,
+    target_x: float,
+) -> tuple[float, float]:
+    import math
+
+    if x1 == x0:
+        ratio = 0.0
+    else:
+        ratio = (target_x - x0) / (x1 - x0)
+    log_f = math.log10(f0) + ratio * (math.log10(f1) - math.log10(f0))
+    y = y0 + ratio * (y1 - y0)
+    return 10.0 ** log_f, y
 
 
 def bode_usb_driver_status(instance_id: str = r"USB\VID_156D&PID_0010\PN287H") -> dict[str, str]:

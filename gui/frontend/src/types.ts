@@ -44,6 +44,8 @@ export type TuningConfig = {
     undershoot_pct: number;
     settling_time_s: number;
     oscillations: number;
+    phase_margin_deg: number;
+    crossover_frequency_hz: number;
   };
   search: {
     wc_min_rad_s: number;
@@ -228,6 +230,18 @@ export type BodeSweepReadback = {
   frequency_hz?: number[];
   magnitude_db?: number[];
   phase_deg?: number[];
+  sweep_id?: string;
+  data_file?: string;
+  original_points?: number;
+  display_points?: number;
+  bode_png?: string | null;
+  bode_png_error?: string | null;
+  margins?: {
+    phase_margin_deg?: number | null;
+    phase_crossover_hz?: number | null;
+    gain_margin_db?: number | null;
+    gain_crossover_hz?: number | null;
+  };
   system_error?: string;
   duration_s?: number;
   timestamp?: number;
@@ -239,6 +253,14 @@ export type ScopeWaveform = {
   y: number[];
   x_unit: string;
   y_unit: string;
+  time_span_s?: number | null;
+  original_points?: number | null;
+  plotted_points?: number | null;
+  display_points?: number | null;
+  display_strategy?: string | null;
+  capture_id?: string | null;
+  data_file?: string | null;
+  transfer_encoding?: string | null;
 };
 
 export type ScopeMeasurementValue = {
@@ -258,6 +280,18 @@ export type ScopeCaptureReadback = {
   measurements?: string[];
   waveforms?: ScopeWaveform[];
   measurement_values?: ScopeMeasurementValue[];
+  capture_id?: string;
+  scope_png?: string | null;
+  scope_png_error?: string | null;
+  function_generator_frequency_hz?: number | null;
+  scope_window_s?: number | null;
+  scope_actual_window_s?: number | null;
+  scope_scale_s_per_div?: number | null;
+  scope_trigger_source?: string | null;
+  scope_trigger_slope?: string | null;
+  scope_trigger_offset_from_left_s?: number | null;
+  scope_trigger_position_percent?: number | null;
+  duration_s?: number;
   timestamp?: number;
 };
 
@@ -282,6 +316,7 @@ export type FunctionGeneratorReadback = {
   identity?: string;
   function?: string | null;
   frequency_hz?: number | null;
+  voltage_unit?: string | null;
   amplitude_vpp?: number | null;
   offset_v?: number | null;
   high_v?: number | null;
