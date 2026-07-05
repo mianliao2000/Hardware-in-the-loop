@@ -16,7 +16,7 @@ from typing import Any
 from .board_controller import BoardControllerConfig, create_board_controller
 from .bode_analyzer import BodeScpiClient
 from .function_generator import FunctionGenerator
-from .i2c_adapters import create_i2c_adapter
+from .i2c_adapters import create_i2c_adapter, reset_xdp_usb_bridges
 from .oscilloscope import TektronixOscilloscope
 from .power_supply import KeysightN5700PowerSupply
 from .visa_resource import list_visa_resources
@@ -441,13 +441,7 @@ def _test_board_i2c(config: InstrumentSelfTestConfig) -> dict:
     original_page = None
     original_vout = None
     try:
-        adapter = create_i2c_adapter(config.board_adapter, timeout_ms=config.timeout_ms)
-        board = create_board_controller(
-            "infineon_xdp",
-            adapter,
-            BoardControllerConfig(address=config.board_address, name="XDPE1A2G5C"),
-        )
-        board.connect()
+        board = _connect_board_for_self_test(config)
         result["resource_present"] = True
 
         try:
@@ -498,7 +492,9 @@ def _test_board_i2c(config: InstrumentSelfTestConfig) -> dict:
             raise RuntimeError(f"Board VOUT_COMMAND restore mismatch: expected {original_vout}, read {restored}")
         result["status"] = "passed"
     except Exception as exc:
-        result["error"] = str(exc)
+        result["error"] = _format_board_self_test_error(exc)
+        if str(exc) != result["error"]:
+            result["details"]["raw_error"] = str(exc)
         if board is not None and original_vout is not None:
             try:
                 board.set_vout_command(original_vout, page=config.board_page)
@@ -519,8 +515,61 @@ def _test_board_i2c(config: InstrumentSelfTestConfig) -> dict:
                 board.close()
             except Exception:
                 pass
+        if config.board_adapter.strip().lower() in {"xdp", "xdp_usb"}:
+            reset_xdp_usb_bridges(include_external_processes=True)
+            time.sleep(0.5)
+            result["details"]["xdp_bridge_released"] = "yes"
         result["duration_s"] = time.time() - started
     return result
+
+
+def _connect_board_for_self_test(config: InstrumentSelfTestConfig):
+    adapter_name = config.board_adapter.strip().lower()
+    is_xdp_node = adapter_name in {"xdp", "xdp_usb"}
+    last_error: Exception | None = None
+
+    for attempt in range(2 if is_xdp_node else 1):
+        board = None
+        try:
+            if is_xdp_node:
+                reset_xdp_usb_bridges(include_external_processes=True)
+                if attempt:
+                    time.sleep(0.35)
+            adapter_kwargs: dict[str, Any] = {"timeout_ms": config.timeout_ms}
+            if is_xdp_node:
+                adapter_kwargs["persistent"] = False
+            adapter = create_i2c_adapter(config.board_adapter, **adapter_kwargs)
+            board = create_board_controller(
+                "infineon_xdp",
+                adapter,
+                BoardControllerConfig(address=config.board_address, name="XDPE1A2G5C"),
+            )
+            board.connect()
+            return board
+        except Exception as exc:
+            last_error = exc
+            if board is not None:
+                try:
+                    board.close()
+                except Exception:
+                    pass
+            if "LIBUSB_ERROR_ACCESS" not in str(exc) or attempt == 1:
+                raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Board I2C self-test could not create a board connection.")
+
+
+def _format_board_self_test_error(exc: Exception) -> str:
+    message = str(exc)
+    if "LIBUSB_ERROR_ACCESS" in message:
+        return (
+            "XDP USB dongle is busy or locked by another process. Close XDP Designer or any stale "
+            "XDP bridge process, then run Board I2C self test again. The self-test now resets the "
+            "local XDP bridge and retries once before reporting this error."
+        )
+    return message
 
 
 def _record_action(result: dict, name: str, value: Any) -> None:

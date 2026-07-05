@@ -14,9 +14,28 @@ export type ResponseMetrics = {
   overshoot_pct: number;
   undershoot_pct: number;
   settling_time_s: number;
+  overshoot_settling_time_s?: number;
+  undershoot_settling_time_s?: number;
   oscillations: number;
   score: number;
   passed: boolean;
+  low_load_steady_v?: number | null;
+  high_load_steady_v?: number | null;
+  phase_margin_deg?: number | null;
+  crossover_frequency_hz?: number | null;
+  gain_margin_db?: number | null;
+  pass_reasons?: string[];
+};
+
+export type HardwarePidCandidate = {
+  mod0_kp: number;
+  mod0_ki: number;
+  mod0_kd: number;
+  mod0_kpole1: number;
+  mod0_kpole2: number;
+  output_inductance_nh: number;
+  effective_lc_inductance_nh: number;
+  phase: string;
 };
 
 export type IterationRecord = {
@@ -28,6 +47,19 @@ export type IterationRecord = {
   metrics: ResponseMetrics;
   waveform: Waveform;
   timestamp: number;
+  candidate?: HardwarePidCandidate | null;
+  write_results?: Record<string, unknown>;
+  bode_result?: Record<string, unknown>;
+  scope_result?: Record<string, unknown>;
+  duration_s?: number;
+};
+
+export type SearchParameter = {
+  center: number;
+  min: number;
+  max: number;
+  step: number;
+  points: number;
 };
 
 export type TuningConfig = {
@@ -46,6 +78,9 @@ export type TuningConfig = {
     oscillations: number;
     phase_margin_deg: number;
     crossover_frequency_hz: number;
+    gain_margin_db: number;
+    phase_margin_tolerance_deg: number;
+    crossover_tolerance_pct: number;
   };
   search: {
     wc_min_rad_s: number;
@@ -55,14 +90,36 @@ export type TuningConfig = {
     initial_wc_rad_s: number;
     initial_phi_deg: number;
     max_iterations: number;
+    mod0_kp: SearchParameter;
+    mod0_ki: SearchParameter;
+    mod0_kd: SearchParameter;
+    mod0_kpole1: SearchParameter;
+    mod0_kpole2: SearchParameter;
+    output_inductance_nh: SearchParameter;
+    effective_lc_inductance_nh: SearchParameter;
   };
+};
+
+export type AutotuneExperimentConfig = {
+  board_address: string;
+  board_page: number;
+  board_adapter: string;
+  response_channel: string;
+  enable_bode_analysis: boolean;
+  enable_transient_analysis: boolean;
+  bode_config: BodeSweepConfig;
+  function_generator_config: Record<string, unknown>;
+  scope_config: Record<string, unknown>;
+  vout_tolerance_v: number;
+  response_abs_limit_v: number;
 };
 
 export type TuningStatus = {
   ok?: boolean;
-  state: "idle" | "running" | "stopped" | "complete" | "error";
+  state: "idle" | "running" | "paused" | "stopped" | "complete" | "error";
   message: string;
   config: TuningConfig;
+  experiment?: AutotuneExperimentConfig;
   current: IterationRecord | null;
   best: IterationRecord | null;
   history: IterationRecord[];
@@ -73,6 +130,53 @@ export type TuningStatus = {
     message: string;
     write_attempts: number;
   };
+  run?: AutotuneRunInfo;
+};
+
+export type AutotuneRunInfo = {
+  run_id: string;
+  kind: "recent" | "saved" | string;
+  path: string;
+  recent_limit?: number;
+};
+
+export type AutotuneRunSummary = {
+  run_id: string;
+  kind: "recent" | "saved" | string;
+  path?: string;
+  created_at?: number;
+  updated_at?: number;
+  archived_at?: number;
+  state?: string;
+  message?: string;
+  iteration_count?: number;
+  current_iteration?: number | null;
+  best_iteration?: number | null;
+  best_penalty?: number | null;
+};
+
+export type AutotuneRunsResponse = {
+  ok: boolean;
+  current_run_id?: string | null;
+  recent: AutotuneRunSummary[];
+  saved: AutotuneRunSummary[];
+};
+
+export type AutotuneArchiveResponse = {
+  ok: boolean;
+  saved_run: AutotuneRunSummary;
+};
+
+export type AutotuneGifResponse = {
+  ok: boolean;
+  run_id: string;
+  kind: string;
+  generated_at?: number;
+  duration_ms?: number;
+  animation_dir?: string | null;
+  combined_gif?: string | null;
+  transient_gif?: string | null;
+  bode_gif?: string | null;
 };
 
 export type VoutReadback = {

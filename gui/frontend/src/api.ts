@@ -1,11 +1,18 @@
-import type { BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceReadback, InstrumentKey, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
+import type { AutotuneArchiveResponse, AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceReadback, InstrumentKey, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     ...init
   });
-  const payload = await response.json();
+  const text = await response.text();
+  let payload: any;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    const preview = text.slice(0, 80).replace(/\s+/g, " ");
+    throw new Error(`Expected JSON from ${url}, got ${response.status}: ${preview}`);
+  }
   if (!response.ok || payload.ok === false) {
     throw new Error(payload.error ?? `Request failed: ${response.status}`);
   }
@@ -16,10 +23,10 @@ export function getTuningStatus(): Promise<TuningStatus> {
   return requestJson<TuningStatus>("/api/tuning/status");
 }
 
-export function startTuning(config: TuningConfig): Promise<TuningStatus> {
+export function startTuning(config: TuningConfig, experiment?: AutotuneExperimentConfig): Promise<TuningStatus> {
   return requestJson<TuningStatus>("/api/tuning/start", {
     method: "POST",
-    body: JSON.stringify({ config })
+    body: JSON.stringify({ config, experiment })
   });
 }
 
@@ -27,10 +34,60 @@ export function stopTuning(): Promise<TuningStatus> {
   return requestJson<TuningStatus>("/api/tuning/stop", { method: "POST", body: "{}" });
 }
 
-export function stepTuning(config: TuningConfig): Promise<TuningStatus> {
+export function pauseTuning(): Promise<TuningStatus> {
+  return requestJson<TuningStatus>("/api/tuning/pause", { method: "POST", body: "{}" });
+}
+
+export function resumeTuning(run_id?: string, kind?: string): Promise<TuningStatus> {
+  return requestJson<TuningStatus>("/api/tuning/resume", {
+    method: "POST",
+    body: JSON.stringify({ run_id, kind })
+  });
+}
+
+export function resetTuning(config?: TuningConfig, experiment?: AutotuneExperimentConfig): Promise<TuningStatus> {
+  return requestJson<TuningStatus>("/api/tuning/reset", {
+    method: "POST",
+    body: JSON.stringify({ config, experiment })
+  });
+}
+
+export function stepTuning(config: TuningConfig, experiment?: AutotuneExperimentConfig): Promise<TuningStatus> {
   return requestJson<TuningStatus>("/api/tuning/step", {
     method: "POST",
-    body: JSON.stringify({ config })
+    body: JSON.stringify({ config, experiment })
+  });
+}
+
+export function getTuningRuns(): Promise<AutotuneRunsResponse> {
+  return requestJson<AutotuneRunsResponse>("/api/tuning/runs");
+}
+
+export function archiveCurrentTuningRun(name?: string, run_id?: string, kind?: string): Promise<AutotuneArchiveResponse> {
+  return requestJson<AutotuneArchiveResponse>("/api/tuning/archive", {
+    method: "POST",
+    body: JSON.stringify({ name, run_id, kind })
+  });
+}
+
+export function deleteTuningRun(run_id: string, kind: string): Promise<{ ok: boolean; deleted_run_id: string; kind: string }> {
+  return requestJson<{ ok: boolean; deleted_run_id: string; kind: string }>("/api/tuning/delete", {
+    method: "POST",
+    body: JSON.stringify({ run_id, kind })
+  });
+}
+
+export function loadTuningRun(run_id: string, kind: string): Promise<TuningStatus> {
+  return requestJson<TuningStatus>("/api/tuning/load", {
+    method: "POST",
+    body: JSON.stringify({ run_id, kind })
+  });
+}
+
+export function saveTuningAnimationGif(run_id?: string, kind?: string, duration_ms?: number): Promise<AutotuneGifResponse> {
+  return requestJson<AutotuneGifResponse>("/api/tuning/gif", {
+    method: "POST",
+    body: JSON.stringify({ run_id, kind, duration_ms })
   });
 }
 
@@ -121,7 +178,13 @@ export function runBodeSweep(config: BodeSweepConfig): Promise<BodeSweepReadback
     body: JSON.stringify(config)
   }).then(async (response) => {
     const text = await response.text();
-    const payload = text ? JSON.parse(text) : { ok: false, error: `Request failed: ${response.status}` };
+    let payload: any;
+    try {
+      payload = text ? JSON.parse(text) : { ok: false, error: `Request failed: ${response.status}` };
+    } catch {
+      const preview = text.slice(0, 80).replace(/\s+/g, " ");
+      throw new Error(`Expected JSON from /api/bode/sweep, got ${response.status}: ${preview}`);
+    }
     if (!response.ok && !payload.error) {
       payload.error = `Request failed: ${response.status}`;
     }

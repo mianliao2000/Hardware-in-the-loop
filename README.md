@@ -151,7 +151,7 @@ the instrument APIs and serves the React/Vite workbench build.
 
 - `gui/server.py`: localhost API and React build server
 - `gui/frontend/`: React/Vite/TypeScript workbench
-- `hardware/tuning/`: PID autotuning framework and stub experiment runner
+- `hardware/tuning/`: hardware PID candidate search, scoring, and run state
 
 Build the frontend once after changing GUI code:
 
@@ -174,12 +174,36 @@ Then open:
 http://127.0.0.1:8765
 ```
 
-The current auto-tuner GUI runs PID iterations with a placeholder experiment
-runner. PID programming is deliberately disabled until the XDPE PID register map
-is verified. The Vout panel still uses the XDP USB dongle path and performs
-volatile PMBus writes only: `VOUT_COMMAND` followed by `OPERATION = 0x80`.
-Close XDP Designer before using the Vout controls, because the XDP dongle is
-exclusive and cannot be controlled by both programs at the same time.
+The current auto-tuner GUI runs real hardware-in-the-loop iterations. Each
+iteration can write Loop A/page 0 XDPE parameters, run a Bode 100 gain/phase
+sweep, apply the configured function-generator load step, capture the MSO58
+scope response, disable the function-generator output, and score the candidate.
+
+The hardware search space is centered on the current manual parameters and
+includes:
+
+- `mod0_kp`, `mod0_ki`, `mod0_kd`
+- `mod0_kpole1`, `mod0_kpole2`
+- output inductance
+- effective LC inductance
+
+The target panel defines transient and loop-stability goals such as overshoot,
+undershoot, settling time, phase margin, crossover frequency, and gain margin.
+The penalty value is lower-is-better. Recent auto-tune runs are saved locally
+with transient/Bode PNG snapshots, and a combined transient+Bode GIF can be
+generated from the iteration history.
+
+Search-space inputs are edited locally and committed only on blur or Enter so
+that values can be cleared and rewritten without being overwritten by status
+polling. The status endpoint is intentionally lightweight and does not perform
+disk persistence on every GUI refresh; result persistence happens on tuning
+events and iteration completion.
+
+The Vout and PMBus output controls use the XDP USB dongle path and perform
+volatile PMBus writes only. Vout control writes `VOUT_COMMAND` followed by
+`OPERATION = 0x80` when PMBus output control is active. Close XDP Designer
+before using these controls, because the XDP dongle is exclusive and cannot be
+controlled by both programs at the same time.
 
 ## Bode 100 SCPI Server Automation
 

@@ -137,31 +137,34 @@ class TektronixOscilloscope(VisaInstrument):
             raise ValueError("Horizontal window duration must be positive.")
         scale_s_per_div = duration_s / 10.0
         last_error: Exception | None = None
+
         for command in ("HORIZONTAL:MODE MANUAL", "HOR:MODE MANUAL"):
             try:
                 self.write(command)
                 break
-            except Exception:
-                pass
-
-        wrote_scale = False
-        for command in ("HORIZONTAL:MODE:SCALE", "HORIZONTAL:SCALE", "HOR:SCA"):
-            try:
-                self.write(f"{command} {scale_s_per_div:.12g}")
-                wrote_scale = True
             except Exception as exc:
                 last_error = exc
-        if not wrote_scale:
-            raise RuntimeError(f"Could not set oscilloscope horizontal scale: {last_error}")
 
-        for query in ("HORIZONTAL:MODE:SCALE?", "HORIZONTAL:SCALE?", "HOR:SCA?"):
+        scale_text = f"{scale_s_per_div:.12E}"
+        command_pairs = (
+            ("HORIZONTAL:MODE:SCALE", "HORIZONTAL:MODE:SCALE?"),
+            ("HORIZONTAL:SCALE", "HORIZONTAL:SCALE?"),
+            ("HOR:SCA", "HOR:SCA?"),
+        )
+        readbacks: list[float] = []
+        for write_command, query_command in command_pairs:
             try:
-                actual = self._parse_numeric_response(self.query(query))
-                if actual > 0:
+                self.write(f"{write_command} {scale_text}")
+                actual = self._parse_numeric_response(self.query(query_command))
+                if actual > 0 and abs(actual - scale_s_per_div) <= max(scale_s_per_div * 0.005, 1e-12):
                     return actual
-            except Exception:
-                pass
-        return scale_s_per_div
+                if actual > 0:
+                    readbacks.append(actual)
+            except Exception as exc:
+                last_error = exc
+        if readbacks:
+            return min(readbacks, key=lambda value: abs(value - scale_s_per_div))
+        raise RuntimeError(f"Could not set oscilloscope horizontal scale: {last_error}")
 
     def set_trigger_position_from_left(self, offset_s: float, window_s: float) -> float:
         if offset_s < 0:

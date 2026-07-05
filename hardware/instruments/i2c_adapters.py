@@ -403,6 +403,31 @@ def _stop_persistent_xdp_bridges() -> None:
         bridge.stop()
 
 
+def reset_xdp_usb_bridges(*, include_external_processes: bool = False) -> None:
+    """Close XDP bridge processes so the next request opens a fresh USB handle."""
+    _stop_persistent_xdp_bridges()
+    if include_external_processes:
+        _stop_external_xdp_bridge_processes()
+
+
+def _stop_external_xdp_bridge_processes() -> None:
+    powershell = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*xdp_usb_bridge.js*' } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", powershell],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except Exception:
+        pass
+
+
 atexit.register(_stop_persistent_xdp_bridges)
 
 
