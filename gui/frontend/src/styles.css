@@ -346,6 +346,17 @@ h1 {
   box-shadow: 0 24px 70px rgba(15, 23, 42, 0.25);
 }
 
+.llm-chat-panel.is-fullscreen {
+  position: fixed;
+  inset: 18px;
+  right: 18px;
+  bottom: 18px;
+  width: auto;
+  height: auto;
+  max-height: none;
+  border-radius: 16px;
+}
+
 .llm-chat-header {
   display: flex;
   align-items: center;
@@ -353,6 +364,12 @@ h1 {
   gap: 12px;
   padding: 14px 14px 12px;
   border-bottom: 1px solid #e5e7eb;
+}
+
+.llm-chat-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .llm-chat-header h2 {
@@ -496,6 +513,15 @@ body.theme-dark .llm-chat-launcher {
   color: #ffffff;
   background: #1a73e8;
   border-color: #2b7de9;
+}
+
+@media (max-width: 720px) {
+  .llm-chat-panel.is-fullscreen {
+    inset: 8px;
+    right: 8px;
+    bottom: 8px;
+    border-radius: 12px;
+  }
 }
 
 body.theme-dark .topbar,

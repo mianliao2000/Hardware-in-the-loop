@@ -18,7 +18,9 @@ import {
   StopCircle,
   LoaderCircle,
   Moon,
+  Maximize2,
   MessageCircle,
+  Minimize2,
   Send,
   XCircle,
   X,
@@ -1407,6 +1409,7 @@ function LlmAssistantWidget({
     ? "你好，我可以帮你理解这个 GUI、Auto-Tune 流程、Manual Tuning、Self Testing，以及 Bode 100 / Scope / Function Generator / PMBus 这些模块。"
     : "Hi, I can help explain this GUI, the Auto-Tune flow, Manual Tuning, Self Testing, and the Bode 100 / Scope / Function Generator / PMBus panels.";
   const [open, setOpen] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [messages, setMessages] = useState<LlmChatMessage[]>([{ role: "assistant", content: greeting }]);
@@ -1454,14 +1457,31 @@ function LlmAssistantWidget({
   return (
     <div className="llm-chat-root">
       {open && (
-        <section className="llm-chat-panel" aria-label="LLM assistant chat">
+        <section className={`llm-chat-panel${fullscreen ? " is-fullscreen" : ""}`} aria-label="LLM assistant chat">
           <div className="llm-chat-header">
             <div>
               <h2>AI Help</h2>
             </div>
-            <button className="llm-chat-icon-button" onClick={() => setOpen(false)} aria-label="Close LLM chat">
-              <X size={18} />
-            </button>
+            <div className="llm-chat-header-actions">
+              <button
+                className="llm-chat-icon-button"
+                onClick={() => setFullscreen((current) => !current)}
+                aria-label={fullscreen ? "Exit fullscreen AI Help" : "Open AI Help fullscreen"}
+                title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+              >
+                {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+              </button>
+              <button
+                className="llm-chat-icon-button"
+                onClick={() => {
+                  setOpen(false);
+                  setFullscreen(false);
+                }}
+                aria-label="Close LLM chat"
+              >
+                <X size={18} />
+              </button>
+            </div>
           </div>
           <div className="llm-chat-messages" ref={messagesRef}>
             {messages.map((message, index) => (
