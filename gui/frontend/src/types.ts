@@ -33,6 +33,7 @@ export type HardwarePidCandidate = {
   mod0_kd: number;
   mod0_kpole1: number;
   mod0_kpole2: number;
+  mod0_cm_gain: number;
   output_inductance_nh: number;
   effective_lc_inductance_nh: number;
   phase: string;
@@ -90,11 +91,14 @@ export type TuningConfig = {
     initial_wc_rad_s: number;
     initial_phi_deg: number;
     max_iterations: number;
+    max_coarse_iterations: number;
+    max_refined_iterations: number;
     mod0_kp: SearchParameter;
     mod0_ki: SearchParameter;
     mod0_kd: SearchParameter;
     mod0_kpole1: SearchParameter;
     mod0_kpole2: SearchParameter;
+    mod0_cm_gain: SearchParameter;
     output_inductance_nh: SearchParameter;
     effective_lc_inductance_nh: SearchParameter;
   };
@@ -112,6 +116,8 @@ export type AutotuneExperimentConfig = {
   scope_config: Record<string, unknown>;
   vout_tolerance_v: number;
   response_abs_limit_v: number;
+  async_artifacts?: boolean;
+  ignore_pass_until_max_iterations?: boolean;
 };
 
 export type TuningStatus = {
@@ -135,6 +141,7 @@ export type TuningStatus = {
 
 export type AutotuneRunInfo = {
   run_id: string;
+  display_name?: string;
   kind: "recent" | "saved" | string;
   path: string;
   recent_limit?: number;
@@ -142,6 +149,7 @@ export type AutotuneRunInfo = {
 
 export type AutotuneRunSummary = {
   run_id: string;
+  display_name?: string;
   kind: "recent" | "saved" | string;
   path?: string;
   created_at?: number;
@@ -177,6 +185,20 @@ export type AutotuneGifResponse = {
   combined_gif?: string | null;
   transient_gif?: string | null;
   bode_gif?: string | null;
+  opened?: boolean;
+  opened_path?: string | null;
+};
+
+export type LlmChatMessage = {
+  role: "user" | "assistant" | "system";
+  content: string;
+};
+
+export type LlmChatResponse = {
+  ok: boolean;
+  reply?: string;
+  model?: string;
+  error?: string;
 };
 
 export type VoutReadback = {
@@ -248,7 +270,17 @@ export type XdpPidReadback = {
   page?: number;
   loop?: string;
   pid_registers?: XdpPidRegisterBlock;
+  current_mode_registers?: XdpPidRegisterBlock;
   write?: {
+    name: string;
+    memory_address: string;
+    word_before: string;
+    word_after: string;
+    changed: boolean;
+    writes: Record<string, XdpPidField>;
+    readback: XdpPidRegisterBlock;
+  };
+  current_mode_write?: {
     name: string;
     memory_address: string;
     word_before: string;
@@ -320,6 +352,8 @@ export type BodeSweepConfig = {
   stop_hz: number;
   points: number;
   bandwidth_hz: number;
+  source_vpp?: number | null;
+  /** Legacy field kept so old saved runs can still be loaded. New UI uses source_vpp. */
   source_dbm?: number | null;
   timeout_ms?: number;
 };

@@ -18,12 +18,15 @@ import {
   StopCircle,
   LoaderCircle,
   Moon,
+  MessageCircle,
+  Send,
   XCircle,
+  X,
   Sun,
   Zap
 } from "lucide-react";
-import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getTuningRuns, getTuningStatus, loadTuningRun, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runSelfTestDevice, saveTuningAnimationGif, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopTuning, warmScope } from "./api";
-import type { AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceField, InductanceReadback, InstrumentKey, InstrumentTestResult, IterationRecord, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SearchParameter, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
+import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getTuningRuns, getTuningStatus, loadTuningRun, openTuningAnimationGif, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runSelfTestDevice, saveTuningAnimationGif, sendLlmChat, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopTuning, warmScope } from "./api";
+import type { AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceField, InductanceReadback, InstrumentKey, InstrumentTestResult, IterationRecord, LlmChatMessage, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SearchParameter, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 import "./styles.css";
 
 const searchParameter = (center: number, min: number, max: number, points: number): SearchParameter => ({
@@ -46,7 +49,7 @@ const defaultConfig: TuningConfig = {
     vout_target_v: 0.9296875,
     overshoot_pct: 3,
     undershoot_pct: 3,
-    settling_time_s: 4e-6,
+    settling_time_s: 1e-6,
     oscillations: 0,
     phase_margin_deg: 45,
     crossover_frequency_hz: 200000,
@@ -62,26 +65,78 @@ const defaultConfig: TuningConfig = {
     initial_wc_rad_s: 157080,
     initial_phi_deg: 60,
     max_iterations: 40,
-    mod0_kp: searchParameter(165, 141, 189, 7),
-    mod0_ki: searchParameter(220, 196, 244, 7),
-    mod0_kd: searchParameter(175, 151, 199, 7),
-    mod0_kpole1: searchParameter(3, 1, 5, 5),
-    mod0_kpole2: searchParameter(3, 1, 5, 5),
-    output_inductance_nh: searchParameter(100.024, 80.019, 120.029, 9),
-    effective_lc_inductance_nh: searchParameter(369.276, 295.421, 443.131, 9)
+    max_coarse_iterations: 20,
+    max_refined_iterations: 20,
+    mod0_kp: searchParameter(165, 100, 255, 9),
+    mod0_ki: searchParameter(220, 150, 255, 9),
+    mod0_kd: searchParameter(175, 100, 200, 9),
+    mod0_kpole1: searchParameter(3, 3, 6, 2),
+    mod0_kpole2: searchParameter(3, 3, 6, 2),
+    mod0_cm_gain: searchParameter(2, 2, 2, 1),
+    output_inductance_nh: searchParameter(100.024, 80.019, 120.029, 5),
+    effective_lc_inductance_nh: searchParameter(369.276, 295.421, 443.131, 5)
   }
 };
 
 const cloneDefaultConfig = (): TuningConfig => JSON.parse(JSON.stringify(defaultConfig)) as TuningConfig;
 
+const normalizeSearchParameter = (value: Partial<SearchParameter> | undefined, fallback: SearchParameter): SearchParameter => {
+  const next = {
+    ...fallback,
+    ...(value ?? {})
+  };
+  const points = Math.max(1, Math.round(Number.isFinite(next.points) ? next.points : fallback.points));
+  const min = Number.isFinite(next.min) ? next.min : fallback.min;
+  const max = Number.isFinite(next.max) ? next.max : fallback.max;
+  const center = Number.isFinite(next.center) ? Math.min(Math.max(next.center, Math.min(min, max)), Math.max(min, max)) : fallback.center;
+  return {
+    ...next,
+    center,
+    min,
+    max,
+    points,
+    step: points > 1 ? Math.abs((max - min) / (points - 1)) : Math.abs(max - min)
+  };
+};
+
+const normalizeTuningConfig = (config?: Partial<TuningConfig> | null): TuningConfig => {
+  const fallback = cloneDefaultConfig();
+  const incoming = config ?? {};
+  const incomingSearch = incoming.search ?? {};
+  const normalizedSearch = {
+    ...fallback.search,
+    ...incomingSearch
+  };
+  for (const field of hardwareSearchFields) {
+    normalizedSearch[field.key] = normalizeSearchParameter(
+      incomingSearch[field.key] as Partial<SearchParameter> | undefined,
+      fallback.search[field.key]
+    );
+  }
+  return {
+    ...fallback,
+    ...incoming,
+    plant: {
+      ...fallback.plant,
+      ...(incoming.plant ?? {})
+    },
+    targets: {
+      ...fallback.targets,
+      ...(incoming.targets ?? {})
+    },
+    search: normalizedSearch
+  };
+};
+
 const selfTestOrder: InstrumentKey[] = ["afg", "bode", "power_supply", "scope", "board_i2c"];
-const xdpPidFieldNames = ["mod0_kp", "mod0_ki", "mod0_kd", "mod0_kpole1", "mod0_kpole2"] as const;
+const xdpPidFieldNames = ["mod0_kp", "mod0_ki", "mod0_kd", "mod0_kpole1", "mod0_kpole2", "mod0_cm_gain"] as const;
 const defaultXdpPidLimits: Record<(typeof xdpPidFieldNames)[number], { min: number; max: number }> = {
   mod0_kp: { min: 0, max: 255 },
   mod0_ki: { min: 0, max: 255 },
   mod0_kd: { min: 0, max: 255 },
   mod0_kpole1: { min: 0, max: 15 },
-  mod0_kpole2: { min: 0, max: 15 }
+  mod0_kpole2: { min: 0, max: 15 },
+  mod0_cm_gain: { min: 0, max: 127 }
 };
 type HardwareSearchKey =
   | "mod0_kp"
@@ -89,6 +144,7 @@ type HardwareSearchKey =
   | "mod0_kd"
   | "mod0_kpole1"
   | "mod0_kpole2"
+  | "mod0_cm_gain"
   | "output_inductance_nh"
   | "effective_lc_inductance_nh";
 const hardwareSearchFields: Array<{ key: HardwareSearchKey; label: string; limit: string }> = [
@@ -97,6 +153,7 @@ const hardwareSearchFields: Array<{ key: HardwareSearchKey; label: string; limit
   { key: "mod0_kd", label: "mod0_kd", limit: "0-255" },
   { key: "mod0_kpole1", label: "mod0_kpole1", limit: "0-15" },
   { key: "mod0_kpole2", label: "mod0_kpole2", limit: "0-15" },
+  { key: "mod0_cm_gain", label: "Current Mode Gain", limit: "0-127" },
   { key: "output_inductance_nh", label: "Output Inductance (nH)", limit: "14.29-117028.57 nH" },
   { key: "effective_lc_inductance_nh", label: "Effective Lc Inductance (nH)", limit: "229.02-117028.57 nH" }
 ];
@@ -122,7 +179,8 @@ const defaultManualXdpPidRequest: Record<string, number> = {
   mod0_ki: 220,
   mod0_kd: 175,
   mod0_kpole1: 3,
-  mod0_kpole2: 3
+  mod0_kpole2: 3,
+  mod0_cm_gain: 2
 };
 const defaultBodeSweepConfig: BodeSweepConfig = {
   host: "127.0.0.1",
@@ -131,7 +189,7 @@ const defaultBodeSweepConfig: BodeSweepConfig = {
   stop_hz: 1_000_000,
   points: 201,
   bandwidth_hz: 300,
-  source_dbm: 0,
+  source_vpp: 0.1,
   timeout_ms: 60000
 };
 const defaultScopeChannels = ["CH1", "CH3"];
@@ -407,9 +465,10 @@ function voutRegisterStepFromExponent(exponent: number) {
 }
 
 function xdpPidLimitLabel(name: (typeof xdpPidFieldNames)[number], xdpPid: XdpPidReadback | null) {
-  const field = xdpPid?.pid_registers?.fields[name];
+  const field = xdpPid?.pid_registers?.fields[name] ?? xdpPid?.current_mode_registers?.fields[name];
   const limits = field ? { min: field.min, max: field.max } : defaultXdpPidLimits[name];
-  return `${name} (${limits.min}-${limits.max})`;
+  const label = name === "mod0_cm_gain" ? "Current Mode Gain" : name;
+  return `${label} (${limits.min}-${limits.max})`;
 }
 
 function searchParameterWithCenter(parameter: SearchParameter, center: number): SearchParameter {
@@ -436,6 +495,7 @@ function withManualSearchCenters(
       mod0_kd: searchParameterWithCenter(config.search.mod0_kd, Math.round(xdpPidRequest.mod0_kd ?? defaultManualXdpPidRequest.mod0_kd)),
       mod0_kpole1: searchParameterWithCenter(config.search.mod0_kpole1, Math.round(xdpPidRequest.mod0_kpole1 ?? defaultManualXdpPidRequest.mod0_kpole1)),
       mod0_kpole2: searchParameterWithCenter(config.search.mod0_kpole2, Math.round(xdpPidRequest.mod0_kpole2 ?? defaultManualXdpPidRequest.mod0_kpole2)),
+      mod0_cm_gain: searchParameterWithCenter(config.search.mod0_cm_gain, Math.round(xdpPidRequest.mod0_cm_gain ?? defaultManualXdpPidRequest.mod0_cm_gain)),
       output_inductance_nh: searchParameterWithCenter(config.search.output_inductance_nh, inductanceRequest.output_nh),
       effective_lc_inductance_nh: searchParameterWithCenter(config.search.effective_lc_inductance_nh, inductanceRequest.effective_lc_nh)
     }
@@ -466,7 +526,8 @@ function buildAutotuneExperiment(
       }
     },
     vout_tolerance_v: 0.15,
-    response_abs_limit_v: 0.25
+    response_abs_limit_v: 0.25,
+    ignore_pass_until_max_iterations: true
   };
 }
 
@@ -523,6 +584,7 @@ function App() {
     if (viewingLoadedRun.current) return;
     try {
       const next = await getTuningStatus();
+      if (viewingLoadedRun.current) return;
       setStatus(next);
       setError("");
     } catch (exc) {
@@ -584,17 +646,19 @@ function App() {
     }
 
     const pidFieldsFromState = nextPid?.pid_registers?.fields;
-    if (!pidFieldsFromState) {
+    const currentModeFieldsFromState = nextPid?.current_mode_registers?.fields;
+    if (!pidFieldsFromState || !currentModeFieldsFromState) {
       nextPid = await readXdpPid(voutRequest.address, voutRequest.page, voutRequest.adapter);
       setXdpPidState(nextPid);
     }
     const pidFields = nextPid?.pid_registers?.fields;
+    const currentModeFields = nextPid?.current_mode_registers?.fields;
     if (!pidFields) {
       throw new Error("Auto-Tune safety check failed: could not read current XDP PID fields before writing.");
     }
     pidRequest = {
       ...pidRequest,
-      ...Object.fromEntries(xdpPidFieldNames.map((name) => [name, pidFields[name]?.raw ?? pidRequest[name]]))
+      ...Object.fromEntries(xdpPidFieldNames.map((name) => [name, (pidFields[name] ?? currentModeFields?.[name])?.raw ?? pidRequest[name]]))
     };
     setXdpPidRequest(pidRequest);
 
@@ -627,7 +691,7 @@ function App() {
             ? await resumeTuning(resumeRun?.run_id, resumeRun?.kind)
             : await stopTuning();
         setStatus(next);
-        setConfig(next.config);
+        setConfig(normalizeTuningConfig(next.config));
         refreshAutotuneRuns();
         setError("");
         return;
@@ -647,7 +711,7 @@ function App() {
       const next =
         action === "start" ? await startTuning(runConfig, experiment) : await stepTuning(runConfig, experiment);
       setStatus(next);
-      setConfig(next.config);
+      setConfig(normalizeTuningConfig(next.config));
       refreshAutotuneRuns();
       setError("");
     } catch (exc) {
@@ -660,7 +724,7 @@ function App() {
       const defaults = cloneDefaultConfig();
       viewingLoadedRun.current = false;
       const next = await resetTuning(defaults);
-      setConfig(next.config);
+      setConfig(normalizeTuningConfig(next.config));
       setStatus(next);
       refreshAutotuneRuns();
       setError("");
@@ -720,10 +784,11 @@ function App() {
       const next = await readXdpPid(voutRequest.address, voutRequest.page, voutRequest.adapter);
       setXdpPidState(next);
       const fields = next.pid_registers?.fields;
-      if (fields) {
+      const currentModeFields = next.current_mode_registers?.fields;
+      if (fields || currentModeFields) {
         setXdpPidRequest((current) => ({
           ...current,
-          ...Object.fromEntries(xdpPidFieldNames.map((name) => [name, fields[name]?.raw ?? current[name]]))
+          ...Object.fromEntries(xdpPidFieldNames.map((name) => [name, (fields?.[name] ?? currentModeFields?.[name])?.raw ?? current[name]]))
         }));
       }
       setError("");
@@ -914,6 +979,9 @@ function App() {
       setError("");
     } catch (exc) {
       setError(String(exc));
+      if (!showSelectionError) {
+        throw exc;
+      }
     } finally {
       setManualWriteRunning(false);
     }
@@ -1070,7 +1138,7 @@ function App() {
       const kind = status?.run?.kind ?? "recent";
       const result = await archiveCurrentTuningRun(undefined, runId, kind);
       setAutotuneArchiveStatus(`Saved permanently: ${formatRunLabel(result.saved_run, {}, 0, false)}`);
-      await refreshAutotuneRuns();
+      await refreshAutotuneRuns(`saved:${result.saved_run.run_id}`);
       setError("");
     } catch (exc) {
       setAutotuneArchiveStatus("");
@@ -1108,8 +1176,9 @@ function App() {
       if (!kind || !runId) throw new Error("Select an auto-tune result to load.");
       const loaded = await loadTuningRun(runId, kind);
       viewingLoadedRun.current = true;
+      setSelectedAutotuneRun(`${kind}:${runId}`);
       setStatus(loaded);
-      setConfig(loaded.config);
+      setConfig(normalizeTuningConfig(loaded.config));
       setAutotuneArchiveStatus(`Loaded ${formatLoadedRunLabel(autotuneRuns, kind, runId)}`);
       setError("");
     } catch (exc) {
@@ -1123,25 +1192,50 @@ function App() {
       const parsedDurationS = Number.parseFloat(autotuneGifFrameDurationS);
       const safeDurationS = Number.isFinite(parsedDurationS) ? parsedDurationS : 0.1;
       const durationMs = Math.round(Math.max(0.05, Math.min(5, safeDurationS)) * 1000);
-      const selectedParts = selectedAutotuneRun ? selectedAutotuneRun.split(":") : [];
-      const selectedKind = selectedParts[0] || undefined;
-      const selectedRunId = selectedParts.slice(1).join(":") || undefined;
-      const targetRunId = status?.run?.run_id || selectedRunId;
-      const targetKind = status?.run?.kind || selectedKind;
+      const { targetRunId, targetKind } = selectedAutotuneGifRun();
       const result = await saveTuningAnimationGif(targetRunId, targetKind, durationMs);
       setAutotuneGif(result);
-      const savedFolder = result.animation_dir
-        ? result.animation_dir.replace(/\//g, "\\")
-        : gifFolderDisplayPath(result.combined_gif ?? result.transient_gif ?? result.bode_gif);
+      const savedPath = gifResultDisplayPath(result);
       const savedSelection = `${result.kind}:${result.run_id}`;
       setSelectedAutotuneRun(savedSelection);
-      setAutotuneArchiveStatus(savedFolder ? `GIF animation saved: ${savedFolder}` : "GIF animation saved, but no GIF file was returned.");
+      setAutotuneArchiveStatus(savedPath ? `GIF animation saved: ${savedPath}` : "GIF animation saved, but no GIF file was returned.");
       await refreshAutotuneRuns(savedSelection);
       setError("");
     } catch (exc) {
       setAutotuneArchiveStatus("");
       setError(String(exc));
     }
+  };
+
+  const openAutotuneGif = async () => {
+    try {
+      setAutotuneArchiveStatus("Opening GIF animation...");
+      const parsedDurationS = Number.parseFloat(autotuneGifFrameDurationS);
+      const safeDurationS = Number.isFinite(parsedDurationS) ? parsedDurationS : 0.1;
+      const durationMs = Math.round(Math.max(0.05, Math.min(5, safeDurationS)) * 1000);
+      const { targetRunId, targetKind } = selectedAutotuneGifRun();
+      const result = await openTuningAnimationGif(targetRunId, targetKind, durationMs);
+      setAutotuneGif(result);
+      const savedSelection = `${result.kind}:${result.run_id}`;
+      setSelectedAutotuneRun(savedSelection);
+      const openedPath = result.opened_path ? result.opened_path.replace(/\//g, "\\") : gifResultDisplayPath(result);
+      setAutotuneArchiveStatus(openedPath ? `GIF animation opened: ${openedPath}` : "GIF animation opened.");
+      await refreshAutotuneRuns(savedSelection);
+      setError("");
+    } catch (exc) {
+      setAutotuneArchiveStatus("");
+      setError(String(exc));
+    }
+  };
+
+  const selectedAutotuneGifRun = () => {
+    const selectedParts = selectedAutotuneRun ? selectedAutotuneRun.split(":") : [];
+    const selectedKind = selectedParts[0] || undefined;
+    const selectedRunId = selectedParts.slice(1).join(":") || undefined;
+    return {
+      targetRunId: status?.run?.run_id || selectedRunId,
+      targetKind: status?.run?.kind || selectedKind
+    };
   };
 
   return (
@@ -1227,6 +1321,7 @@ function App() {
         loadRun={loadAutotuneRunResult}
         deleteRun={deleteAutotuneRunResult}
         saveGif={saveAutotuneGif}
+        openGif={openAutotuneGif}
         gifFrameDurationS={autotuneGifFrameDurationS}
         setGifFrameDurationS={setAutotuneGifFrameDurationS}
         archiveStatus={autotuneArchiveStatus}
@@ -1287,7 +1382,125 @@ function App() {
         onRun={testInstruments}
         onRunDevice={testSingleInstrument}
       />}
+      <LlmAssistantWidget
+        activeTab={activeTab}
+        status={status}
+        config={config}
+        language={language}
+      />
     </main>
+  );
+}
+
+function LlmAssistantWidget({
+  activeTab,
+  status,
+  config,
+  language
+}: {
+  activeTab: AppTab;
+  status: TuningStatus | null;
+  config: TuningConfig;
+  language: Language;
+}) {
+  const greeting = language === "zh"
+    ? "你好，我可以帮你理解这个 GUI、Auto-Tune 流程、Manual Tuning、Self Testing，以及 Bode 100 / Scope / Function Generator / PMBus 这些模块。"
+    : "Hi, I can help explain this GUI, the Auto-Tune flow, Manual Tuning, Self Testing, and the Bode 100 / Scope / Function Generator / PMBus panels.";
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [messages, setMessages] = useState<LlmChatMessage[]>([{ role: "assistant", content: greeting }]);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: "smooth" });
+  }, [open, messages, sending]);
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+    const nextMessages: LlmChatMessage[] = [...messages, { role: "user", content: text }];
+    const context = {
+      active_tab: activeTab,
+      backend_state: status?.state ?? "unknown",
+      backend_message: status?.message ?? "",
+      current_iteration: status?.current?.iteration ?? null,
+      best_iteration: status?.best?.iteration ?? null,
+      best_penalty: status?.best?.metrics?.score ?? null,
+      max_coarse_iterations: config.search.max_coarse_iterations,
+      max_refined_iterations: config.search.max_refined_iterations,
+      targets: {
+        overshoot_pct: config.targets.overshoot_pct,
+        undershoot_pct: config.targets.undershoot_pct,
+        settling_time_us: config.targets.settling_time_s * 1e6,
+        phase_margin_deg: config.targets.phase_margin_deg,
+        crossover_upper_limit_hz: config.targets.crossover_frequency_hz
+      }
+    };
+    setInput("");
+    setMessages(nextMessages);
+    setSending(true);
+    try {
+      const response = await sendLlmChat(nextMessages, context);
+      setMessages([...nextMessages, { role: "assistant", content: response.reply ?? "No reply." }]);
+    } catch (exc) {
+      setMessages([...nextMessages, { role: "assistant", content: `LLM API error: ${String(exc)}` }]);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="llm-chat-root">
+      {open && (
+        <section className="llm-chat-panel" aria-label="LLM assistant chat">
+          <div className="llm-chat-header">
+            <div>
+              <h2>AI Help</h2>
+            </div>
+            <button className="llm-chat-icon-button" onClick={() => setOpen(false)} aria-label="Close LLM chat">
+              <X size={18} />
+            </button>
+          </div>
+          <div className="llm-chat-messages" ref={messagesRef}>
+            {messages.map((message, index) => (
+              <div className={`llm-message ${message.role}`} key={`${message.role}-${index}`}>
+                <span>{message.role === "user" ? "You" : "Assistant"}</span>
+                <p>{message.content}</p>
+              </div>
+            ))}
+            {sending && (
+              <div className="llm-message assistant">
+                <span>Assistant</span>
+                <p>Thinking...</p>
+              </div>
+            )}
+          </div>
+          <div className="llm-chat-input-row">
+            <textarea
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  handleSend();
+                }
+              }}
+              placeholder={language === "zh" ? "问一下这个 GUI 怎么用..." : "Ask about this GUI..."}
+              rows={2}
+            />
+            <button className="primary llm-send-button" onClick={handleSend} disabled={!input.trim() || sending}>
+              <Send size={16} />
+            </button>
+          </div>
+        </section>
+      )}
+      <button className="llm-chat-launcher" onClick={() => setOpen((current) => !current)} aria-pressed={open}>
+        <MessageCircle size={19} />
+        <span>AI Help</span>
+      </button>
+    </div>
   );
 }
 
@@ -1379,14 +1592,15 @@ function PenaltyExplanationDialog({ onClose }: { onClose: () => void }) {
             important than over-optimizing one metric.
           </p>
           <div className="formula-box">
-            transient penalty = excess OS + excess US + 3 x excess oscillations + 10000 x excess settling time
+            transient penalty = excess OS [%] + excess US [%] + 3 x excess OS settling [us] + 3 x excess US settling [us]
           </div>
           <div className="formula-box">
-            Bode penalty = 1.5 x phase-margin shortage + 0.5 x crossover excess + 2 x gain-margin shortage
+            Bode penalty = 1.5 x phase-margin shortage [deg] + 0.5 x crossover upper-limit excess [%]
           </div>
           <p>
-            Default limits: OS at or below 3%, US at or below 3%, OS/US settling below 4 us, phase margin at or above
-            45 deg, crossover frequency target = 200 kHz, and gain margin at or above 6 dB.
+            Default limits: OS at or below 3%, US at or below 3%, OS/US settling below 1 us, phase margin at or above
+            45 deg, and crossover frequency upper limit = 200 kHz. The OS/US terms are percentage points, settling terms
+            are microseconds, phase margin is degrees, and crossover upper-limit excess is percent.
           </p>
         </div>
 
@@ -1401,7 +1615,7 @@ function PenaltyExplanationDialog({ onClose }: { onClose: () => void }) {
           />
           <DefinitionCard
             title="OS / US Settling"
-            text="Each load step has its own settling time. The code finds the final steady voltage for that segment, then reports the last time CH3 is outside the +/-2% band. The default target is below 4 us."
+            text="Each load step has its own settling time in microseconds. The code finds the final steady voltage for that segment, then reports the last time CH3 is outside the +/-2% band. The default target is below 1 us for both OS settling and US settling."
           />
           <DefinitionCard
             title="Phase Margin"
@@ -1409,11 +1623,7 @@ function PenaltyExplanationDialog({ onClose }: { onClose: () => void }) {
           />
           <DefinitionCard
             title="Crossover Frequency"
-            text="Crossover is the frequency where gain crosses 0 dB. The default target is 200 kHz, with penalty based on percent error outside the configured tolerance."
-          />
-          <DefinitionCard
-            title="Gain Margin"
-            text="For this setup, gain margin is computed from gain at the phase = 0 deg crossing convention used by the backend."
+            text="Crossover is the frequency where gain crosses 0 dB. The default upper limit is 200 kHz. Frequencies below 200 kHz receive a small tie-break reward; frequencies above 200 kHz receive penalty based on percent excess."
           />
         </div>
       </section>
@@ -1486,6 +1696,7 @@ function AutotuneWorkbench({
   loadRun,
   deleteRun,
   saveGif,
+  openGif,
   gifFrameDurationS,
   setGifFrameDurationS,
   archiveStatus,
@@ -1524,6 +1735,7 @@ function AutotuneWorkbench({
   loadRun: (selection?: string) => Promise<void>;
   deleteRun: (selection?: string) => Promise<void>;
   saveGif: () => Promise<void>;
+  openGif: () => Promise<void>;
   gifFrameDurationS: string;
   setGifFrameDurationS: React.Dispatch<React.SetStateAction<string>>;
   archiveStatus: string;
@@ -1594,6 +1806,9 @@ function AutotuneWorkbench({
                 <button className="autotune-control-button gif-save-button" onClick={saveGif} disabled={status?.state === "running" || history.length < 2}>
                   Save GIF
                 </button>
+                <button className="autotune-control-button gif-save-button" onClick={openGif} disabled={status?.state === "running" || history.length < 2}>
+                  Open
+                </button>
                 <label className="gif-duration-field">
                   <span>s / frame</span>
                   <input
@@ -1663,9 +1878,10 @@ function AutotuneWorkbench({
                 onChange={(value) => setBodeSweepConfig((current) => ({ ...current, bandwidth_hz: Math.max(1, value) }))}
               />
               <NumberField
-                label="Source Level (dBm)"
-                value={bodeSweepConfig.source_dbm ?? 0}
-                onChange={(value) => setBodeSweepConfig((current) => ({ ...current, source_dbm: value }))}
+                label="Source Level (Vpp)"
+                value={bodeSweepConfig.source_vpp ?? 0.1}
+                step={0.01}
+                onChange={(value) => setBodeSweepConfig((current) => ({ ...current, source_vpp: Math.max(0.001, value), source_dbm: null }))}
               />
             </div>
           </Panel>
@@ -1682,24 +1898,30 @@ function AutotuneWorkbench({
             <NumberField label="Undershoot max (%)" value={config.targets.undershoot_pct} onChange={(value) => updateConfig(setConfig, "targets", "undershoot_pct", value)} />
             <NumberField label="Settling target (us)" value={config.targets.settling_time_s * 1e6} onChange={(value) => updateConfig(setConfig, "targets", "settling_time_s", value / 1e6)} />
             <NumberField label="Phase Margin (deg)" value={config.targets.phase_margin_deg} onChange={(value) => updateConfig(setConfig, "targets", "phase_margin_deg", value)} />
-            <FrequencyField label="Crossover Frequency (Hz)" value={config.targets.crossover_frequency_hz} onChange={(value) => updateConfig(setConfig, "targets", "crossover_frequency_hz", value)} />
-            <NumberField label="Gain Margin min (dB)" value={config.targets.gain_margin_db} onChange={(value) => updateConfig(setConfig, "targets", "gain_margin_db", value)} />
+            <FrequencyField label="Crossover Frequency Upper Limit (Hz)" value={config.targets.crossover_frequency_hz} onChange={(value) => updateConfig(setConfig, "targets", "crossover_frequency_hz", value)} />
           </Panel>
 
           <Panel title="Search Space" icon={<RefreshCw size={17} />}>
             <DeferredNumberField
-              label="max iterations"
-              value={config.search.max_iterations}
+              label="Max Coarse Iterations"
+              value={config.search.max_coarse_iterations ?? Math.max(1, Math.round((config.search.max_iterations ?? 40) / 2))}
               integer
               min={1}
-              onCommit={(value) => updateConfig(setConfig, "search", "max_iterations", Math.max(1, Math.round(value)))}
+              onCommit={(value) => updateSearchIterationBudget(setConfig, "max_coarse_iterations", Math.max(1, Math.round(value)))}
+            />
+            <DeferredNumberField
+              label="Max Refined Iterations"
+              value={config.search.max_refined_iterations ?? Math.max(0, (config.search.max_iterations ?? 40) - Math.max(1, Math.round((config.search.max_iterations ?? 40) / 2)))}
+              integer
+              min={0}
+              onCommit={(value) => updateSearchIterationBudget(setConfig, "max_refined_iterations", Math.max(0, Math.round(value)))}
             />
             {hardwareSearchFields.map((field) => (
               <SearchParameterField
                 key={field.key}
                 label={field.label}
                 limit={field.limit}
-                value={config.search[field.key]}
+                value={config.search[field.key] ?? defaultConfig.search[field.key]}
                 integer={field.key.startsWith("mod0_")}
                 onChange={(value) => {
                   updateSearchParameter(setConfig, field.key, value);
@@ -1750,12 +1972,23 @@ function AutotuneWorkbench({
         </section>
 
         <aside className="metrics-rail">
-          <RunStatusPanel status={status} current={current} best={best} history={history} maxIterations={config.search.max_iterations} />
-          <PidPanel title={selectedRecord ? `Iteration #${selectedRecord.iteration}` : "Current Candidate"} record={visibleRecord} />
-          <PidPanel title="Best Result" record={best} />
-          <Panel title="Current Metrics" icon={<Activity size={17} />}>
-            <Metrics record={visibleRecord} />
-          </Panel>
+          <RunCurrentPanel
+            title={selectedRecord ? `Iteration #${selectedRecord.iteration}` : "Current Result"}
+            candidateTitle={selectedRecord ? "Candidate" : "Current Candidate"}
+            metricsTitle="Current Metrics"
+            status={status}
+            current={current}
+            best={best}
+            history={history}
+            record={visibleRecord}
+          />
+          <CandidateMetricsPanel
+            title="Best Result"
+            candidateTitle="Best Candidate"
+            metricsTitle="Best Metrics"
+            record={best}
+            showIteration
+          />
         </aside>
       </div>
   );
@@ -2046,6 +2279,14 @@ function ManualTuningView({
       setFullAcquisitionRunning(true);
       setFullAcquisitionDurationS(null);
       setError("");
+      setFullAcquisitionStatus(`Disabling function generator output on CH${acquisitionFgConfig.channel} before Bode...`);
+      setFgRunning(true);
+      setFgReadback(await setFunctionGenerator({
+        channel: acquisitionFgConfig.channel,
+        mode: acquisitionFgConfig.mode,
+        output_enabled: false
+      }));
+      setFgRunning(false);
       setFullAcquisitionStatus("Writing manual parameters to XDP...");
       await writeAllManualParametersForAcquisition();
       setFullAcquisitionStatus("Running Bode 100 sweep...");
@@ -2432,9 +2673,10 @@ function ManualTuningView({
                 onChange={(value) => setBodeSweepConfig((current) => ({ ...current, bandwidth_hz: Math.max(1, value) }))}
               />
               <NumberField
-                label="Source (dBm)"
-                value={bodeSweepConfig.source_dbm ?? 0}
-                onChange={(value) => setBodeSweepConfig((current) => ({ ...current, source_dbm: value }))}
+                label="Source (Vpp)"
+                value={bodeSweepConfig.source_vpp ?? 0.1}
+                step={0.01}
+                onChange={(value) => setBodeSweepConfig((current) => ({ ...current, source_vpp: Math.max(0.001, value), source_dbm: null }))}
               />
               <button className="primary bode-run-button" onClick={runManualBodeSweep} disabled={bodeSweepRunning}>
                 {bodeSweepRunning ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
@@ -3066,7 +3308,7 @@ function FunctionGeneratorSettingsRow({
 }) {
   return (
     <>
-      <SelectField label={compact ? "FG CH" : "Channel"} value={String(fgConfig.channel)} options={["1", "2"]} onChange={(value) => setFgConfig((current) => ({ ...current, channel: Number(value) }))} />
+      <SelectField label="Channel #" value={String(fgConfig.channel)} options={["1", "2"]} onChange={(value) => setFgConfig((current) => ({ ...current, channel: Number(value) }))} />
       <SelectField label={compact ? "Wave" : "Waveform"} value={fgConfig.mode} options={["square", "pulse", "dc", "sine"]} onChange={(value) => setFgConfig((current) => ({ ...current, mode: value }))} />
       {fgConfig.mode !== "dc" ? (
         <FrequencyField label="Frequency" value={fgConfig.frequency_hz} onChange={(value) => setFgConfig((current) => ({ ...current, frequency_hz: value }))} />
@@ -3511,10 +3753,6 @@ function BodeMarginReadout({ sweep }: { sweep: BodeSweepReadback | null }) {
         <span>Gain Crossover</span>
         <strong>{formatMaybeFrequency(margins?.phase_crossover_hz)}</strong>
       </div>
-      <div>
-        <span>Gain Margin</span>
-        <strong>{formatMaybeNumber(margins?.gain_margin_db, 2)} dB</strong>
-      </div>
     </div>
   );
 }
@@ -3537,8 +3775,25 @@ function AutotuneResultImage({
   const result = record?.[resultKey] as Record<string, unknown> | null | undefined;
   const imagePath = typeof result?.[imageKey] === "string" ? String(result[imageKey]) : "";
   const errorKey = imageKey === "scope_png" ? "scope_png_error" : "bode_png_error";
+  const pendingKey = imageKey === "scope_png" ? "scope_png_pending" : "bode_png_pending";
   const error = typeof result?.[errorKey] === "string" ? String(result[errorKey]) : "";
+  const pending = result?.[pendingKey] === true;
   const version = versionKeys.map((key) => result?.[key]).find((value) => value !== undefined && value !== null) ?? record?.iteration ?? Date.now();
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [loadFailed, setLoadFailed] = useState(false);
+  useEffect(() => {
+    setRetryNonce(0);
+    setLoadFailed(false);
+  }, [imagePath, String(version), pending]);
+
+  if (pending) {
+    return (
+      <div className="autotune-image-empty">
+        <p>Generating image...</p>
+        {error ? <p className="bad-text">{error}</p> : null}
+      </div>
+    );
+  }
   if (!imagePath) {
     return (
       <div className="autotune-image-empty">
@@ -3549,7 +3804,19 @@ function AutotuneResultImage({
   }
   return (
     <div className="autotune-image-preview">
-      <img src={`${imagePath}?v=${encodeURIComponent(String(version))}`} alt={alt} />
+      <img
+        src={`${imagePath}?v=${encodeURIComponent(`${String(version)}-${retryNonce}`)}`}
+        alt={alt}
+        onLoad={() => setLoadFailed(false)}
+        onError={() => {
+          if (retryNonce < 6) {
+            window.setTimeout(() => setRetryNonce((value) => value + 1), 500);
+          } else {
+            setLoadFailed(true);
+          }
+        }}
+      />
+      {loadFailed ? <p className="message-line bad-text">Image file is not ready yet. Retrying on the next status update.</p> : null}
       {error ? <p className="message-line bad-text">{error}</p> : null}
     </div>
   );
@@ -3558,6 +3825,8 @@ function AutotuneResultImage({
 type ResultRunSummary = AutotuneRunsResponse["recent"][number];
 
 function runDateKey(runId: string): string {
+  const friendly = String(runId).match(/^(?:Recent|Permanent)_(\d{4}-\d{2}-\d{2})_/);
+  if (friendly) return friendly[1];
   const match = String(runId).match(/^(\d{4})(\d{2})(\d{2})/);
   if (!match) return String(runId || "Unknown");
   return `${match[1]}-${match[2]}-${match[3]}`;
@@ -3572,11 +3841,12 @@ function countRunDates(runs: Array<{ run_id: string }>): Record<string, number> 
 }
 
 function formatRunLabel(
-  run: Pick<ResultRunSummary, "run_id" | "kind">,
+  run: Pick<ResultRunSummary, "run_id" | "kind" | "display_name">,
   dateCounts: Record<string, number>,
   index: number,
   includeDuplicateIndex = true
 ): string {
+  if (run.display_name && / #\d+$/.test(run.display_name)) return run.display_name;
   const date = runDateKey(run.run_id);
   const kind = run.kind === "saved" ? "Permanent" : "Recent";
   const duplicateSuffix = includeDuplicateIndex && (dateCounts[date] ?? 0) > 1 ? ` #${index + 1}` : "";
@@ -3604,6 +3874,14 @@ function gifFolderDisplayPath(path?: string | null): string {
   const slashIndex = clean.lastIndexOf("/");
   const folder = slashIndex >= 0 ? clean.slice(0, slashIndex) : clean;
   return folder.replace(/\//g, "\\");
+}
+
+function gifResultDisplayPath(result: AutotuneGifResponse): string {
+  const gifPath = result.combined_gif ?? result.transient_gif ?? result.bode_gif;
+  if (gifPath) {
+    return gifPath.replace(/^\/results\//, "results/").replace(/\//g, "\\");
+  }
+  return result.animation_dir ? result.animation_dir.replace(/\//g, "\\") : "";
 }
 
 function ResultLibraryPanel({
@@ -3646,7 +3924,16 @@ function ResultLibraryPanel({
       <div className="result-library">
         <dl className="kv compact-kv">
           <dt>Current run</dt>
-          <dd>{currentRun?.run_id ? formatRunLabel({ run_id: currentRun.run_id, kind: "recent" }, recentLabelCounts, 0, false) : "--"}</dd>
+          <dd>
+            {currentRun?.run_id
+              ? formatRunLabel(
+                  { run_id: currentRun.run_id, kind: currentRun.kind, display_name: currentRun.display_name },
+                  currentRun.kind === "saved" ? savedLabelCounts : recentLabelCounts,
+                  0,
+                  false
+                )
+              : "--"}
+          </dd>
           <dt>Recent limit</dt>
           <dd>{currentRun?.recent_limit ?? 5}</dd>
         </dl>
@@ -3685,10 +3972,10 @@ function ResultLibraryPanel({
         </div>
         {archiveStatus ? (
           <p className="message-line result-save-message">
-            {archiveStatus.startsWith("GIF animation saved:") ? (
+            {archiveStatus.startsWith("GIF animation saved:") || archiveStatus.startsWith("GIF animation opened:") ? (
               <>
-                <span>GIF animation saved:</span>
-                <code>{archiveStatus.replace("GIF animation saved:", "").trim()}</code>
+                <span>{archiveStatus.startsWith("GIF animation opened:") ? "GIF animation opened:" : "GIF animation saved:"}</span>
+                <code>{archiveStatus.replace(/^GIF animation (?:saved|opened):/, "").trim()}</code>
               </>
             ) : (
               archiveStatus
@@ -4094,27 +4381,108 @@ function DeferredSearchInput({
   );
 }
 
-function PidPanel({ title, record }: { title: string; record: IterationRecord | null }) {
-  const candidate = record?.candidate;
+function PidPanel({ title, record, showIteration = false }: { title: string; record: IterationRecord | null; showIteration?: boolean }) {
   return (
     <Panel title={title} icon={<Gauge size={17} />}>
-      <dl className="kv mono">
-        <dt>mod0_kp</dt>
-        <dd>{candidate ? candidate.mod0_kp : "--"}</dd>
-        <dt>mod0_ki</dt>
-        <dd>{candidate ? candidate.mod0_ki : "--"}</dd>
-        <dt>mod0_kd</dt>
-        <dd>{candidate ? candidate.mod0_kd : "--"}</dd>
-        <dt>mod0_kpole1</dt>
-        <dd>{candidate ? candidate.mod0_kpole1 : "--"}</dd>
-        <dt>mod0_kpole2</dt>
-        <dd>{candidate ? candidate.mod0_kpole2 : "--"}</dd>
-        <dt>Output L</dt>
-        <dd>{candidate ? `${candidate.output_inductance_nh.toFixed(3)} nH` : "--"}</dd>
-        <dt>Effective Lc</dt>
-        <dd>{candidate ? `${candidate.effective_lc_inductance_nh.toFixed(3)} nH` : "--"}</dd>
-      </dl>
+      <PidReadout record={record} showIteration={showIteration} />
     </Panel>
+  );
+}
+
+function CandidateMetricsPanel({
+  title,
+  candidateTitle,
+  metricsTitle,
+  record,
+  showIteration = false
+}: {
+  title: string;
+  candidateTitle: string;
+  metricsTitle: string;
+  record: IterationRecord | null;
+  showIteration?: boolean;
+}) {
+  return (
+    <Panel title={title} icon={<Gauge size={17} />}>
+      <div className="combined-result-section">
+        <h4>{candidateTitle}</h4>
+        <PidReadout record={record} showIteration={showIteration} />
+      </div>
+      <div className="combined-result-divider" />
+      <div className="combined-result-section">
+        <h4>{metricsTitle}</h4>
+        <Metrics record={record} />
+      </div>
+    </Panel>
+  );
+}
+
+function RunCurrentPanel({
+  title,
+  candidateTitle,
+  metricsTitle,
+  status,
+  current,
+  best,
+  history,
+  record
+}: {
+  title: string;
+  candidateTitle: string;
+  metricsTitle: string;
+  status: TuningStatus | null;
+  current: IterationRecord | null;
+  best: IterationRecord | null;
+  history: IterationRecord[];
+  record: IterationRecord | null;
+}) {
+  return (
+    <Panel title={title} icon={<Activity size={17} />}>
+      <div className="combined-result-section">
+        <h4>Run Status</h4>
+        <RunStatusReadout status={status} current={current} best={best} history={history} />
+      </div>
+      <div className="combined-result-divider" />
+      <div className="combined-result-section">
+        <h4>{candidateTitle}</h4>
+        <PidReadout record={record} />
+      </div>
+      <div className="combined-result-divider" />
+      <div className="combined-result-section">
+        <h4>{metricsTitle}</h4>
+        <Metrics record={record} />
+      </div>
+    </Panel>
+  );
+}
+
+function PidReadout({ record, showIteration = false }: { record: IterationRecord | null; showIteration?: boolean }) {
+  const candidate = record?.candidate;
+  return (
+    <dl className="kv mono">
+      {showIteration ? (
+        <>
+          <dt>Iteration</dt>
+          <dd>{record?.iteration ? `#${record.iteration}` : "--"}</dd>
+        </>
+      ) : null}
+      <dt>mod0_kp</dt>
+      <dd>{candidate ? candidate.mod0_kp : "--"}</dd>
+      <dt>mod0_ki</dt>
+      <dd>{candidate ? candidate.mod0_ki : "--"}</dd>
+      <dt>mod0_kd</dt>
+      <dd>{candidate ? candidate.mod0_kd : "--"}</dd>
+      <dt>mod0_kpole1</dt>
+      <dd>{candidate ? candidate.mod0_kpole1 : "--"}</dd>
+      <dt>mod0_kpole2</dt>
+      <dd>{candidate ? candidate.mod0_kpole2 : "--"}</dd>
+      <dt>cm gain</dt>
+      <dd>{candidate ? candidate.mod0_cm_gain : "--"}</dd>
+      <dt>Output L</dt>
+      <dd>{candidate ? `${candidate.output_inductance_nh.toFixed(3)} nH` : "--"}</dd>
+      <dt>Effective Lc</dt>
+      <dd>{candidate ? `${candidate.effective_lc_inductance_nh.toFixed(3)} nH` : "--"}</dd>
+    </dl>
   );
 }
 
@@ -4122,20 +4490,42 @@ function RunStatusPanel({
   status,
   current,
   best,
-  history,
-  maxIterations
+  history
 }: {
   status: TuningStatus | null;
   current: IterationRecord | null;
   best: IterationRecord | null;
   history: IterationRecord[];
-  maxIterations: number;
+}) {
+  return (
+    <Panel title="Run Status" icon={<Activity size={17} />}>
+      <RunStatusReadout status={status} current={current} best={best} history={history} />
+    </Panel>
+  );
+}
+
+function RunStatusReadout({
+  status,
+  current,
+  best,
+  history
+}: {
+  status: TuningStatus | null;
+  current: IterationRecord | null;
+  best: IterationRecord | null;
+  history: IterationRecord[];
 }) {
   const iteration = history.length;
-  const safeMaxIterations = Math.max(1, maxIterations);
+  const search = normalizeTuningConfig(status?.config).search;
+  const maxCoarse = searchCoarseBudget(search);
+  const maxRefined = searchRefinedBudget(search);
+  const safeMaxIterations = Math.max(1, maxCoarse + maxRefined);
+  const coarseDone = Math.min(maxCoarse, countCoarseIterations(history));
+  const refinedDone = Math.min(maxRefined, Math.max(0, iteration - coarseDone));
   const progressPct = Math.max(0, Math.min(100, (iteration / safeMaxIterations) * 100));
   const currentLabel = current ? `#${current.iteration} ${current.phase}` : "-";
-  const bestLabel = best ? `#${best.iteration} penalty ${best.metrics.score.toFixed(3)}` : "-";
+  const bestPenalty = best ? displayPenaltyScore(best) : null;
+  const bestLabel = best ? `#${best.iteration} penalty ${formatMaybeNumber(bestPenalty, 3)}` : "-";
   const resultsSaved = Boolean(
     current?.scope_result && typeof current.scope_result === "object" && "scope_png" in current.scope_result
   ) || Boolean(
@@ -4143,14 +4533,16 @@ function RunStatusPanel({
   );
 
   return (
-    <Panel title="Run Status" icon={<Activity size={17} />}>
+    <>
       <dl className="kv run-status-kv">
         <dt>Backend</dt>
         <dd>{status ? status.state : "connecting"}</dd>
         <dt>Mode</dt>
         <dd>{status?.state === "running" ? "Running" : "Ready"}</dd>
-        <dt>Iter</dt>
-        <dd>{iteration} / {safeMaxIterations}</dd>
+        <dt>Iter Coarse</dt>
+        <dd>{coarseDone} / {maxCoarse}</dd>
+        <dt>Iter Refined</dt>
+        <dd>{refinedDone} / {maxRefined}</dd>
         <dt>Phase</dt>
         <dd>{current?.phase ?? "-"}</dd>
         <dt>Current</dt>
@@ -4164,7 +4556,7 @@ function RunStatusPanel({
         <div style={{ width: `${progressPct}%` }} />
       </div>
       <div className="run-progress-label">{progressPct.toFixed(0)}%</div>
-    </Panel>
+    </>
   );
 }
 
@@ -4180,8 +4572,6 @@ function Metrics({ record }: { record: IterationRecord | null }) {
       <dd>{formatSettlingUs(record.metrics.overshoot_settling_time_s, record.metrics.settling_time_s)}</dd>
       <dt>US settling</dt>
       <dd>{formatSettlingUs(record.metrics.undershoot_settling_time_s, record.metrics.settling_time_s)}</dd>
-      <dt>Oscillations</dt>
-      <dd>{record.metrics.oscillations}</dd>
       <dt>Low-load Vout</dt>
       <dd>{record.metrics.low_load_steady_v === null || record.metrics.low_load_steady_v === undefined ? "--" : `${record.metrics.low_load_steady_v.toFixed(3)} V`}</dd>
       <dt>High-load Vout</dt>
@@ -4193,7 +4583,7 @@ function Metrics({ record }: { record: IterationRecord | null }) {
       <dt>Gain Margin</dt>
       <dd>{record.metrics.gain_margin_db === null || record.metrics.gain_margin_db === undefined ? "--" : `${record.metrics.gain_margin_db.toFixed(2)} dB`}</dd>
       <dt>Penalty</dt>
-      <dd>{record.metrics.score.toFixed(3)}</dd>
+      <dd>{formatMaybeNumber(displayPenaltyScore(record), 3)}</dd>
       <dt>Pass</dt>
       <dd>{record.metrics.passed ? "yes" : "no"}</dd>
       <dt>Reason</dt>
@@ -4219,8 +4609,9 @@ function InductanceReadout({ field }: { field: InductanceField | null }) {
 }
 
 function XdpPidTable({ pid }: { pid: XdpPidReadback | null }) {
-  const fields = pid?.pid_registers?.fields;
-  if (!fields) return <p className="readback">No mod0 PID field readback yet.</p>;
+  const pidFields = pid?.pid_registers?.fields;
+  const currentModeFields = pid?.current_mode_registers?.fields;
+  if (!pidFields && !currentModeFields) return <p className="readback">No mod0 PID field readback yet.</p>;
   return (
     <div className="table-wrap compact-table">
       <table>
@@ -4235,7 +4626,7 @@ function XdpPidTable({ pid }: { pid: XdpPidReadback | null }) {
         </thead>
         <tbody>
           {xdpPidFieldNames.map((name) => {
-            const field = fields[name];
+            const field = pidFields?.[name] ?? currentModeFields?.[name];
             return (
               <tr key={name}>
                 <td>{name}</td>
@@ -4273,6 +4664,7 @@ function IterationTable({
             <th>kd</th>
             <th>p1</th>
             <th>p2</th>
+            <th>cm gain</th>
             <th><span className="table-head-main">Out L</span><span className="table-head-unit">nH</span></th>
             <th><span className="table-head-main">Eff Lc</span><span className="table-head-unit">nH</span></th>
             <th><span className="table-head-main">PM</span><span className="table-head-unit">deg</span></th>
@@ -4300,16 +4692,17 @@ function IterationTable({
               <td>{item.candidate?.mod0_kd ?? "--"}</td>
               <td>{item.candidate?.mod0_kpole1 ?? "--"}</td>
               <td>{item.candidate?.mod0_kpole2 ?? "--"}</td>
+              <td>{item.candidate?.mod0_cm_gain ?? "--"}</td>
               <td>{item.candidate ? item.candidate.output_inductance_nh.toFixed(1) : "--"}</td>
               <td>{item.candidate ? item.candidate.effective_lc_inductance_nh.toFixed(1) : "--"}</td>
               <td>{formatMaybeNumber(item.metrics.phase_margin_deg, 1)}</td>
               <td>{formatMaybeNumber(item.metrics.crossover_frequency_hz === null || item.metrics.crossover_frequency_hz === undefined ? null : item.metrics.crossover_frequency_hz / 1000, 2)}</td>
-              <td>{formatMaybeNumber(item.metrics.gain_margin_db, 1)}</td>
+              <td>{formatMaybeNumber(item.metrics.gain_margin_db, 2)}</td>
               <td>{item.metrics.overshoot_pct.toFixed(2)}</td>
               <td>{item.metrics.undershoot_pct.toFixed(2)}</td>
               <td>{formatSettlingUs(item.metrics.overshoot_settling_time_s, item.metrics.settling_time_s).replace(" us", "")}</td>
               <td>{formatSettlingUs(item.metrics.undershoot_settling_time_s, item.metrics.settling_time_s).replace(" us", "")}</td>
-              <td>{item.metrics.score.toFixed(3)}</td>
+              <td>{formatMaybeNumber(displayPenaltyScore(item), 3)}</td>
             </tr>
           ))}
         </tbody>
@@ -4335,13 +4728,14 @@ function waveformOption(record: IterationRecord | null, target: number) {
 }
 
 function penaltyOption(history: IterationRecord[]) {
+  const plotted = history.map((item) => displayPenaltyScore(item));
   return {
     animation: false,
     tooltip: { trigger: "axis" },
     grid: { left: 48, right: 18, top: 20, bottom: 38 },
     xAxis: { type: "category", data: history.map((item) => item.iteration) },
     yAxis: { type: "value", name: "penalty" },
-    series: [{ name: "Penalty", type: "line", smooth: true, data: history.map((item) => item.metrics.score), areaStyle: {}, lineStyle: { color: "#ea4335" } }]
+    series: [{ name: "Penalty", type: "line", smooth: true, data: plotted, areaStyle: {}, lineStyle: { color: "#ea4335" } }]
   };
 }
 
@@ -4808,6 +5202,74 @@ function updateSearchParameter(
       [field]: value
     }
   }));
+}
+
+function updateSearchIterationBudget(
+  setConfig: React.Dispatch<React.SetStateAction<TuningConfig>>,
+  field: "max_coarse_iterations" | "max_refined_iterations",
+  value: number
+) {
+  setConfig((current) => {
+    const nextSearch = {
+      ...current.search,
+      [field]: value
+    };
+    const maxCoarse = Math.max(1, Math.round(nextSearch.max_coarse_iterations ?? 1));
+    const maxRefined = Math.max(0, Math.round(nextSearch.max_refined_iterations ?? 0));
+    return {
+      ...current,
+      search: {
+        ...nextSearch,
+        max_coarse_iterations: maxCoarse,
+        max_refined_iterations: maxRefined,
+        max_iterations: Math.max(1, maxCoarse + maxRefined)
+      }
+    };
+  });
+}
+
+function searchIterationBudget(search: TuningConfig["search"]) {
+  const maxCoarse = searchCoarseBudget(search);
+  const maxRefined = searchRefinedBudget(search);
+  return Math.max(1, maxCoarse + maxRefined);
+}
+
+function searchCoarseBudget(search: TuningConfig["search"]) {
+  return Math.max(1, Math.round(search.max_coarse_iterations ?? Math.max(1, Math.round((search.max_iterations ?? 40) / 2))));
+}
+
+function searchRefinedBudget(search: TuningConfig["search"]) {
+  const maxCoarse = searchCoarseBudget(search);
+  return Math.max(0, Math.round(search.max_refined_iterations ?? Math.max(0, (search.max_iterations ?? 40) - maxCoarse)));
+}
+
+function countCoarseIterations(history: IterationRecord[]) {
+  return history.filter((item) => isCoarsePhase(item.phase)).length;
+}
+
+function isCoarsePhase(phase: string | undefined) {
+  const value = (phase ?? "").toLowerCase();
+  return value === "baseline" || value === "coordinate" || value.includes("coarse");
+}
+
+function displayPenaltyScore(record: IterationRecord) {
+  const reasons = (record.metrics.pass_reasons ?? []).join(" ").toLowerCase();
+  if (reasons.includes("invalid bode") || reasons.includes("duplicate 0 db crossover") || reasons.includes("second 0 db crossover")) {
+    return 250;
+  }
+  if (reasons.includes("protection skipped") || reasons.includes("transient protection skipped")) {
+    return 300;
+  }
+  const scope = record.scope_result ?? {};
+  const scopeError = String(scope.error ?? "").toLowerCase();
+  if (scope.skipped || scopeError.includes("protection") || scopeError.includes("trip")) {
+    return 300;
+  }
+  const score = Number(record.metrics.score);
+  if (Number.isFinite(score) && score >= 1e6) {
+    return 300;
+  }
+  return Number.isFinite(score) ? score : null;
 }
 
 function formatSci(value: number | undefined) {

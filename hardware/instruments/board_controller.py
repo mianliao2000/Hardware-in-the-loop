@@ -46,6 +46,14 @@ XDPE_MOD0_PID_FIELDS = {
     "mod0_kpole1": (24, 4),
     "mod0_kpole2": (28, 4),
 }
+XDPE_MOD0_CM_GAIN_ADDRESS = 0x70006004
+XDPE_MOD0_CURRENT_MODE_FIELDS = {
+    "mod0_cm_gain": (0, 7),
+    "mod0_cm_pole": (7, 5),
+    "mod0_cm_gain_fatr": (12, 7),
+    "mod0_cm_pole_fatr": (19, 5),
+}
+XDPE_MOD0_CURRENT_MODE_WRITABLE_FIELDS = {"mod0_cm_gain"}
 XDPE_XV_EN_ADDRESS = 0x2005D8E0
 XDPE_XV_EN_VREN_START = 4
 XDPE_XV_EN_VREN_LENGTH = 2
@@ -325,6 +333,64 @@ class BoardController:
         return {
             "name": "modulator.mod0_pid",
             "memory_address": f"0x{XDPE_MOD0_PID_ADDRESS:08X}",
+            "word_before": f"0x{before:08X}",
+            "word_after": f"0x{after:08X}",
+            "changed": before != after,
+            "writes": writes,
+            "readback": readback,
+        }
+
+    def read_mod0_current_mode_registers(self, page: int = 0) -> dict:
+        self._require_loop_a_register(page, "mod0 current-mode registers")
+        word = self._read_xdpe_ahb_word(XDPE_MOD0_CM_GAIN_ADDRESS)
+        fields = {}
+        for name, (start, length) in XDPE_MOD0_CURRENT_MODE_FIELDS.items():
+            raw = _extract_bits(word, start, length)
+            fields[name] = _xdp_register_field_result(
+                name=name,
+                address=XDPE_MOD0_CM_GAIN_ADDRESS,
+                start=start,
+                length=length,
+                word=word,
+                raw=raw,
+            )
+        return {
+            "name": "modulator.mod0_current_mode",
+            "memory_address": f"0x{XDPE_MOD0_CM_GAIN_ADDRESS:08X}",
+            "word": f"0x{word:08X}",
+            "fields": fields,
+        }
+
+    def set_mod0_current_mode_registers(self, values: dict[str, int], page: int = 0) -> dict:
+        self._require_loop_a_register(page, "mod0 current-mode registers")
+        unknown = sorted(set(values) - XDPE_MOD0_CURRENT_MODE_WRITABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"Unsupported mod0 current-mode field(s): {', '.join(unknown)}")
+        before = self._read_xdpe_ahb_word(XDPE_MOD0_CM_GAIN_ADDRESS)
+        after = before
+        writes = {}
+        for name, value in values.items():
+            start, length = XDPE_MOD0_CURRENT_MODE_FIELDS[name]
+            raw = int(value)
+            max_field = (1 << length) - 1
+            if not 0 <= raw <= max_field:
+                raise ValueError(f"{name} value {raw} does not fit in {length} bits.")
+            mask = max_field << start
+            after = (after & ~mask) | ((raw & max_field) << start)
+            writes[name] = _xdp_register_field_result(
+                name=name,
+                address=XDPE_MOD0_CM_GAIN_ADDRESS,
+                start=start,
+                length=length,
+                word=after,
+                raw=raw,
+            )
+        if after != before:
+            self._write_xdpe_ahb_word(XDPE_MOD0_CM_GAIN_ADDRESS, after)
+        readback = self.read_mod0_current_mode_registers(page)
+        return {
+            "name": "modulator.mod0_current_mode",
+            "memory_address": f"0x{XDPE_MOD0_CM_GAIN_ADDRESS:08X}",
             "word_before": f"0x{before:08X}",
             "word_after": f"0x{after:08X}",
             "changed": before != after,

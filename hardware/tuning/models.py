@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Literal
 
 
@@ -13,6 +13,7 @@ HARDWARE_TUNING_FIELD_NAMES = (
     "mod0_kd",
     "mod0_kpole1",
     "mod0_kpole2",
+    "mod0_cm_gain",
     "output_inductance_nh",
     "effective_lc_inductance_nh",
 )
@@ -40,7 +41,7 @@ class TuningTargets:
     vout_target_v: float = 0.9296875
     overshoot_pct: float = 3.0
     undershoot_pct: float = 3.0
-    settling_time_s: float = 4e-6
+    settling_time_s: float = 1e-6
     oscillations: int = 0
     phase_margin_deg: float = 45.0
     crossover_frequency_hz: float = 200_000.0
@@ -68,6 +69,7 @@ class HardwarePidCandidate:
     mod0_kd: int = 175
     mod0_kpole1: int = 3
     mod0_kpole2: int = 3
+    mod0_cm_gain: int = 2
     output_inductance_nh: float = 100.024
     effective_lc_inductance_nh: float = 369.276
     phase: str = "baseline"
@@ -81,6 +83,11 @@ class HardwarePidCandidate:
             "mod0_kpole2": int(self.mod0_kpole2),
         }
 
+    def current_mode_values(self) -> dict[str, int]:
+        return {
+            "mod0_cm_gain": int(self.mod0_cm_gain),
+        }
+
 
 @dataclass(frozen=True)
 class SearchSpace:
@@ -91,13 +98,25 @@ class SearchSpace:
     initial_wc_rad_s: float = 157_080.0
     initial_phi_deg: float = 60.0
     max_iterations: int = 40
-    mod0_kp: SearchParameter = field(default_factory=lambda: SearchParameter(165, 141, 189, 8, 7))
-    mod0_ki: SearchParameter = field(default_factory=lambda: SearchParameter(220, 196, 244, 8, 7))
-    mod0_kd: SearchParameter = field(default_factory=lambda: SearchParameter(175, 151, 199, 8, 7))
-    mod0_kpole1: SearchParameter = field(default_factory=lambda: SearchParameter(3, 1, 5, 1, 5))
-    mod0_kpole2: SearchParameter = field(default_factory=lambda: SearchParameter(3, 1, 5, 1, 5))
-    output_inductance_nh: SearchParameter = field(default_factory=lambda: SearchParameter(100.024, 80.019, 120.029, 5, 9))
-    effective_lc_inductance_nh: SearchParameter = field(default_factory=lambda: SearchParameter(369.276, 295.421, 443.131, 10, 9))
+    max_coarse_iterations: int = 20
+    max_refined_iterations: int = 20
+    mod0_kp: SearchParameter = field(default_factory=lambda: SearchParameter(165, 100, 255, 19.375, 9))
+    mod0_ki: SearchParameter = field(default_factory=lambda: SearchParameter(220, 150, 255, 13.125, 9))
+    mod0_kd: SearchParameter = field(default_factory=lambda: SearchParameter(175, 100, 200, 12.5, 9))
+    mod0_kpole1: SearchParameter = field(default_factory=lambda: SearchParameter(3, 3, 6, 3, 2))
+    mod0_kpole2: SearchParameter = field(default_factory=lambda: SearchParameter(3, 3, 6, 3, 2))
+    mod0_cm_gain: SearchParameter = field(default_factory=lambda: SearchParameter(2, 2, 2, 1, 1))
+    output_inductance_nh: SearchParameter = field(default_factory=lambda: SearchParameter(100.024, 80.019, 120.029, 10.0025, 5))
+    effective_lc_inductance_nh: SearchParameter = field(default_factory=lambda: SearchParameter(369.276, 295.421, 443.131, 36.9275, 5))
+
+    def total_iteration_budget(self) -> int:
+        return max(1, int(self.max_coarse_iterations) + int(self.max_refined_iterations))
+
+    def coarse_iteration_budget(self) -> int:
+        return max(1, int(self.max_coarse_iterations))
+
+    def refined_iteration_budget(self) -> int:
+        return max(0, int(self.max_refined_iterations))
 
 
 @dataclass(frozen=True)
@@ -146,6 +165,7 @@ class AutotuneExperimentConfig:
     vout_tolerance_v: float = 0.15
     response_abs_limit_v: float = 0.25
     async_artifacts: bool = False
+    ignore_pass_until_max_iterations: bool = True
 
 
 @dataclass(frozen=True)
@@ -193,8 +213,8 @@ class TuningRunSnapshot:
 def to_jsonable(value: Any) -> Any:
     """Convert nested tuning dataclasses into JSON-safe primitives."""
 
-    if hasattr(value, "__dataclass_fields__"):
-        return {key: to_jsonable(item) for key, item in asdict(value).items()}
+    if is_dataclass(value):
+        return {item.name: to_jsonable(getattr(value, item.name)) for item in fields(value)}
     if isinstance(value, list):
         return [to_jsonable(item) for item in value]
     if isinstance(value, tuple):

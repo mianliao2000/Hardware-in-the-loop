@@ -1,4 +1,4 @@
-import type { AutotuneArchiveResponse, AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceReadback, InstrumentKey, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
+import type { AutotuneArchiveResponse, AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceReadback, InstrumentKey, LlmChatMessage, LlmChatResponse, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -88,6 +88,20 @@ export function saveTuningAnimationGif(run_id?: string, kind?: string, duration_
   return requestJson<AutotuneGifResponse>("/api/tuning/gif", {
     method: "POST",
     body: JSON.stringify({ run_id, kind, duration_ms })
+  });
+}
+
+export function openTuningAnimationGif(run_id?: string, kind?: string, duration_ms?: number): Promise<AutotuneGifResponse> {
+  return requestJson<AutotuneGifResponse>("/api/tuning/gif/open", {
+    method: "POST",
+    body: JSON.stringify({ run_id, kind, duration_ms })
+  });
+}
+
+export function sendLlmChat(messages: LlmChatMessage[], context?: Record<string, unknown>): Promise<LlmChatResponse> {
+  return requestJson<LlmChatResponse>("/api/llm/chat", {
+    method: "POST",
+    body: JSON.stringify({ messages, context })
   });
 }
 

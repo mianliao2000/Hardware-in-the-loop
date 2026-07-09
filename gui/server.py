@@ -7,14 +7,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import argparse
 import copy
 import json
+import math
 import mimetypes
+import os
 from pathlib import Path
 import shutil
 import sys
 import threading
 import time
+from urllib import error as urllib_error
 from urllib.parse import parse_qs, urlparse
+from urllib import request as urllib_request
 import uuid
+import re
 
 import numpy as np
 
@@ -23,6 +28,23 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_ADDRESS = "0x5E"
 DEFAULT_PAGE = 0
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(ROOT / ".env")
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -50,6 +72,7 @@ from hardware.tuning import (
     PidAutotuneSession,
     PlantParams,
     ResponseAnalyzer,
+    ResponseMetrics,
     SearchSpace,
     SearchParameter,
     TuningConfig,
@@ -62,6 +85,8 @@ DEVICE_LOCK = threading.Lock()
 ARTIFACT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="autotune-artifact")
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 SCOPE_CONNECTIONS: dict[str, TektronixOscilloscope] = {}
+BODE_CONNECTIONS: dict[str, dict[str, object]] = {}
+BODE_CONNECTION_LOCK = threading.Lock()
 SCOPE_CAPTURE_DIR = ROOT / "data" / "scope_captures"
 BODE_SWEEP_DIR = ROOT / "data" / "bode_sweeps"
 RESULTS_DIR = ROOT / "results"
@@ -96,6 +121,75 @@ DEFAULT_SCOPE_AXIS_SETTINGS = {
 class ServerHardwareExperimentRunner:
     """Run one real hardware tuning candidate through the existing bench APIs."""
 
+    def recover_after_transient_protection(self, experiment: AutotuneExperimentConfig) -> dict:
+        started = time.perf_counter()
+        steps: list[dict] = []
+
+        def run_step(name: str, action) -> dict:
+            step_started = time.perf_counter()
+            result = action()
+            if isinstance(result, dict):
+                step = dict(result)
+            else:
+                step = {"ok": False, "error": "Recovery action returned a non-dict result."}
+            step["name"] = name
+            step["duration_s"] = round(time.perf_counter() - step_started, 3)
+            steps.append(step)
+            return step
+
+        try:
+            run_step(
+                "pmbus_output_disable",
+                lambda: _set_pmbus_output(
+                    address=experiment.board_address,
+                    page=experiment.board_page,
+                    adapter_kind=experiment.board_adapter,
+                    action="disable",
+                ),
+            )
+            run_step(
+                "xdp_output_disable",
+                lambda: _set_xdp_output(
+                    address=experiment.board_address,
+                    page=experiment.board_page,
+                    adapter_kind=experiment.board_adapter,
+                    action="disable",
+                ),
+            )
+            time.sleep(0.25)
+            run_step(
+                "pmbus_output_enable",
+                lambda: _set_pmbus_output(
+                    address=experiment.board_address,
+                    page=experiment.board_page,
+                    adapter_kind=experiment.board_adapter,
+                    action="enable",
+                ),
+            )
+            run_step(
+                "xdp_output_enable",
+                lambda: _set_xdp_output(
+                    address=experiment.board_address,
+                    page=experiment.board_page,
+                    adapter_kind=experiment.board_adapter,
+                    action="enable",
+                ),
+            )
+            failed = [step for step in steps if not step.get("ok")]
+            return {
+                "ok": not failed,
+                "error": "; ".join(str(step.get("error")) for step in failed if step.get("error")) or None,
+                "steps": steps,
+                "duration_s": round(time.perf_counter() - started, 3),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "steps": steps,
+                "duration_s": round(time.perf_counter() - started, 3),
+            }
+
     def evaluate(
         self,
         candidate: HardwarePidCandidate,
@@ -121,7 +215,9 @@ class ServerHardwareExperimentRunner:
         bode_result: dict[str, object] = {}
         scope_result: dict[str, object] = {}
         waveform: Waveform | None = None
-        async_artifacts = bool(getattr(experiment, "async_artifacts", False))
+        # Keep hardware auto-tune strictly serial: data saving, PNG rendering,
+        # metrics, and persistence all finish before the next candidate starts.
+        async_artifacts = False
         afg_enabled = False
         fg_config = dict(experiment.function_generator_config)
         fg_resource = str(fg_config.get("resource", DEFAULT_AFG_RESOURCE))
@@ -147,11 +243,13 @@ class ServerHardwareExperimentRunner:
                     f"Vout safety check failed: read {read_vout:.4f} V, target {config.targets.vout_target_v:.4f} V."
                 )
 
+            pid_values = candidate.pid_values()
+            pid_values.update(candidate.current_mode_values())
             pid_write = _set_xdp_pid(
                 address=experiment.board_address,
                 page=experiment.board_page,
                 adapter_kind=experiment.board_adapter,
-                values=candidate.pid_values(),
+                values=pid_values,
             )
             write_results["xdp_pid"] = pid_write
             mark_stage("write_pid")
@@ -172,6 +270,8 @@ class ServerHardwareExperimentRunner:
 
             if experiment.enable_bode_analysis:
                 bode_cfg = dict(experiment.bode_config)
+                source_vpp = _optional_bode_source_vpp(bode_cfg, default=0.1)
+                source_dbm = _optional_bode_source_dbm(bode_cfg)
                 bode_result = _run_bode_sweep(
                     host=str(bode_cfg.get("host", "127.0.0.1")),
                     port=int(bode_cfg.get("port", 5025)),
@@ -179,9 +279,11 @@ class ServerHardwareExperimentRunner:
                     stop_hz=float(bode_cfg.get("stop_hz", 1_000_000.0)),
                     points=int(bode_cfg.get("points", 201)),
                     bandwidth_hz=float(bode_cfg.get("bandwidth_hz", 300.0)),
-                    source_dbm=None if bode_cfg.get("source_dbm") is None else float(bode_cfg.get("source_dbm", 0.0)),
+                    source_vpp=source_vpp,
+                    source_dbm=source_dbm,
                     timeout_ms=int(bode_cfg.get("timeout_ms", 60000)),
                     async_artifacts=async_artifacts,
+                    reuse_session=True,
                 )
                 mark_stage("bode_sweep")
                 if not bode_result.get("ok"):
@@ -261,15 +363,17 @@ class AutotuneRunStore:
         self.recent_limit = recent_limit
         self._lock = threading.RLock()
         self._current_run_id: str | None = None
+        self._current_run_kind: str | None = None
         self._persisted_iterations = 0
 
     def start_new(self, status: dict | None = None) -> dict:
         with self._lock:
             self.recent_dir.mkdir(parents=True, exist_ok=True)
-            run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-            run_dir = self.recent_dir / run_id
+            run_dir = self._next_friendly_run_dir("recent")
+            run_id = run_dir.name
             (run_dir / "files").mkdir(parents=True, exist_ok=True)
             self._current_run_id = run_id
+            self._current_run_kind = "recent"
             self._persisted_iterations = 0
             initial_status = copy.deepcopy(status) if isinstance(status, dict) else {}
             initial_status["run"] = self._run_payload(run_id, "recent", run_dir)
@@ -290,31 +394,82 @@ class AutotuneRunStore:
             run_id = self._current_run_id
             if run_id is None:
                 return next_status
-            run_dir = self.recent_dir / run_id
+            run_kind = self._current_run_kind or "recent"
+            run_dir = (self.saved_dir if run_kind == "saved" else self.recent_dir) / run_id
             (run_dir / "files").mkdir(parents=True, exist_ok=True)
-            next_status["run"] = self._run_payload(run_id, "recent", run_dir)
+            next_status["run"] = self._run_payload(run_id, run_kind, run_dir)
             axis_settings = _scope_axis_settings_from_status(next_status)
-            for record in history:
-                if isinstance(record, dict):
-                    self._copy_record_assets(record, run_dir, scope_axis_settings=axis_settings)
+            previous_status = self._read_json(run_dir / "run_status.json") or {}
+            previous_history = previous_status.get("history")
+            if not isinstance(previous_history, list):
+                previous_history = []
+            previous_by_iteration: dict[int, dict] = {}
+            for old_record in previous_history:
+                if not isinstance(old_record, dict):
+                    continue
+                try:
+                    old_iteration = int(old_record.get("iteration") or 0)
+                except (TypeError, ValueError):
+                    old_iteration = 0
+                if old_iteration > 0:
+                    previous_by_iteration[old_iteration] = old_record
+
+            persisted_cutoff = min(self._persisted_iterations, len(history))
+            merged_history: list[dict] = []
+            new_records_for_log: list[dict] = []
+            for index, record in enumerate(history):
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    iteration = int(record.get("iteration") or index + 1)
+                except (TypeError, ValueError):
+                    iteration = index + 1
+                if index < persisted_cutoff and iteration in previous_by_iteration:
+                    merged_history.append(copy.deepcopy(previous_by_iteration[iteration]))
+                    continue
+                self._copy_record_assets(record, run_dir, scope_axis_settings=axis_settings)
+                merged_history.append(record)
+                if index >= self._persisted_iterations:
+                    new_records_for_log.append(record)
+            next_status["history"] = merged_history
+
+            history_by_iteration: dict[int, dict] = {}
+            for record in merged_history:
+                try:
+                    iteration = int(record.get("iteration") or 0)
+                except (TypeError, ValueError):
+                    iteration = 0
+                if iteration > 0:
+                    history_by_iteration[iteration] = record
             for key in ("current", "best"):
                 record = next_status.get(key)
-                if isinstance(record, dict):
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    iteration = int(record.get("iteration") or 0)
+                except (TypeError, ValueError):
+                    iteration = 0
+                if iteration in history_by_iteration:
+                    next_status[key] = history_by_iteration[iteration]
+                else:
                     self._copy_record_assets(record, run_dir, scope_axis_settings=axis_settings)
-            if len(history) > self._persisted_iterations:
+
+            if new_records_for_log:
                 with (run_dir / "iterations.jsonl").open("a", encoding="utf-8") as handle:
-                    for record in history[self._persisted_iterations :]:
+                    for record in new_records_for_log:
                         handle.write(json.dumps(record, indent=None, ensure_ascii=False) + "\n")
                 self._persisted_iterations = len(history)
             self._write_json(run_dir / "run_status.json", next_status)
             self._write_summary(run_dir, next_status)
             self._auto_save_completion_gif(run_dir, next_status)
-            self._enforce_recent_limit()
+            if run_kind == "recent":
+                self._enforce_recent_limit()
             return next_status
 
     def stop_current(self) -> None:
         with self._lock:
             self._current_run_id = None
+            self._current_run_kind = None
             self._persisted_iterations = 0
 
     def archive_current(self, name: str | None = None) -> dict:
@@ -324,24 +479,51 @@ class AutotuneRunStore:
                 self.persist_status(status)
             if self._current_run_id is None:
                 raise RuntimeError("No auto-tune run is available to save.")
-            source = self.recent_dir / self._current_run_id
+            source_kind = self._current_run_kind or "recent"
+            source = (self.saved_dir if source_kind == "saved" else self.recent_dir) / self._current_run_id
             if not source.exists():
                 raise RuntimeError("Current auto-tune result folder does not exist yet.")
-            safe_name = _safe_file_stem(name or self._current_run_id)
-            target = self.saved_dir / safe_name
-            if target.exists():
-                target = self.saved_dir / f"{safe_name}_{uuid.uuid4().hex[:6]}"
+            if source_kind == "saved":
+                status = self._read_json(source / "run_status.json")
+                if isinstance(status, dict):
+                    status = copy.deepcopy(status)
+                    status["run"] = self._run_payload(source.name, "saved", source)
+                    self._write_json(source / "run_status.json", status)
+                    self._write_summary(source, status)
+                summary = self._read_json(source / "summary.json") or {}
+                summary.update({
+                    "run_id": source.name,
+                    "display_name": self._display_name_for_run(source.name, "saved"),
+                    "kind": "saved",
+                    "archived_at": summary.get("archived_at") or time.time(),
+                    "path": _path_label(source),
+                })
+                self._write_json(source / "summary.json", summary)
+                return {"ok": True, "saved_run": summary}
             self.saved_dir.mkdir(parents=True, exist_ok=True)
+            target = self._next_friendly_run_dir("saved", name)
             shutil.copytree(source, target)
+            status = self._read_json(target / "run_status.json")
+            if isinstance(status, dict):
+                self._repair_run_status_artifact_paths(target, status)
+                status["run"] = self._run_payload(target.name, "saved", target)
+                self._write_json(target / "run_status.json", status)
+                self._write_summary(target, status)
             summary = self._read_json(target / "summary.json") or {}
             summary.update({
                 "run_id": target.name,
+                "display_name": self._display_name_for_run(target.name, "saved"),
                 "source_run_id": self._current_run_id,
                 "kind": "saved",
                 "archived_at": time.time(),
                 "path": _path_label(target),
             })
             self._write_json(target / "summary.json", summary)
+            shutil.rmtree(source, ignore_errors=True)
+            self._current_run_id = target.name
+            self._current_run_kind = "saved"
+            if isinstance(status, dict) and isinstance(status.get("history"), list):
+                self._persisted_iterations = len(status["history"])
             return {"ok": True, "saved_run": summary}
 
     def archive_run(self, run_id: str, kind: str = "recent", name: str | None = None) -> dict:
@@ -352,18 +534,28 @@ class AutotuneRunStore:
             status = self._read_json(source / "run_status.json")
             if not isinstance(status, dict):
                 raise RuntimeError(f"No saved status was found for run '{run_id}'.")
-            safe_name = _safe_file_stem(name or run_id)
-            target = self.saved_dir / safe_name
-            if target.exists():
-                target = self.saved_dir / f"{safe_name}_{uuid.uuid4().hex[:6]}"
+            if kind == "saved":
+                summary = self._read_json(source / "summary.json") or {}
+                summary.update({
+                    "run_id": source.name,
+                    "display_name": self._display_name_for_run(source.name, "saved"),
+                    "kind": "saved",
+                    "archived_at": summary.get("archived_at") or time.time(),
+                    "path": _path_label(source),
+                })
+                self._write_json(source / "summary.json", summary)
+                return {"ok": True, "saved_run": summary}
             self.saved_dir.mkdir(parents=True, exist_ok=True)
+            target = self._next_friendly_run_dir("saved", name)
             shutil.copytree(source, target)
+            self._repair_run_status_artifact_paths(target, status)
             status["run"] = self._run_payload(target.name, "saved", target)
             self._write_json(target / "run_status.json", status)
             self._write_summary(target, status)
             summary = self._read_json(target / "summary.json") or {}
             summary.update({
                 "run_id": target.name,
+                "display_name": self._display_name_for_run(target.name, "saved"),
                 "source_run_id": run_id,
                 "source_kind": kind,
                 "kind": "saved",
@@ -371,12 +563,17 @@ class AutotuneRunStore:
                 "path": _path_label(target),
             })
             self._write_json(target / "summary.json", summary)
+            shutil.rmtree(source, ignore_errors=True)
+            if run_id == self._current_run_id and (self._current_run_kind or "recent") == "recent":
+                self._current_run_id = target.name
+                self._current_run_kind = "saved"
+                self._persisted_iterations = len(status.get("history") if isinstance(status.get("history"), list) else [])
             return {"ok": True, "saved_run": summary}
 
     def delete_run(self, run_id: str, kind: str = "recent") -> dict:
         with self._lock:
             run_dir = self._run_dir(kind, run_id)
-            if kind == "recent" and run_dir.name == self._current_run_id:
+            if run_dir.name == self._current_run_id and kind == (self._current_run_kind or "recent"):
                 self.stop_current()
             shutil.rmtree(run_dir, ignore_errors=True)
             return {"ok": True, "deleted_run_id": run_id, "kind": kind}
@@ -386,6 +583,7 @@ class AutotuneRunStore:
             return {
                 "ok": True,
                 "current_run_id": self._current_run_id,
+                "current_run_kind": self._current_run_kind,
                 "recent": self._list_kind(self.recent_dir, "recent"),
                 "saved": self._list_kind(self.saved_dir, "saved"),
             }
@@ -396,14 +594,18 @@ class AutotuneRunStore:
             status = self._read_json(run_dir / "run_status.json")
             if not isinstance(status, dict):
                 raise RuntimeError(f"No saved status was found for run '{run_id}'.")
+            status = copy.deepcopy(status)
+            repaired = self._repair_run_status_artifact_paths(run_dir, status)
             saved_state = str(status.get("state") or "")
             if saved_state in {"running", "paused"}:
-                status = copy.deepcopy(status)
                 status["loaded_state"] = saved_state
                 status["state"] = "stopped"
                 status["can_resume_saved_run"] = True
                 status["message"] = "Loaded saved result snapshot. Press Resume to continue from the next candidate, or load another result."
             status["run"] = self._run_payload(run_dir.name, kind, run_dir)
+            if repaired:
+                self._write_json(run_dir / "run_status.json", status)
+                self._write_summary(run_dir, status)
             return {"ok": True, **status}
 
     def resume_run(self, run_id: str, kind: str = "recent") -> dict:
@@ -414,21 +616,18 @@ class AutotuneRunStore:
                 raise RuntimeError(f"No saved status was found for run '{run_id}'.")
             if str(status.get("state") or "") == "complete":
                 raise RuntimeError("Selected auto-tune result is already complete.")
-            if kind == "saved":
-                self.recent_dir.mkdir(parents=True, exist_ok=True)
-                target = self.recent_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_resume_{uuid.uuid4().hex[:6]}"
-                shutil.copytree(source, target)
-                run_dir = target
-            else:
-                run_dir = source
+            run_kind = "saved" if kind == "saved" else "recent"
+            run_dir = source
             self._current_run_id = run_dir.name
+            self._current_run_kind = run_kind
             self._persisted_iterations = len(status.get("history") if isinstance(status.get("history"), list) else [])
             status = copy.deepcopy(status)
-            status["run"] = self._run_payload(run_dir.name, "recent", run_dir)
+            status["run"] = self._run_payload(run_dir.name, run_kind, run_dir)
             restored = TUNING_SESSION.restore(status)
             resumed = TUNING_SESSION.resume()
             resumed = self.persist_status(resumed)
-            self._enforce_recent_limit()
+            if run_kind == "recent":
+                self._enforce_recent_limit()
             return {"ok": True, "restored": restored, **resumed}
 
     def save_animation_gif(self, run_id: str | None = None, kind: str = "recent", duration_ms: int = 100) -> dict:
@@ -438,7 +637,7 @@ class AutotuneRunStore:
                     status = TUNING_SESSION.status()
                     self.persist_status(status)
                 run_id = self._current_run_id
-                kind = "recent"
+                kind = self._current_run_kind or "recent"
             if run_id is None:
                 raise RuntimeError("No auto-tune run is available for GIF export.")
             run_dir = self._run_dir(kind, run_id)
@@ -449,8 +648,15 @@ class AutotuneRunStore:
             output_dir = run_dir / "animations"
             output_dir.mkdir(parents=True, exist_ok=True)
             duration_ms = max(50, min(5000, int(duration_ms)))
-            combined = self._make_combined_gif(history, target=output_dir / "combined_response_bode.gif", duration_ms=duration_ms)
+            combined = self._make_combined_gif(
+                history,
+                target=output_dir / "combined_response_bode.gif",
+                duration_ms=duration_ms,
+                scope_axis_settings=_scope_axis_settings_from_status(status),
+            )
             generated_at = time.time()
+            if combined is None:
+                raise RuntimeError("No GIF frames were generated. This run may not contain scope or Bode images.")
             return {
                 "ok": True,
                 "run_id": run_id,
@@ -463,6 +669,49 @@ class AutotuneRunStore:
                 "bode_gif": None,
             }
 
+    def open_animation_gif(self, run_id: str | None = None, kind: str = "recent", duration_ms: int = 100) -> dict:
+        with self._lock:
+            if run_id is None:
+                if self._current_run_id is None:
+                    status = TUNING_SESSION.status()
+                    self.persist_status(status)
+                run_id = self._current_run_id
+                kind = self._current_run_kind or "recent"
+            if run_id is None:
+                raise RuntimeError("No auto-tune run is available for GIF export.")
+            run_dir = self._run_dir(kind, run_id)
+            output_dir = run_dir / "animations"
+            gif_path = output_dir / "combined_response_bode.gif"
+            existing_gif = gif_path.exists()
+
+        if existing_gif:
+            result = {
+                "ok": True,
+                "run_id": run_id,
+                "kind": kind,
+                "generated_at": gif_path.stat().st_mtime,
+                "duration_ms": max(50, min(5000, int(duration_ms))),
+                "animation_dir": str(output_dir.relative_to(ROOT)).replace("\\", "/"),
+                "combined_gif": _scope_png_public_path(gif_path),
+                "transient_gif": None,
+                "bode_gif": None,
+                "used_existing": True,
+            }
+        else:
+            result = self.save_animation_gif(run_id, kind, duration_ms)
+            gif_public_path = result.get("combined_gif") or result.get("transient_gif") or result.get("bode_gif")
+            resolved = _path_from_result_reference(gif_public_path)
+            if resolved is None:
+                raise RuntimeError("GIF was generated, but the GIF file could not be found.")
+            gif_path = resolved
+            result["used_existing"] = False
+        if not gif_path.exists():
+            raise RuntimeError("GIF file could not be found.")
+        os.startfile(str(gif_path))
+        result["opened"] = True
+        result["opened_path"] = str(gif_path.relative_to(ROOT)).replace("\\", "/")
+        return result
+
     def _auto_save_completion_gif(self, run_dir: Path, status: dict) -> None:
         if status.get("state") != "complete":
             return
@@ -474,7 +723,7 @@ class AutotuneRunStore:
         if target.exists():
             return
         output_dir.mkdir(parents=True, exist_ok=True)
-        self._make_combined_gif(history, target=target)
+        self._make_combined_gif(history, target=target, scope_axis_settings=_scope_axis_settings_from_status(status))
 
     def rebuild_all_run_images(self) -> dict:
         """Rebuild stored run PNG/GIF artifacts from saved numeric data."""
@@ -517,7 +766,12 @@ class AutotuneRunStore:
                     if history:
                         output_dir = run_dir / "animations"
                         output_dir.mkdir(parents=True, exist_ok=True)
-                        if self._make_combined_gif(history, target=output_dir / "combined_response_bode.gif", duration_ms=100):
+                        if self._make_combined_gif(
+                            history,
+                            target=output_dir / "combined_response_bode.gif",
+                            duration_ms=100,
+                            scope_axis_settings=axis_settings,
+                        ):
                             changed = True
                     if changed:
                         self._write_json(run_dir / "run_status.json", status)
@@ -562,30 +816,98 @@ class AutotuneRunStore:
                 frame.close()
         return target
 
-    def _make_combined_gif(self, history: list, *, target: Path, duration_ms: int = 100) -> Path | None:
+    def _make_combined_gif(
+        self,
+        history: list,
+        *,
+        target: Path,
+        duration_ms: int = 100,
+        scope_axis_settings: dict | None = None,
+    ) -> Path | None:
         from PIL import Image
 
         frames: list[Image.Image] = []
+        trend_records = self._penalty_trend_records(history)
+        target.parent.mkdir(parents=True, exist_ok=True)
         try:
             for record in history:
                 if not isinstance(record, dict):
                     continue
-                scope_path = _path_from_result_reference((record.get("scope_result") or {}).get("scope_png") if isinstance(record.get("scope_result"), dict) else None)
-                bode_path = _path_from_result_reference((record.get("bode_result") or {}).get("bode_png") if isinstance(record.get("bode_result"), dict) else None)
-                if not scope_path or not bode_path or not scope_path.exists() or not bode_path.exists():
+                if self._record_is_skipped_trip(record) or self._record_is_invalid_bode(record):
                     continue
-                with Image.open(scope_path) as scope_image, Image.open(bode_path) as bode_image:
-                    scope = scope_image.convert("RGB")
-                    bode = bode_image.convert("RGB")
-                    width = max(scope.width, bode.width)
-                    if scope.width != width:
-                        scope = scope.resize((width, max(1, round(scope.height * width / scope.width))))
-                    if bode.width != width:
-                        bode = bode.resize((width, max(1, round(bode.height * width / bode.width))))
-                    combined = Image.new("RGB", (width, scope.height + bode.height), "white")
-                    combined.paste(scope, (0, 0))
-                    combined.paste(bode, (0, scope.height))
+                scope_result = record.get("scope_result") if isinstance(record.get("scope_result"), dict) else None
+                bode_result = record.get("bode_result") if isinstance(record.get("bode_result"), dict) else None
+                scope_path = _path_from_result_reference(scope_result.get("scope_png")) if isinstance(scope_result, dict) else None
+                bode_path = _path_from_result_reference(bode_result.get("bode_png")) if isinstance(bode_result, dict) else None
+                has_scope = (scope_path is not None and scope_path.exists()) or isinstance(scope_result, dict)
+                bode_data_file = _path_from_result_reference(bode_result.get("data_file")) if isinstance(bode_result, dict) else None
+                has_bode = (
+                    (bode_path is not None and bode_path.exists())
+                    or (bode_data_file is not None and bode_data_file.exists())
+                )
+                if not has_scope and not has_bode:
+                    continue
+                try:
+                    width = self._gif_frame_width(scope_path, bode_path)
+                    height = max(900, min(1400, round(width * 0.58)))
+                    combined = Image.new("RGB", (width, height), "white")
+                    if has_scope and has_bode:
+                        left_width = max(1, round(width * 0.58))
+                        right_width = max(1, width - left_width)
+                        top_height = max(1, round(height * 0.55))
+                        bottom_height = max(1, height - top_height)
+                        scope = self._render_scope_for_gif(
+                            scope_result,
+                            scope_path,
+                            right_width,
+                            top_height,
+                            scope_axis_settings,
+                            target.parent,
+                            int(record.get("iteration") or 0),
+                        )
+                        bode = self._render_bode_for_gif(
+                            bode_result,
+                            bode_path,
+                            left_width,
+                            height,
+                            target.parent,
+                            int(record.get("iteration") or 0),
+                        )
+                        trend = self._make_penalty_trend_frame(trend_records, record, right_width, bottom_height)
+                        combined.paste(bode, (0, 0))
+                        combined.paste(scope, (left_width, 0))
+                        combined.paste(trend, (left_width, top_height))
+                        bode.close()
+                        scope.close()
+                    else:
+                        plot_height = max(1, round(height * 0.68))
+                        trend_height = max(1, height - plot_height)
+                        if has_scope:
+                            plot = self._render_scope_for_gif(
+                                scope_result,
+                                scope_path,
+                                width,
+                                plot_height,
+                                scope_axis_settings,
+                                target.parent,
+                                int(record.get("iteration") or 0),
+                            )
+                        else:
+                            plot = self._render_bode_for_gif(
+                                bode_result,
+                                bode_path,
+                                width,
+                                plot_height,
+                                target.parent,
+                                int(record.get("iteration") or 0),
+                            )
+                        trend = self._make_penalty_trend_frame(trend_records, record, width, trend_height)
+                        combined.paste(plot, (0, 0))
+                        combined.paste(trend, (0, plot_height))
+                        plot.close()
                     frames.append(combined)
+                except Exception:
+                    continue
             if not frames:
                 return None
             if target.exists():
@@ -602,6 +924,386 @@ class AutotuneRunStore:
         finally:
             for frame in frames:
                 frame.close()
+
+    @staticmethod
+    def _gif_frame_width(scope_path: Path | None, bode_path: Path | None) -> int:
+        from PIL import Image
+
+        widths: list[int] = []
+        for path in (scope_path, bode_path):
+            if path and path.exists():
+                try:
+                    with Image.open(path) as image:
+                        widths.append(int(image.width))
+                except Exception:
+                    pass
+        return max(widths) if widths else 2400
+
+    @staticmethod
+    def _fit_image_no_stretch(image: "Image.Image", width: int, height: int) -> "Image.Image":
+        from PIL import Image
+
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        scale = min(width / max(1, image.width), height / max(1, image.height))
+        scaled = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), resampling)
+        canvas = Image.new("RGB", (width, height), "white")
+        canvas.paste(scaled, ((width - scaled.width) // 2, (height - scaled.height) // 2))
+        scaled.close()
+        return canvas
+
+    @staticmethod
+    def _render_scope_for_gif(
+        scope_result: dict | None,
+        fallback_path: Path | None,
+        width: int,
+        height: int,
+        axis_settings: dict | None,
+        temp_dir: Path,
+        iteration: int,
+    ) -> "Image.Image":
+        from PIL import Image
+
+        entry = _scope_capture_entry_from_result(scope_result) if isinstance(scope_result, dict) else None
+        if entry is not None:
+            temp_path = temp_dir / f".gif_scope_{uuid.uuid4().hex}.png"
+            try:
+                _plot_full_scope_capture_png(
+                    entry,
+                    axis_settings,
+                    path=temp_path,
+                    title=f"Iteration {iteration} - Scope Capture - Full Data",
+                    figsize=(width / 150.0, height / 150.0),
+                    dpi=150,
+                )
+                with Image.open(temp_path) as image:
+                    return image.convert("RGB")
+            finally:
+                temp_path.unlink(missing_ok=True)
+        if fallback_path and fallback_path.exists():
+            with Image.open(fallback_path) as image:
+                return AutotuneRunStore._fit_image_no_stretch(image.convert("RGB"), width, height)
+        raise RuntimeError("No scope image data is available for GIF rendering.")
+
+    @staticmethod
+    def _render_bode_for_gif(
+        bode_result: dict | None,
+        fallback_path: Path | None,
+        width: int,
+        height: int,
+        temp_dir: Path,
+        iteration: int,
+    ) -> "Image.Image":
+        from PIL import Image
+
+        data_file = _path_from_result_reference(bode_result.get("data_file")) if isinstance(bode_result, dict) else None
+        if data_file and data_file.exists():
+            temp_path = temp_dir / f".gif_bode_{uuid.uuid4().hex}.png"
+            try:
+                with np.load(data_file, allow_pickle=True) as payload:
+                    _plot_full_bode_sweep_png(
+                        frequency_hz=np.asarray(payload["frequency_hz"], dtype=np.float64).tolist(),
+                        magnitude_db=np.asarray(payload["magnitude_db"], dtype=np.float64).tolist(),
+                        phase_deg=np.asarray(payload["phase_deg"], dtype=np.float64).tolist(),
+                        margins=bode_result.get("margins") if isinstance(bode_result.get("margins"), dict) else None,
+                        path=temp_path,
+                        title=f"Iteration {iteration} - Bode 100 Sweep - Full Data",
+                        figsize=(width / 150.0, height / 150.0),
+                        dpi=150,
+                    )
+                with Image.open(temp_path) as image:
+                    return image.convert("RGB")
+            finally:
+                temp_path.unlink(missing_ok=True)
+        if fallback_path and fallback_path.exists():
+            with Image.open(fallback_path) as image:
+                return AutotuneRunStore._fit_image_no_stretch(image.convert("RGB"), width, height)
+        raise RuntimeError("No Bode image data is available for GIF rendering.")
+
+    @staticmethod
+    def _penalty_trend_records(history: list) -> list[dict]:
+        trend: list[dict] = []
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            if AutotuneRunStore._record_is_skipped_trip(record):
+                normalized_penalty = 300.0
+            elif AutotuneRunStore._record_is_invalid_bode(record):
+                normalized_penalty = 250.0
+            else:
+                normalized_penalty = None
+            metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+            penalty = metrics.get("score") if isinstance(metrics, dict) else None
+            iteration = record.get("iteration")
+            try:
+                penalty_f = float(normalized_penalty if normalized_penalty is not None else penalty)
+                iteration_i = int(iteration)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(penalty_f) or iteration_i <= 0:
+                continue
+            trend.append({"iteration": iteration_i, "penalty": penalty_f})
+        trend.sort(key=lambda item: item["iteration"])
+        return trend
+
+    @staticmethod
+    def _record_is_skipped_trip(record: dict) -> bool:
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        reasons = metrics.get("pass_reasons") if isinstance(metrics.get("pass_reasons"), list) else []
+        reason_text = " ".join(str(item).lower() for item in reasons)
+        if "protection skipped" in reason_text or "transient protection skipped" in reason_text:
+            return True
+        scope_result = record.get("scope_result") if isinstance(record.get("scope_result"), dict) else {}
+        scope_error = str(scope_result.get("error") or "").lower()
+        if scope_result.get("skipped") or "protection" in scope_error or "trip" in scope_error:
+            return True
+        try:
+            penalty = float(metrics.get("score"))
+        except (TypeError, ValueError):
+            penalty = None
+        return penalty is not None and math.isfinite(penalty) and penalty >= 1.0e6
+
+    @staticmethod
+    def _record_is_invalid_bode(record: dict) -> bool:
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        reasons = metrics.get("pass_reasons") if isinstance(metrics.get("pass_reasons"), list) else []
+        reason_text = " ".join(str(item).lower() for item in reasons)
+        return (
+            "invalid bode" in reason_text
+            or "duplicate 0 db crossover" in reason_text
+            or "second 0 db crossover" in reason_text
+        )
+
+    @staticmethod
+    def _make_penalty_trend_frame(
+        trend_records: list[dict],
+        current_record: dict,
+        width: int,
+        height: int | None = None,
+    ) -> "Image.Image":
+        from PIL import Image, ImageDraw, ImageFont
+
+        height = height or max(280, min(460, int(width * 0.36)))
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        font = AutotuneRunStore._gif_font(22)
+        small_font = AutotuneRunStore._gif_font(18)
+        title_font = AutotuneRunStore._gif_font(28, bold=True)
+
+        left = 92
+        right = 36
+        top = 62
+        bottom = 62
+        plot_w = max(10, width - left - right)
+        plot_h = max(10, height - top - bottom)
+
+        draw.text((left, 18), "Penalty Trend", fill=(32, 33, 36), font=title_font)
+        draw.text((left, height - 34), "Iteration", fill=(95, 99, 104), font=font)
+        draw.text((14, top + 4), "Penalty", fill=(95, 99, 104), font=small_font)
+
+        # Axes and light grid.
+        axis = (180, 186, 195)
+        grid = (230, 234, 240)
+        draw.line((left, top, left, top + plot_h), fill=axis, width=2)
+        draw.line((left, top + plot_h, left + plot_w, top + plot_h), fill=axis, width=2)
+        for i in range(1, 5):
+            y = top + round(plot_h * i / 5)
+            draw.line((left, y, left + plot_w, y), fill=grid, width=2)
+        for i in range(1, 6):
+            x = left + round(plot_w * i / 6)
+            draw.line((x, top, x, top + plot_h), fill=grid, width=2)
+
+        if not trend_records:
+            draw.text((left + 10, top + 20), "No penalty data", fill=(95, 99, 104), font=font)
+            return image
+
+        iterations = [item["iteration"] for item in trend_records]
+        penalties = [item["penalty"] for item in trend_records]
+        min_iter = min(iterations)
+        max_iter = max(iterations)
+        min_penalty = min(penalties)
+        max_penalty = max(penalties)
+        if max_iter == min_iter:
+            max_iter = min_iter + 1
+        if math.isclose(max_penalty, min_penalty):
+            pad = max(1.0, abs(max_penalty) * 0.05)
+            min_penalty -= pad
+            max_penalty += pad
+        else:
+            pad = (max_penalty - min_penalty) * 0.08
+            min_penalty -= pad
+            max_penalty += pad
+
+        def point(iteration: int, penalty: float) -> tuple[int, int]:
+            x = left + round((iteration - min_iter) / (max_iter - min_iter) * plot_w)
+            y = top + round((max_penalty - penalty) / (max_penalty - min_penalty) * plot_h)
+            return x, y
+
+        points = [point(item["iteration"], item["penalty"]) for item in trend_records]
+        if len(points) == 1:
+            x, y = points[0]
+            draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=(26, 115, 232))
+        else:
+            draw.line(points, fill=(66, 133, 244), width=5)
+            for x, y in points:
+                draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(66, 133, 244))
+
+        current_iteration = current_record.get("iteration")
+        current_penalty = None
+        metrics = current_record.get("metrics") if isinstance(current_record.get("metrics"), dict) else {}
+        if isinstance(metrics, dict):
+            current_penalty = metrics.get("score")
+        try:
+            current_iteration_i = int(current_iteration)
+            current_penalty_f = float(current_penalty)
+        except (TypeError, ValueError):
+            current_iteration_i = None
+            current_penalty_f = None
+        if current_iteration_i is not None and current_penalty_f is not None and math.isfinite(current_penalty_f):
+            cx, cy = point(current_iteration_i, current_penalty_f)
+            draw.line((cx, top, cx, top + plot_h), fill=(234, 67, 53), width=4)
+            draw.ellipse((cx - 12, cy - 12, cx + 12, cy + 12), fill=(234, 67, 53), outline=(255, 255, 255), width=3)
+            label = f"Iteration {current_iteration_i}   Penalty {current_penalty_f:.3f}"
+            draw.rectangle((left, height - 58, min(width - right, left + 430), height - 30), fill=(255, 255, 255))
+            draw.text((left, height - 58), label, fill=(32, 33, 36), font=font)
+
+        # Endpoint labels after plotting so they remain legible.
+        draw.text((left - 76, top - 10), f"{max_penalty:.2f}", fill=(95, 99, 104), font=small_font)
+        draw.text((left - 76, top + plot_h - 10), f"{min_penalty:.2f}", fill=(95, 99, 104), font=small_font)
+        draw.text((left - 8, top + plot_h + 12), str(min(iterations)), fill=(95, 99, 104), font=small_font)
+        max_text = str(max(iterations))
+        draw.text((left + plot_w - 12 * len(max_text), top + plot_h + 12), max_text, fill=(95, 99, 104), font=small_font)
+        return image
+
+    @staticmethod
+    def _gif_font(size: int, bold: bool = False) -> "ImageFont.ImageFont":
+        from PIL import ImageFont
+
+        candidates = (
+            ["arialbd.ttf", "DejaVuSans-Bold.ttf", "segoeuib.ttf"]
+            if bold
+            else ["arial.ttf", "DejaVuSans.ttf", "segoeui.ttf"]
+        )
+        for name in candidates:
+            try:
+                return ImageFont.truetype(name, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    def _repair_run_status_artifact_paths(self, run_dir: Path, status: dict) -> bool:
+        """Make archived run records point at files inside their own run folder."""
+        changed = False
+        files_dir = run_dir / "files"
+        history = status.get("history") if isinstance(status.get("history"), list) else []
+        by_iteration: dict[int, dict] = {}
+
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            if self._repair_record_artifact_paths(record, files_dir):
+                changed = True
+            try:
+                iteration = int(record.get("iteration") or 0)
+            except (TypeError, ValueError):
+                iteration = 0
+            if iteration > 0:
+                by_iteration[iteration] = record
+
+        for key in ("current", "best"):
+            record = status.get(key)
+            if not isinstance(record, dict):
+                continue
+            try:
+                iteration = int(record.get("iteration") or 0)
+            except (TypeError, ValueError):
+                iteration = 0
+            if iteration in by_iteration:
+                if record is not by_iteration[iteration]:
+                    status[key] = by_iteration[iteration]
+                    changed = True
+            elif self._repair_record_artifact_paths(record, files_dir):
+                changed = True
+
+        status["run"] = self._run_payload(
+            run_dir.name,
+            "saved" if run_dir.parent == self.saved_dir else "recent",
+            run_dir,
+        )
+        return changed
+
+    def _repair_record_artifact_paths(self, record: dict, files_dir: Path) -> bool:
+        changed = False
+        try:
+            iteration = int(record.get("iteration") or 0)
+        except (TypeError, ValueError):
+            iteration = 0
+        if iteration <= 0:
+            return False
+
+        scope_result = record.get("scope_result")
+        if isinstance(scope_result, dict):
+            if self._repair_result_file_reference(
+                scope_result,
+                "scope_png",
+                files_dir / f"iteration_{iteration:03d}_scope.png",
+                public=True,
+            ):
+                scope_result["scope_png_pending"] = False
+                scope_result["scope_png_error"] = None
+                changed = True
+            waveforms = scope_result.get("waveforms")
+            if isinstance(waveforms, list):
+                for waveform in waveforms:
+                    if not isinstance(waveform, dict):
+                        continue
+                    source = str(waveform.get("source") or "CH").upper()
+                    compact = files_dir / f"iteration_{iteration:03d}_scope.npz"
+                    per_channel = files_dir / f"iteration_{iteration:03d}_scope_{_safe_file_stem(source)}.npz"
+                    target = compact if compact.exists() else per_channel
+                    if self._repair_result_file_reference(waveform, "data_file", target, public=False):
+                        changed = True
+
+        bode_result = record.get("bode_result")
+        if isinstance(bode_result, dict):
+            if self._repair_result_file_reference(
+                bode_result,
+                "bode_png",
+                files_dir / f"iteration_{iteration:03d}_bode.png",
+                public=True,
+            ):
+                bode_result["bode_png_pending"] = False
+                bode_result["bode_png_error"] = None
+                changed = True
+            if self._repair_result_file_reference(
+                bode_result,
+                "data_file",
+                files_dir / f"iteration_{iteration:03d}_bode.npz",
+                public=False,
+            ):
+                changed = True
+
+        return changed
+
+    @staticmethod
+    def _repair_result_file_reference(result: dict, key: str, target: Path, *, public: bool) -> bool:
+        if not target.exists():
+            return False
+        expected = _scope_png_public_path(target) if public else _path_label(target)
+        current = result.get(key)
+        current_path = _path_from_result_reference(current)
+        if current == expected:
+            return False
+        if current_path is not None:
+            try:
+                if current_path.resolve() == target.resolve():
+                    if current != expected:
+                        result[key] = expected
+                        return True
+                    return False
+            except OSError:
+                pass
+        result[key] = expected
+        return True
 
     def _copy_record_assets(
         self,
@@ -668,6 +1370,7 @@ class AutotuneRunStore:
     def _copy_scope_channel_data_files(self, scope_result: dict, files_dir: Path, iteration: int) -> bool:
         changed = False
         waveforms = scope_result.get("waveforms") if isinstance(scope_result.get("waveforms"), list) else []
+        copied: dict[Path, Path] = {}
         for waveform in waveforms:
             if not isinstance(waveform, dict):
                 continue
@@ -675,10 +1378,21 @@ class AutotuneRunStore:
             data_source = _path_from_result_reference(waveform.get("data_file"))
             if not data_source or not data_source.exists():
                 continue
-            target = files_dir / f"iteration_{iteration:03d}_scope_{_safe_file_stem(source_label)}{data_source.suffix}"
-            if data_source.resolve() != target.resolve():
+            try:
+                with np.load(data_source, allow_pickle=False) as payload:
+                    is_compact = "format_version" in payload.files and int(np.asarray(payload["format_version"]).item()) >= 2
+            except Exception:
+                is_compact = False
+            target_name = f"iteration_{iteration:03d}_scope{data_source.suffix}" if is_compact else f"iteration_{iteration:03d}_scope_{_safe_file_stem(source_label)}{data_source.suffix}"
+            target = files_dir / target_name
+            if data_source in copied:
+                target = copied[data_source]
+            elif data_source.resolve() != target.resolve():
                 shutil.copy2(data_source, target)
                 changed = True
+                copied[data_source] = target
+            else:
+                copied[data_source] = target
             waveform["data_file"] = str(target.relative_to(ROOT)).replace("\\", "/")
         return changed
 
@@ -731,6 +1445,7 @@ class AutotuneRunStore:
         current = status.get("current") if isinstance(status.get("current"), dict) else None
         summary = {
             "run_id": run_dir.name,
+            "display_name": self._display_name_for_run(run_dir.name, "recent" if run_dir.parent == self.recent_dir else "saved"),
             "kind": "recent" if run_dir.parent == self.recent_dir else "saved",
             "path": _path_label(run_dir),
             "updated_at": time.time(),
@@ -756,11 +1471,16 @@ class AutotuneRunStore:
                 continue
             summary = self._read_json(run_dir / "summary.json") or {"run_id": run_dir.name}
             status = self._read_json(run_dir / "run_status.json")
+            if isinstance(status, dict) and self._repair_run_status_artifact_paths(run_dir, status):
+                self._write_json(run_dir / "run_status.json", status)
+                self._write_summary(run_dir, status)
+                summary = self._read_json(run_dir / "summary.json") or summary
             history = status.get("history") if isinstance(status, dict) and isinstance(status.get("history"), list) else None
             if history is not None and int(summary.get("iteration_count") or 0) != len(history):
                 summary["iteration_count"] = len(history)
                 self._write_json(run_dir / "summary.json", summary)
             summary["run_id"] = run_dir.name
+            summary["display_name"] = self._display_name_for_run(run_dir.name, kind)
             summary["kind"] = kind
             runs.append(summary)
         runs.sort(key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0), reverse=True)
@@ -784,10 +1504,61 @@ class AutotuneRunStore:
     def _run_payload(self, run_id: str, kind: str, run_dir: Path) -> dict:
         return {
             "run_id": run_id,
+            "display_name": self._display_name_for_run(run_id, kind),
             "kind": kind,
             "path": _path_label(run_dir),
             "recent_limit": self.recent_limit,
         }
+
+    def _next_friendly_run_dir(self, kind: str, requested_name: str | None = None) -> Path:
+        folder = self.saved_dir if kind == "saved" else self.recent_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        if requested_name:
+            base = _safe_file_stem(requested_name)
+            if base:
+                candidate = folder / base
+                if not candidate.exists():
+                    return candidate
+                index = 2
+                while True:
+                    candidate = folder / f"{base}_{index:02d}"
+                    if not candidate.exists():
+                        return candidate
+                    index += 1
+
+        prefix = "Permanent" if kind == "saved" else "Recent"
+        date = time.strftime("%Y-%m-%d")
+        next_index = self._next_friendly_index(folder, prefix, date)
+        while True:
+            candidate = folder / f"{prefix}_{date}_{next_index:02d}"
+            if not candidate.exists():
+                return candidate
+            next_index += 1
+
+    @staticmethod
+    def _next_friendly_index(folder: Path, prefix: str, date: str) -> int:
+        pattern = re.compile(rf"^{re.escape(prefix)}_{re.escape(date)}_(\d+)(?:_.*)?$")
+        highest = 0
+        if folder.exists():
+            for child in folder.iterdir():
+                if not child.is_dir():
+                    continue
+                match = pattern.match(child.name)
+                if match:
+                    highest = max(highest, int(match.group(1)))
+        return highest + 1
+
+    @staticmethod
+    def _display_name_for_run(run_id: str, kind: str) -> str:
+        text = str(run_id)
+        prefix = "Permanent" if kind == "saved" else "Recent"
+        friendly = re.match(r"^(Recent|Permanent)_(\d{4}-\d{2}-\d{2})_(\d+)", text)
+        if friendly:
+            return f"{friendly.group(1)} / {friendly.group(2)} #{int(friendly.group(3))}"
+        legacy = re.match(r"^(\d{4})(\d{2})(\d{2})", text)
+        if legacy:
+            return f"{prefix} / {legacy.group(1)}-{legacy.group(2)}-{legacy.group(3)}"
+        return f"{prefix} / {text or 'Unknown'}"
 
     @staticmethod
     def _write_json(path: Path, payload: dict) -> None:
@@ -820,6 +1591,95 @@ def main() -> int:
     finally:
         server.server_close()
     return 0
+
+
+def _coerce_llm_messages(messages: object) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        raise ValueError("messages must be a list")
+    clean: list[dict[str, str]] = []
+    for item in messages[-16:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        content = str(item.get("content", "")).strip()
+        if role not in {"user", "assistant", "system"} or not content:
+            continue
+        clean.append({"role": role, "content": content[:6000]})
+    if not any(message["role"] == "user" for message in clean):
+        raise ValueError("at least one user message is required")
+    return clean
+
+
+def _llm_chat_endpoint(base_url: str) -> str:
+    explicit = (os.environ.get("LLM_API_ENDPOINT") or os.environ.get("MINIMAX_CHAT_ENDPOINT") or "").strip()
+    if explicit:
+        return explicit
+    endpoint = base_url.rstrip("/")
+    if endpoint.endswith("/chat/completions"):
+        return endpoint
+    return f"{endpoint}/chat/completions"
+
+
+def _sanitize_llm_reply(reply: str) -> str:
+    return re.sub(r"(?is)<think>.*?</think>\s*", "", reply).strip()
+
+
+def _call_llm_chat(messages: object, context: object) -> tuple[str, str]:
+    api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("MINIMAX_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("LLM_API_KEY or MINIMAX_API_KEY is not set. Add it to .env and restart the GUI server.")
+
+    base_url = (os.environ.get("LLM_API_BASE_URL") or os.environ.get("MINIMAX_BASE_URL") or "https://api.openai.com/v1").strip()
+    model = (os.environ.get("LLM_MODEL") or os.environ.get("MINIMAX_MODEL") or "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    timeout_s = float(os.environ.get("LLM_TIMEOUT_S", "30") or "30")
+    temperature = float(os.environ.get("LLM_TEMPERATURE", "0.2") or "0.2")
+    max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "700") or "700")
+
+    gui_context = json.dumps(context if isinstance(context, dict) else {}, ensure_ascii=False, default=str)[:4000]
+    system_prompt = (
+        "You are a concise assistant embedded inside the Google Power Auto-Tuner GUI. "
+        "Help users understand this hardware-in-the-loop PID tuning interface: PID Auto-Tune, "
+        "Manual Tuning, Self Testing, XDP/PMBus board control, Bode 100, oscilloscope, "
+        "function generator, and power supply panels. Use the user's language. "
+        "Do not claim that you can directly control hardware; tell the user which GUI control "
+        "or workflow to use. Be safety-aware and practical.\n\n"
+        f"Current GUI context JSON:\n{gui_context}"
+    )
+    outgoing = [{"role": "system", "content": system_prompt}, *_coerce_llm_messages(messages)]
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": outgoing,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+    ).encode("utf-8")
+    request = urllib_request.Request(
+        _llm_chat_endpoint(base_url),
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_s) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:700]
+        raise RuntimeError(f"LLM API error {exc.code}: {detail}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"Could not reach LLM API: {exc.reason}") from exc
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not choices:
+        raise RuntimeError("LLM API returned no choices.")
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    reply = _sanitize_llm_reply(str(message.get("content", "")).strip())
+    if not reply:
+        raise RuntimeError("LLM API returned an empty reply.")
+    return reply, str(payload.get("model", model))
 
 
 class GuiHandler(BaseHTTPRequestHandler):
@@ -872,6 +1732,8 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tuning/status":
             status = TUNING_SESSION.status()
+            if AUTOTUNE_RUN_STORE._current_run_id is not None and status.get("state") != "running":
+                status = AUTOTUNE_RUN_STORE.persist_status(status)
             self._send_json({"ok": True, **status})
             return
         if parsed.path == "/api/tuning/config":
@@ -977,6 +1839,12 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tuning/gif":
             self._handle_tuning_gif()
+            return
+        if parsed.path == "/api/tuning/gif/open":
+            self._handle_tuning_gif(open_after_save=True)
+            return
+        if parsed.path == "/api/llm/chat":
+            self._handle_llm_chat()
             return
         if parsed.path == "/api/self-test":
             self._handle_self_test(parsed.query)
@@ -1199,7 +2067,7 @@ class GuiHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=400)
 
-    def _handle_tuning_gif(self) -> None:
+    def _handle_tuning_gif(self, open_after_save: bool = False) -> None:
         try:
             payload = self._read_json_body()
         except Exception:
@@ -1214,7 +2082,10 @@ class GuiHandler(BaseHTTPRequestHandler):
                 duration_ms = int(payload.get("duration_ms", 100))
             except (TypeError, ValueError):
                 duration_ms = 100
-            self._send_json(AUTOTUNE_RUN_STORE.save_animation_gif(None if run_id in (None, "") else str(run_id), kind, duration_ms))
+            if open_after_save:
+                self._send_json(AUTOTUNE_RUN_STORE.open_animation_gif(None if run_id in (None, "") else str(run_id), kind, duration_ms))
+            else:
+                self._send_json(AUTOTUNE_RUN_STORE.save_animation_gif(None if run_id in (None, "") else str(run_id), kind, duration_ms))
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=400)
 
@@ -1255,8 +2126,8 @@ class GuiHandler(BaseHTTPRequestHandler):
             stop_hz = float(payload.get("stop_hz", 1_000_000.0))
             points = int(payload.get("points", 201))
             bandwidth_hz = float(payload.get("bandwidth_hz", 300.0))
-            source_dbm_raw = payload.get("source_dbm", 0.0)
-            source_dbm = None if source_dbm_raw is None else float(source_dbm_raw)
+            source_vpp = _optional_bode_source_vpp(payload, default=0.1)
+            source_dbm = _optional_bode_source_dbm(payload)
             timeout_ms = int(payload.get("timeout_ms", 30000))
         except Exception as exc:
             self._send_json({"ok": False, "error": f"Invalid request: {exc}"}, status=400)
@@ -1268,6 +2139,7 @@ class GuiHandler(BaseHTTPRequestHandler):
             stop_hz=stop_hz,
             points=points,
             bandwidth_hz=bandwidth_hz,
+            source_vpp=source_vpp,
             source_dbm=source_dbm,
             timeout_ms=timeout_ms,
         )
@@ -1365,6 +2237,16 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": f"Invalid request: {exc}"}, status=400)
             return
         self._send_json(_warm_scope_connection(resource))
+
+    def _handle_llm_chat(self) -> None:
+        try:
+            payload = self._read_json_body()
+            messages = payload.get("messages", [])
+            context = payload.get("context", {})
+            reply, model = _call_llm_chat(messages, context)
+            self._send_json({"ok": True, "reply": reply, "model": model})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
 
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -1714,6 +2596,7 @@ def _read_xdp_pid(address: str, page: int, adapter_kind: str) -> dict:
                 "page": page,
                 "loop": _loop_name(page),
                 "pid_registers": board.read_mod0_pid_registers(page),
+                "current_mode_registers": board.read_mod0_current_mode_registers(page),
                 "timestamp": time.time(),
             }
         except Exception as exc:
@@ -1731,14 +2614,34 @@ def _set_xdp_pid(address: str, page: int, adapter_kind: str, values: dict) -> di
         try:
             board = _connect_board(address, adapter_kind)
             int_values = {str(name): int(value) for name, value in values.items()}
-            write = board.set_mod0_pid_registers(int_values, page)
+            supported_pid_fields = {"mod0_kp", "mod0_ki", "mod0_kd", "mod0_kpole1", "mod0_kpole2"}
+            supported_current_mode_fields = {"mod0_cm_gain"}
+            unknown = sorted(set(int_values) - supported_pid_fields - supported_current_mode_fields)
+            if unknown:
+                raise ValueError(f"Unsupported XDP field(s): {', '.join(unknown)}")
+            pid_values = {name: value for name, value in int_values.items() if name in supported_pid_fields}
+            current_mode_values = {name: value for name, value in int_values.items() if name == "mod0_cm_gain"}
+            write = board.set_mod0_pid_registers(pid_values, page) if pid_values else None
+            current_mode_write = (
+                board.set_mod0_current_mode_registers(current_mode_values, page)
+                if current_mode_values
+                else None
+            )
+            pid_readback = write["readback"] if write else board.read_mod0_pid_registers(page)
+            current_mode_readback = (
+                current_mode_write["readback"]
+                if current_mode_write
+                else board.read_mod0_current_mode_registers(page)
+            )
             return {
                 "ok": True,
                 "address": f"0x{board.device.address:02X}",
                 "page": page,
                 "loop": _loop_name(page),
                 "write": write,
-                "pid_registers": write["readback"],
+                "current_mode_write": current_mode_write,
+                "pid_registers": pid_readback,
+                "current_mode_registers": current_mode_readback,
                 "timestamp": time.time(),
             }
         except Exception as exc:
@@ -1907,15 +2810,21 @@ def _run_bode_sweep(
     stop_hz: float,
     points: int,
     bandwidth_hz: float,
-    source_dbm: float | None,
+    source_vpp: float | None = None,
+    source_dbm: float | None = None,
     timeout_ms: int,
     async_artifacts: bool = False,
+    reuse_session: bool = False,
+    _retry_stale_session: bool = True,
 ) -> dict:
     started = time.perf_counter()
     if start_hz <= 0 or stop_hz <= start_hz:
         return {"ok": False, "error": "Bode sweep requires 0 < start_hz < stop_hz."}
     if not 2 <= points <= 2001:
         return {"ok": False, "error": "Bode sweep points must be between 2 and 2001."}
+    if source_vpp is not None and source_vpp <= 0:
+        return {"ok": False, "error": "Bode source level must be greater than 0 Vpp."}
+    effective_source_dbm = _vpp_to_dbm(source_vpp) if source_vpp is not None else source_dbm
 
     bode_driver = Bode100Driver(host=host, port=port, startup_timeout_s=max(timeout_ms / 1000.0, 5.0))
     try:
@@ -1934,27 +2843,39 @@ def _run_bode_sweep(
                 "stop_hz": stop_hz,
                 "points": points,
                 "bandwidth_hz": bandwidth_hz,
-                "source_dbm": source_dbm,
+                "source_vpp": source_vpp,
+                "source_dbm": effective_source_dbm,
             },
             "duration_s": round(time.perf_counter() - started, 3),
             "timestamp": time.time(),
         }
 
     bode = None
+    close_when_done = not reuse_session
+    session_reused = False
+    retried_stale_session = not _retry_stale_session
     try:
-        bode = BodeScpiClient(resource_name=bode_driver.resource_name, timeout_ms=timeout_ms)
-        bode.connect()
-        identity = bode.idn()
-        try:
-            bode.lock()
-        except Exception:
-            pass
+        if reuse_session:
+            bode, identity, session_reused = _get_bode_connection(
+                bode_driver.resource_name,
+                host=host,
+                port=port,
+                timeout_ms=timeout_ms,
+            )
+        else:
+            bode = BodeScpiClient(resource_name=bode_driver.resource_name, timeout_ms=timeout_ms)
+            bode.connect()
+            identity = bode.idn()
+            try:
+                bode.lock()
+            except Exception:
+                pass
         bode.configure_gain_phase(
             start_hz=start_hz,
             stop_hz=stop_hz,
             points=points,
             bandwidth_hz=bandwidth_hz,
-            source_dbm=source_dbm,
+            source_dbm=effective_source_dbm,
         )
         data = bode.run_sweep()
         margins = data.stability_margins.as_dict()
@@ -1975,7 +2896,8 @@ def _run_bode_sweep(
                     "stop_hz": float(stop_hz),
                     "points": int(points),
                     "bandwidth_hz": float(bandwidth_hz),
-                    "source_dbm": np.nan if source_dbm is None else float(source_dbm),
+                    "source_vpp": np.nan if source_vpp is None else float(source_vpp),
+                    "source_dbm": np.nan if effective_source_dbm is None else float(effective_source_dbm),
                     "identity": str(identity),
                     "timestamp": float(timestamp),
                 },
@@ -1991,7 +2913,8 @@ def _run_bode_sweep(
                     "stop_hz": float(stop_hz),
                     "points": int(points),
                     "bandwidth_hz": float(bandwidth_hz),
-                    "source_dbm": np.nan if source_dbm is None else float(source_dbm),
+                    "source_vpp": np.nan if source_vpp is None else float(source_vpp),
+                    "source_dbm": np.nan if effective_source_dbm is None else float(effective_source_dbm),
                     "identity": str(identity),
                     "timestamp": float(timestamp),
                 },
@@ -2040,7 +2963,8 @@ def _run_bode_sweep(
                 "stop_hz": stop_hz,
                 "points": points,
                 "bandwidth_hz": bandwidth_hz,
-                "source_dbm": source_dbm,
+                "source_vpp": source_vpp,
+                "source_dbm": effective_source_dbm,
             },
             "frequency_hz": data.frequency_hz,
             "magnitude_db": data.magnitude_db,
@@ -2054,11 +2978,30 @@ def _run_bode_sweep(
             "bode_png": bode_png,
             "bode_png_error": bode_png_error,
             "bode_png_pending": bode_png_pending,
+            "session_reused": session_reused,
+            "retried_stale_session": retried_stale_session,
             "system_error": system_error,
             "duration_s": round(time.perf_counter() - started, 3),
             "timestamp": timestamp,
         }
     except Exception as exc:
+        if reuse_session:
+            _drop_bode_connection(host, port)
+            if _retry_stale_session and _is_stale_bode_session_error(exc):
+                return _run_bode_sweep(
+                    host=host,
+                    port=port,
+                    start_hz=start_hz,
+                    stop_hz=stop_hz,
+                    points=points,
+                    bandwidth_hz=bandwidth_hz,
+                    source_vpp=source_vpp,
+                    source_dbm=source_dbm,
+                    timeout_ms=timeout_ms,
+                    async_artifacts=async_artifacts,
+                    reuse_session=reuse_session,
+                    _retry_stale_session=False,
+                )
         return {
             "ok": False,
             "error": str(exc),
@@ -2070,13 +3013,14 @@ def _run_bode_sweep(
                 "stop_hz": stop_hz,
                 "points": points,
                 "bandwidth_hz": bandwidth_hz,
-                "source_dbm": source_dbm,
+                "source_vpp": source_vpp,
+                "source_dbm": effective_source_dbm,
             },
             "duration_s": round(time.perf_counter() - started, 3),
             "timestamp": time.time(),
         }
     finally:
-        if bode is not None:
+        if bode is not None and close_when_done:
             try:
                 bode.unlock()
             except Exception:
@@ -2085,6 +3029,99 @@ def _run_bode_sweep(
                 bode.close()
             except Exception:
                 pass
+
+
+def _bode_connection_key(host: str, port: int) -> str:
+    return f"{host}:{int(port)}"
+
+
+def _get_bode_connection(
+    resource_name: str,
+    *,
+    host: str,
+    port: int,
+    timeout_ms: int,
+) -> tuple[BodeScpiClient, str, bool]:
+    key = _bode_connection_key(host, port)
+    with BODE_CONNECTION_LOCK:
+        cached = BODE_CONNECTIONS.get(key)
+        if cached is not None:
+            client = cached.get("client")
+            identity = str(cached.get("identity") or "")
+            if isinstance(client, BodeScpiClient):
+                try:
+                    client.timeout_ms = timeout_ms
+                    if getattr(client, "_inst", None) is not None:
+                        client._inst.timeout = timeout_ms
+                except Exception:
+                    pass
+                return client, identity, True
+
+        client = BodeScpiClient(resource_name=resource_name, timeout_ms=timeout_ms)
+        try:
+            client.connect()
+            identity = client.idn()
+            try:
+                client.lock()
+            except Exception:
+                pass
+            BODE_CONNECTIONS[key] = {"client": client, "identity": identity}
+            return client, identity, False
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+            raise
+
+
+def _drop_bode_connection(host: str, port: int) -> None:
+    key = _bode_connection_key(host, port)
+    with BODE_CONNECTION_LOCK:
+        cached = BODE_CONNECTIONS.pop(key, None)
+    client = cached.get("client") if cached else None
+    if isinstance(client, BodeScpiClient):
+        try:
+            client.unlock()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _is_stale_bode_session_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "invalid session" in message
+        or "session handle" in message
+        or "resource might be closed" in message
+        or "connection is closed" in message
+    )
+
+
+def _optional_bode_source_vpp(payload: dict, default: float | None = None) -> float | None:
+    raw = payload.get("source_vpp")
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
+def _optional_bode_source_dbm(payload: dict) -> float | None:
+    # Legacy compatibility for old saved runs and external callers. New UI sends source_vpp.
+    if payload.get("source_vpp") is not None:
+        return None
+    raw = payload.get("source_dbm")
+    if raw is None or raw == "":
+        return None
+    return float(raw)
+
+
+def _vpp_to_dbm(vpp: float, impedance_ohm: float = 50.0) -> float:
+    vrms = float(vpp) / (2.0 * math.sqrt(2.0))
+    power_w = (vrms * vrms) / impedance_ohm
+    return 10.0 * math.log10(power_w / 1e-3)
 
 
 def _read_bode100_idn(
@@ -2225,15 +3262,15 @@ def _set_function_generator(resource: str, channel: int, mode: str, payload: dic
             if mode_name == "square":
                 fg.configure_square_levels(
                     frequency_hz=float(payload.get("frequency_hz", 10000.0)),
-                    low_v=float(payload.get("low_v", 0.365)),
-                    high_v=float(payload.get("high_v", 2.0)),
+                    low_v=float(payload.get("low_v", 0.0)),
+                    high_v=float(payload.get("high_v", 1.0)),
                     channel=channel,
                 )
             elif mode_name == "pulse":
                 fg.configure_pulse_levels(
                     frequency_hz=float(payload.get("frequency_hz", 10000.0)),
-                    low_v=float(payload.get("low_v", 0.365)),
-                    high_v=float(payload.get("high_v", 2.0)),
+                    low_v=float(payload.get("low_v", 0.0)),
+                    high_v=float(payload.get("high_v", 1.0)),
                     width_s=_optional_float(payload.get("pulse_width_s")),
                     channel=channel,
                 )
@@ -2385,60 +3422,154 @@ def _edge_focused_scope_display(
     return x_array[indices].tolist(), y_array[indices].tolist(), "edge-focused"
 
 
-def _scope_capture_file_path(capture_id: str, source: str, timestamp: float) -> Path:
-    safe_source = "".join(char for char in source.upper() if char.isalnum() or char in {"_", "-"})
+def _scope_capture_compact_file_path(capture_id: str, timestamp: float) -> Path:
     time_tag = time.strftime("%Y%m%d_%H%M%S", time.localtime(timestamp))
-    return SCOPE_CAPTURE_DIR / f"{time_tag}_{capture_id}_{safe_source}.npz"
+    return SCOPE_CAPTURE_DIR / f"{time_tag}_{capture_id}_scope.npz"
 
 
-def _schedule_scope_data_artifact(x: np.ndarray, y: np.ndarray, path: Path, metadata: dict) -> None:
-    ARTIFACT_EXECUTOR.submit(
-        _write_scope_data_artifact,
-        np.asarray(x, dtype=np.float64),
-        np.asarray(y, dtype=np.float64),
-        path,
-        copy.deepcopy(metadata),
-    )
+def _linear_x_metadata(x: np.ndarray) -> tuple[float, float, int]:
+    x_array = np.asarray(x, dtype=np.float64)
+    points = int(x_array.size)
+    if points <= 0:
+        return 0.0, 0.0, 0
+    x_start = float(x_array[0])
+    if points > 1:
+        x_increment = float((x_array[-1] - x_array[0]) / float(points - 1))
+    else:
+        x_increment = 0.0
+    return x_start, x_increment, points
 
 
-def _write_scope_data_artifact(x: np.ndarray, y: np.ndarray, path: Path, metadata: dict) -> None:
+def _schedule_scope_capture_artifact(channels: dict[str, dict], path: Path, metadata: dict) -> None:
+    compact_channels = {}
+    for source, record in channels.items():
+        compact_channels[source] = {
+            "x": np.asarray(record["x"], dtype=np.float64),
+            "y": np.asarray(record["y"], dtype=np.float32),
+            "x_unit": record.get("x_unit") or "s",
+            "y_unit": record.get("y_unit") or "V",
+            "original_points": int(record.get("original_points") or len(record["y"])),
+            "transfer_encoding": record.get("transfer_encoding") or "",
+        }
+    ARTIFACT_EXECUTOR.submit(_write_scope_capture_artifact, compact_channels, path, copy.deepcopy(metadata))
+
+
+def _write_scope_capture_artifact(channels: dict[str, dict], path: Path, metadata: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, x=x, y=y, **metadata)
+    sources = [str(source).upper() for source in channels]
+    first = channels[sources[0]] if sources else None
+    x_start, x_increment, points = _linear_x_metadata(first["x"] if first else np.array([], dtype=np.float64))
+    payload: dict[str, object] = {
+        "format_version": np.array(2, dtype=np.int16),
+        "sources": np.asarray(sources, dtype="U8"),
+        "x_start": np.array(x_start, dtype=np.float64),
+        "x_increment": np.array(x_increment, dtype=np.float64),
+        "points": np.array(points, dtype=np.int64),
+        **metadata,
+    }
+    if first:
+        payload["x_unit"] = np.asarray(first.get("x_unit") or "s")
+    for source in sources:
+        record = channels[source]
+        safe_source = "".join(char for char in source.upper() if char.isalnum() or char in {"_", "-"})
+        payload[f"y_{safe_source}"] = np.asarray(record["y"], dtype=np.float32)
+        payload[f"y_unit_{safe_source}"] = np.asarray(record.get("y_unit") or "V")
+        payload[f"original_points_{safe_source}"] = np.array(
+            int(record.get("original_points") or len(record["y"])),
+            dtype=np.int64,
+        )
+        payload[f"transfer_encoding_{safe_source}"] = np.asarray(record.get("transfer_encoding") or "")
+    np.savez(path, **payload)
 
 
-def _store_full_scope_waveform(capture_id: str, capture, timestamp: float, async_save: bool = False) -> tuple[str, dict]:
-    x_array = np.asarray(capture.x, dtype=np.float64)
-    y_array = np.asarray(capture.y, dtype=np.float64)
-    file_path = _scope_capture_file_path(capture_id, capture.source, timestamp)
+def _load_scope_waveform_npz(data_file: Path, source: str | None = None) -> dict | None:
+    if not data_file.exists():
+        return None
+    with np.load(data_file, allow_pickle=False) as payload:
+        requested = str(source or "").upper()
+        if "format_version" in payload.files and int(np.asarray(payload["format_version"]).item()) >= 2:
+            sources = [str(item).upper() for item in np.asarray(payload["sources"]).tolist()] if "sources" in payload.files else []
+            selected = requested if requested in sources else (sources[0] if sources else "")
+            if not selected:
+                return None
+            safe_source = "".join(char for char in selected.upper() if char.isalnum() or char in {"_", "-"})
+            y_key = f"y_{safe_source}"
+            if y_key not in payload.files:
+                return None
+            points = int(np.asarray(payload["points"]).item()) if "points" in payload.files else int(len(payload[y_key]))
+            x_start = float(np.asarray(payload["x_start"]).item()) if "x_start" in payload.files else 0.0
+            x_increment = float(np.asarray(payload["x_increment"]).item()) if "x_increment" in payload.files else 0.0
+            x_values = x_start + np.arange(points, dtype=np.float64) * x_increment
+            y_values = np.asarray(payload[y_key], dtype=np.float64)
+            if y_values.size != x_values.size:
+                count = min(int(y_values.size), int(x_values.size))
+                x_values = x_values[:count]
+                y_values = y_values[:count]
+            return {
+                "source": selected,
+                "x": x_values,
+                "y": y_values,
+                "x_unit": str(np.asarray(payload["x_unit"]).item()) if "x_unit" in payload.files else "s",
+                "y_unit": str(np.asarray(payload[f"y_unit_{safe_source}"]).item()) if f"y_unit_{safe_source}" in payload.files else "V",
+                "original_points": int(np.asarray(payload[f"original_points_{safe_source}"]).item())
+                if f"original_points_{safe_source}" in payload.files
+                else int(len(y_values)),
+                "transfer_encoding": str(np.asarray(payload[f"transfer_encoding_{safe_source}"]).item())
+                if f"transfer_encoding_{safe_source}" in payload.files
+                else "",
+                "capture_id": str(np.asarray(payload["capture_id"]).item()) if "capture_id" in payload.files else None,
+                "timestamp": float(np.asarray(payload["timestamp"]).item()) if "timestamp" in payload.files else None,
+            }
+
+        x_values = np.asarray(payload["x"], dtype=np.float64)
+        y_values = np.asarray(payload["y"], dtype=np.float64)
+        payload_source = str(np.asarray(payload["source"]).item()) if "source" in payload.files else requested
+        return {
+            "source": payload_source.upper() if payload_source else requested,
+            "x": x_values,
+            "y": y_values,
+            "x_unit": str(np.asarray(payload["x_unit"]).item()) if "x_unit" in payload.files else "s",
+            "y_unit": str(np.asarray(payload["y_unit"]).item()) if "y_unit" in payload.files else "V",
+            "original_points": int(np.asarray(payload["original_points"]).item()) if "original_points" in payload.files else int(len(y_values)),
+            "transfer_encoding": str(np.asarray(payload["transfer_encoding"]).item()) if "transfer_encoding" in payload.files else "",
+            "capture_id": str(np.asarray(payload["capture_id"]).item()) if "capture_id" in payload.files else None,
+            "timestamp": float(np.asarray(payload["timestamp"]).item()) if "timestamp" in payload.files else None,
+        }
+
+
+def _store_full_scope_capture(capture_id: str, captures: list, timestamp: float, async_save: bool = False) -> tuple[str, dict[str, dict]]:
+    file_path = _scope_capture_compact_file_path(capture_id, timestamp)
+    channel_records: dict[str, dict] = {}
+    for capture in captures:
+        source = str(capture.source).upper()
+        x_array = np.asarray(capture.x, dtype=np.float64)
+        y_array = np.asarray(capture.y, dtype=np.float64)
+        channel_records[source] = {
+            "source": source,
+            "x": x_array,
+            "y": y_array,
+            "x_unit": capture.x_unit,
+            "y_unit": capture.y_unit,
+            "original_points": int(capture.original_points or len(capture.y)),
+            "transfer_encoding": capture.transfer_encoding,
+            "data_file": "",
+            "data_file_pending": bool(async_save),
+        }
     metadata = {
-        "source": capture.source,
-        "x_unit": capture.x_unit,
-        "y_unit": capture.y_unit,
-        "original_points": int(capture.original_points or len(capture.y)),
-        "transfer_encoding": capture.transfer_encoding or "",
         "capture_id": capture_id,
         "timestamp": timestamp,
     }
     if async_save:
-        _schedule_scope_data_artifact(x_array, y_array, file_path, metadata)
+        _schedule_scope_capture_artifact(channel_records, file_path, metadata)
     else:
-        _write_scope_data_artifact(x_array, y_array, file_path, metadata)
+        _write_scope_capture_artifact(channel_records, file_path, metadata)
     try:
         data_file = str(file_path.relative_to(ROOT)).replace("\\", "/")
     except ValueError:
         data_file = str(file_path)
-    channel_record = {
-        "source": capture.source,
-        "x": x_array,
-        "y": y_array,
-        "x_unit": capture.x_unit,
-        "y_unit": capture.y_unit,
-        "original_points": int(capture.original_points or len(capture.y)),
-        "transfer_encoding": capture.transfer_encoding,
-        "data_file": data_file,
-        "data_file_pending": bool(async_save),
-    }
-    return data_file, channel_record
+    for record in channel_records.values():
+        record["data_file"] = data_file
+    return data_file, channel_records
 
 
 def _remember_scope_capture(capture_id: str, entry: dict) -> None:
@@ -2539,20 +3670,20 @@ def _scope_capture_entry_from_result(scope_result: dict) -> dict | None:
         if not data_file or not data_file.exists():
             continue
         try:
-            with np.load(data_file, allow_pickle=True) as payload:
-                source = str(payload["source"].item() if getattr(payload["source"], "shape", None) == () else waveform.get("source"))
-                x_values = np.asarray(payload["x"], dtype=np.float64)
-                y_values = np.asarray(payload["y"], dtype=np.float64)
-                x_unit = str(payload["x_unit"].item()) if "x_unit" in payload.files else str(waveform.get("x_unit") or "s")
-                y_unit = str(payload["y_unit"].item()) if "y_unit" in payload.files else str(waveform.get("y_unit") or "V")
-                original_points = int(payload["original_points"].item()) if "original_points" in payload.files else int(len(y_values))
-                transfer_encoding = (
-                    str(payload["transfer_encoding"].item()) if "transfer_encoding" in payload.files else str(waveform.get("transfer_encoding") or "")
-                )
-                if "capture_id" in payload.files:
-                    capture_id = str(payload["capture_id"].item())
-                if "timestamp" in payload.files:
-                    created_at = float(payload["timestamp"].item())
+            loaded = _load_scope_waveform_npz(data_file, str(waveform.get("source") or ""))
+            if not loaded:
+                continue
+            source = str(loaded["source"])
+            x_values = np.asarray(loaded["x"], dtype=np.float64)
+            y_values = np.asarray(loaded["y"], dtype=np.float64)
+            x_unit = str(loaded.get("x_unit") or waveform.get("x_unit") or "s")
+            y_unit = str(loaded.get("y_unit") or waveform.get("y_unit") or "V")
+            original_points = int(loaded.get("original_points") or len(y_values))
+            transfer_encoding = str(loaded.get("transfer_encoding") or waveform.get("transfer_encoding") or "")
+            if loaded.get("capture_id"):
+                capture_id = str(loaded["capture_id"])
+            if loaded.get("timestamp") is not None:
+                created_at = float(loaded["timestamp"])
         except Exception:
             continue
         channels[source.upper()] = {
@@ -2584,6 +3715,8 @@ def _plot_full_bode_sweep_png(
     margins: dict | None = None,
     path: Path = LATEST_BODE_PNG,
     title: str = "Latest Bode 100 Sweep - Full Data",
+    figsize: tuple[float, float] = (16, 6),
+    dpi: int = 150,
 ) -> str:
     import matplotlib
 
@@ -2608,7 +3741,7 @@ def _plot_full_bode_sweep_png(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.style.use("default")
-    fig, gain_ax = plt.subplots(figsize=(16, 6), dpi=150)
+    fig, gain_ax = plt.subplots(figsize=figsize, dpi=dpi)
     phase_ax = gain_ax.twinx()
     gain_line, = gain_ax.semilogx(frequency, magnitude, color="#ea4335", linewidth=1.2, label="Gain")
     phase_line, = phase_ax.semilogx(frequency, phase, color="#1a73e8", linewidth=1.2, label="Phase")
@@ -2677,11 +3810,219 @@ def _write_bode_data_artifact(
     )
 
 
+def _scope_input_edge_times_s(channels: dict) -> list[tuple[float, str]]:
+    record = channels.get("CH1") or channels.get("ch1")
+    if not isinstance(record, dict):
+        return []
+    x_array = np.asarray(record.get("x", []), dtype=np.float64)
+    y_array = np.asarray(record.get("y", []), dtype=np.float64)
+    total = min(x_array.size, y_array.size)
+    if total < 2:
+        return []
+    x_array = x_array[:total]
+    y_array = y_array[:total]
+    finite = np.isfinite(x_array) & np.isfinite(y_array)
+    if not np.any(finite):
+        return []
+    x_array = x_array[finite]
+    y_array = y_array[finite]
+    if x_array.size < 2:
+        return []
+    low = float(np.percentile(y_array, 10))
+    high = float(np.percentile(y_array, 90))
+    if not np.isfinite(low) or not np.isfinite(high) or abs(high - low) < 1e-9:
+        return []
+    threshold = (low + high) / 2.0
+
+    edge_candidates: list[tuple[float, str]] = []
+    crossing_sets = (
+        ("rising", np.where((y_array[:-1] < threshold) & (y_array[1:] >= threshold))[0]),
+        ("falling", np.where((y_array[:-1] >= threshold) & (y_array[1:] < threshold))[0]),
+    )
+    for kind, indices in crossing_sets:
+        for raw_index in indices:
+            index = int(raw_index)
+            y0 = float(y_array[index])
+            y1 = float(y_array[index + 1])
+            x_start = float(x_array[index])
+            x_stop = float(x_array[index + 1])
+            if y1 == y0:
+                crossing_time = x_start
+            else:
+                fraction = max(0.0, min(1.0, (threshold - y0) / (y1 - y0)))
+                crossing_time = x_start + fraction * (x_stop - x_start)
+            edge_candidates.append((crossing_time, kind))
+
+    if not edge_candidates:
+        return []
+
+    edge_candidates.sort(key=lambda item: item[0])
+    span_s = max(0.0, float(x_array[-1] - x_array[0]))
+    debounce_s = max(0.5e-6, min(5e-6, span_s * 0.005))
+    edges: list[tuple[float, str]] = []
+    for edge_time, kind in edge_candidates:
+        if edges and edge_time - edges[-1][0] < debounce_s:
+            continue
+        edges.append((edge_time, kind))
+    return edges
+
+
+def _draw_scope_settling_markers(
+    axis,
+    *,
+    channels: dict,
+    x0: float,
+    x1: float,
+    x_scale: float,
+    metrics: ResponseMetrics | None = None,
+) -> None:
+    edge_times = _selected_scope_settling_marker_edges(_scope_input_edge_times_s(channels))
+    if not edge_times:
+        return
+
+    x_min = 0.0
+    x_max = max(0.0, (x1 - x0) * x_scale)
+    y_min, y_max = axis.get_ylim()
+    y_span = max(1e-12, y_max - y_min)
+    y_arrow = y_min + 0.82 * y_span
+    y_text = y_min + 0.85 * y_span
+    edge_colors = {"rising": "#5f6368", "falling": "#5f6368"}
+    settle_color = "#ea4335"
+
+    for edge_time_s, kind in edge_times:
+        settling_time_s = None
+        if metrics is not None:
+            if kind == "rising":
+                settling_time_s = float(metrics.undershoot_settling_time_s)
+                settling_label = "US Ts"
+            else:
+                settling_time_s = float(metrics.overshoot_settling_time_s)
+                settling_label = "OS Ts"
+        else:
+            settling_label = "Ts"
+        if settling_time_s is None or not math.isfinite(settling_time_s) or settling_time_s < 0:
+            continue
+        edge_x = (edge_time_s - x0) * x_scale
+        settle_x = (edge_time_s + settling_time_s - x0) * x_scale
+        edge_visible = x_min <= edge_x <= x_max
+        settle_visible = x_min <= settle_x <= x_max
+
+        if edge_visible:
+            axis.axvline(
+                edge_x,
+                color=edge_colors.get(kind, "#5f6368"),
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.85,
+                zorder=0,
+            )
+        if settle_visible:
+            axis.axvline(
+                settle_x,
+                color=settle_color,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.85,
+                zorder=0,
+            )
+        if edge_visible and settle_visible and abs(settle_x - edge_x) > 0:
+            axis.annotate(
+                "",
+                xy=(edge_x, y_arrow),
+                xytext=(settle_x, y_arrow),
+                arrowprops={"arrowstyle": "<->", "color": settle_color, "linewidth": 0.9},
+                annotation_clip=True,
+            )
+            axis.text(
+                (edge_x + settle_x) / 2.0,
+                y_text,
+                f"{settling_label} {settling_time_s * 1e6:.1f} us",
+                color=settle_color,
+                fontsize=8,
+                ha="center",
+                va="bottom",
+                bbox={"boxstyle": "round,pad=0.15", "facecolor": "white", "edgecolor": "none", "alpha": 0.75},
+                clip_on=True,
+            )
+
+
+def _scope_response_metrics_from_plot_channels(channels: dict) -> ResponseMetrics | None:
+    ch1 = channels.get("CH1") or channels.get("ch1")
+    ch3 = channels.get("CH3") or channels.get("ch3")
+    if not ch1 or not ch3:
+        return None
+
+    time_array = np.asarray(ch3.get("x", []), dtype=np.float64)
+    response_array = np.asarray(ch3.get("y", []), dtype=np.float64)
+    input_time = np.asarray(ch1.get("x", []), dtype=np.float64)
+    input_array = np.asarray(ch1.get("y", []), dtype=np.float64)
+    total = min(time_array.size, response_array.size)
+    input_total = min(input_time.size, input_array.size)
+    if total < 2 or input_total < 2:
+        return None
+
+    time_array = time_array[:total]
+    response_array = response_array[:total]
+    finite = np.isfinite(time_array) & np.isfinite(response_array)
+    if not np.any(finite):
+        return None
+    time_array = time_array[finite]
+    response_array = response_array[finite]
+    if time_array.size < 2:
+        return None
+
+    input_time = input_time[:input_total]
+    input_array = input_array[:input_total]
+    input_finite = np.isfinite(input_time) & np.isfinite(input_array)
+    if not np.any(input_finite):
+        return None
+    input_time = input_time[input_finite]
+    input_array = input_array[input_finite]
+    if input_time.size < 2:
+        return None
+
+    order = np.argsort(input_time)
+    input_time = input_time[order]
+    input_array = input_array[order]
+    if input_time.size == time_array.size and np.allclose(input_time, time_array, rtol=0.0, atol=1e-15):
+        aligned_input = input_array
+    else:
+        aligned_input = np.interp(time_array, input_time, input_array)
+
+    try:
+        return ResponseAnalyzer(TuningTargets()).analyze(
+            Waveform(
+                time_s=time_array.tolist(),
+                vout_v=response_array.tolist(),
+                input_v=aligned_input.tolist(),
+            )
+        )
+    except Exception:
+        return None
+
+
+def _selected_scope_settling_marker_edges(edges: list[tuple[float, str]]) -> list[tuple[float, str]]:
+    """Show only the first load step and final return step markers."""
+
+    selected: list[tuple[float, str]] = []
+    rising = [edge for edge in edges if edge[1] == "rising"]
+    falling = [edge for edge in edges if edge[1] == "falling"]
+    if rising:
+        selected.append(rising[0])
+    if len(falling) >= 2:
+        selected.append(falling[1])
+    elif falling:
+        selected.append(falling[-1])
+    return sorted(selected, key=lambda item: item[0])
+
+
 def _plot_full_scope_capture_png(
     entry: dict,
     axis_settings: dict | None = None,
     path: Path = LATEST_SCOPE_PNG,
     title: str = "Latest Scope Capture - Full Data",
+    figsize: tuple[float, float] = (16, 6),
+    dpi: int = 150,
 ) -> str:
     import matplotlib
 
@@ -2716,11 +4057,12 @@ def _plot_full_scope_capture_png(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.style.use("default")
-    fig, left_ax = plt.subplots(figsize=(16, 6), dpi=150)
+    fig, left_ax = plt.subplots(figsize=figsize, dpi=dpi)
     right_ax = left_ax.twinx()
     colors = ["#1a73e8", "#ea4335", "#34a853", "#fbbc04", "#8ab4f8", "#f28b82", "#81c995", "#fde293"]
     lines = []
     labels = []
+    response_filter = ResponseAnalyzer(TuningTargets())
     for index, (source, record) in enumerate(channels.items()):
         x_array = np.asarray(record.get("x", []), dtype=np.float64)
         y_array = np.asarray(record.get("y", []), dtype=np.float64)
@@ -2734,11 +4076,31 @@ def _plot_full_scope_capture_png(
             y_array[:total],
             label=source,
             linewidth=0.6,
-            color=colors[index % len(colors)],
+            color="#111111" if source.upper() == "CH3" else colors[index % len(colors)],
+            alpha=0.3 if source.upper() == "CH3" else 1.0,
             rasterized=True,
         )
         lines.append(line)
         labels.append(source)
+        if source.upper() == "CH3":
+            filtered_y = response_filter._zero_phase_lowpass(
+                x_array[:total].tolist(),
+                y_array[:total].tolist(),
+                cutoff_hz=ResponseAnalyzer.RESPONSE_LOWPASS_CUTOFF_HZ,
+            )
+            if len(filtered_y) == total:
+                filtered_line, = axis.plot(
+                    (x_array[:total] - x0) * x_scale,
+                    filtered_y,
+                    label="CH3 5MHz LPF",
+                    linewidth=1.8,
+                    color="#ea4335",
+                    alpha=1.0,
+                    zorder=10,
+                    rasterized=True,
+                )
+                lines.append(filtered_line)
+                labels.append("CH3 5MHz LPF")
 
     left_color = "#1a73e8"
     right_color = "#ea4335"
@@ -2754,6 +4116,15 @@ def _plot_full_scope_capture_png(
     left_ax.spines["left"].set_color(left_color)
     right_ax.spines["right"].set_color(right_color)
     left_ax.grid(True, color="#d9dee7", linewidth=0.7, alpha=0.8)
+    settling_metrics = _scope_response_metrics_from_plot_channels(channels)
+    _draw_scope_settling_markers(
+        left_ax,
+        channels=channels,
+        x0=x0,
+        x1=x1,
+        x_scale=x_scale,
+        metrics=settling_metrics,
+    )
     if lines:
         left_ax.legend(lines, labels, loc="upper center", ncol=min(4, max(1, len(labels))))
     fig.tight_layout()
@@ -2946,15 +4317,18 @@ def _capture_scope(
                     )
                 force_after_s = 0.5 if scope_window_s is None else max(0.25, min(2.0, scope_window_s * 1.5))
                 scope.single_acquisition(timeout_s=8.0, force_after_s=force_after_s)
+                captures = []
                 for channel in safe_channels:
-                    capture = scope.capture_waveform(channel, start=1, stop=stop, max_plot_points=None)
-                    data_file, full_record = _store_full_scope_waveform(
-                        capture_id,
-                        capture,
-                        timestamp,
-                        async_save=async_artifacts,
-                    )
+                    captures.append(scope.capture_waveform(channel, start=1, stop=stop, max_plot_points=None))
+                data_file, full_records = _store_full_scope_capture(
+                    capture_id,
+                    captures,
+                    timestamp,
+                    async_save=async_artifacts,
+                )
+                for channel, full_record in full_records.items():
                     capture_cache_entry["channels"][channel] = full_record
+                for capture in captures:
                     display_x, display_y, display_strategy = _edge_focused_scope_display(
                         capture.x,
                         capture.y,
@@ -2979,13 +4353,14 @@ def _capture_scope(
                             "transfer_encoding": capture.transfer_encoding,
                         }
                     )
+                    source_channel = str(capture.source).upper()
                     for measurement in safe_measurements:
                         try:
-                            value = scope.read_immediate_measurement(channel, measurement)
-                            measurement_rows.append({"source": channel, "measurement": measurement, "value": value, "ok": True})
+                            value = scope.read_immediate_measurement(source_channel, measurement)
+                            measurement_rows.append({"source": source_channel, "measurement": measurement, "value": value, "ok": True})
                         except Exception as exc:
                             measurement_rows.append(
-                                {"source": channel, "measurement": measurement, "value": None, "ok": False, "error": str(exc)}
+                                {"source": source_channel, "measurement": measurement, "value": None, "ok": False, "error": str(exc)}
                             )
                 _remember_scope_capture(capture_id, capture_cache_entry)
                 scope_png = None
@@ -3240,6 +4615,14 @@ def _config_from_payload(payload: dict | None) -> TuningConfig:
     targets_payload = payload.get("targets", {})
     search_payload = payload.get("search", {})
     default_search = SearchSpace()
+    legacy_max_iterations = _int_field(search_payload, "max_iterations", default_search.max_iterations)
+    default_coarse = getattr(default_search, "max_coarse_iterations", max(1, legacy_max_iterations // 2))
+    default_refined = getattr(default_search, "max_refined_iterations", max(0, legacy_max_iterations - default_coarse))
+    max_coarse_iterations = _int_field(search_payload, "max_coarse_iterations", default_coarse)
+    max_refined_iterations = _int_field(search_payload, "max_refined_iterations", default_refined)
+    if legacy_max_iterations > max_coarse_iterations + max_refined_iterations:
+        max_coarse_iterations += legacy_max_iterations - (max_coarse_iterations + max_refined_iterations)
+    total_iterations = max(1, max_coarse_iterations + max_refined_iterations)
     return TuningConfig(
         plant=PlantParams(
             vdc=_float_field(plant_payload, "vdc", 12.0),
@@ -3252,7 +4635,7 @@ def _config_from_payload(payload: dict | None) -> TuningConfig:
             vout_target_v=_float_field(targets_payload, "vout_target_v", 0.9296875),
             overshoot_pct=_float_field(targets_payload, "overshoot_pct", 3.0),
             undershoot_pct=_float_field(targets_payload, "undershoot_pct", 3.0),
-            settling_time_s=_float_field(targets_payload, "settling_time_s", 4e-6),
+            settling_time_s=_float_field(targets_payload, "settling_time_s", 1e-6),
             oscillations=_int_field(targets_payload, "oscillations", 0),
             phase_margin_deg=_float_field(targets_payload, "phase_margin_deg", 45.0),
             crossover_frequency_hz=_float_field(targets_payload, "crossover_frequency_hz", 200_000.0),
@@ -3267,12 +4650,15 @@ def _config_from_payload(payload: dict | None) -> TuningConfig:
             phi_max_deg=_float_field(search_payload, "phi_max_deg", 80.0),
             initial_wc_rad_s=_float_field(search_payload, "initial_wc_rad_s", 157_080.0),
             initial_phi_deg=_float_field(search_payload, "initial_phi_deg", 60.0),
-            max_iterations=_int_field(search_payload, "max_iterations", 40),
+            max_iterations=total_iterations,
+            max_coarse_iterations=max_coarse_iterations,
+            max_refined_iterations=max_refined_iterations,
             mod0_kp=_search_parameter_from_payload(search_payload, "mod0_kp", default_search.mod0_kp, integer=True),
             mod0_ki=_search_parameter_from_payload(search_payload, "mod0_ki", default_search.mod0_ki, integer=True),
             mod0_kd=_search_parameter_from_payload(search_payload, "mod0_kd", default_search.mod0_kd, integer=True),
             mod0_kpole1=_search_parameter_from_payload(search_payload, "mod0_kpole1", default_search.mod0_kpole1, integer=True),
             mod0_kpole2=_search_parameter_from_payload(search_payload, "mod0_kpole2", default_search.mod0_kpole2, integer=True),
+            mod0_cm_gain=_search_parameter_from_payload(search_payload, "mod0_cm_gain", default_search.mod0_cm_gain, integer=True),
             output_inductance_nh=_search_parameter_from_payload(
                 search_payload,
                 "output_inductance_nh",
@@ -3301,6 +4687,7 @@ def _experiment_from_payload(payload: dict | None) -> AutotuneExperimentConfig:
         scope_config=dict(payload.get("scope_config", {}) or {}),
         vout_tolerance_v=_float_field(payload, "vout_tolerance_v", 0.15),
         response_abs_limit_v=_float_field(payload, "response_abs_limit_v", 0.25),
+        ignore_pass_until_max_iterations=bool(payload.get("ignore_pass_until_max_iterations", True)),
     )
 
 
@@ -3491,6 +4878,8 @@ def _compact_bode_result(result: dict) -> dict:
         "original_points": result.get("original_points"),
         "display_points": result.get("display_points"),
         "bode_png_pending": result.get("bode_png_pending"),
+        "session_reused": result.get("session_reused"),
+        "retried_stale_session": result.get("retried_stale_session"),
         "duration_s": result.get("duration_s"),
         "error": result.get("error"),
     }

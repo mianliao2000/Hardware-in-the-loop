@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from itertools import product
 
 from .models import HARDWARE_TUNING_FIELD_NAMES, HardwarePidCandidate, IterationRecord, SearchParameter, SearchSpace
 
@@ -28,7 +29,7 @@ class GridRefinePidTuner:
         self._post_loaded = False
 
     def next_candidate(self, history: list[IterationRecord], best: IterationRecord | None) -> TuningCandidate | None:
-        if len(history) >= self.search.max_iterations:
+        if len(history) >= _total_iteration_budget(self.search):
             return None
         if self._queue:
             return self._queue.pop(0)
@@ -71,16 +72,18 @@ class GridRefinePidTuner:
 class HardwareGridHeuristicTuner:
     """Generate raw hardware candidates with local grid + heuristic refinement."""
 
+    COORDINATE_COARSE_FRACTION = 0.60
+
     def __init__(self, search: SearchSpace):
         self.search = search
         self._queue: list[HardwarePidCandidate] = [self._center_candidate("baseline")]
         self._coordinate_loaded = False
         self._pairwise_loaded = False
-        self._local_loaded = False
+        self._local_pass_index = 0
         self._seen: set[tuple] = set()
 
     def next_candidate(self, history: list[IterationRecord], best: IterationRecord | None) -> HardwarePidCandidate | None:
-        if len(history) >= self.search.max_iterations:
+        if len(history) >= _total_iteration_budget(self.search):
             return None
         for record in history:
             if record.candidate is not None:
@@ -97,20 +100,59 @@ class HardwareGridHeuristicTuner:
 
             if not self._coordinate_loaded:
                 self._coordinate_loaded = True
-                self._queue.extend(self._coordinate_grid())
+                remaining = self._remaining_coordinate_budget(history)
+                if remaining > 0:
+                    self._queue.extend(self._coordinate_grid()[:remaining])
                 continue
 
             if not self._pairwise_loaded and best is not None:
                 self._pairwise_loaded = True
-                self._queue.extend(self._pairwise_refine(history, best))
+                remaining = self._remaining_pairwise_coarse_budget(history)
+                if remaining > 0:
+                    fresh = _dedupe_candidates(self._pairwise_coarse(history, best), self._seen)
+                    self._queue.extend(fresh[:remaining])
                 continue
 
-            if not self._local_loaded and best is not None:
-                self._local_loaded = True
-                self._queue.extend(self._local_refine(best))
-                continue
+            if best is not None and self._remaining_refined_budget(history) > 0:
+                local_loaded = self._load_next_local_pass(history, best)
+                if local_loaded:
+                    continue
 
             return None
+
+    def next_candidate_batch(
+        self,
+        history: list[IterationRecord],
+        best: IterationRecord | None,
+        max_count: int,
+    ) -> list[HardwarePidCandidate]:
+        """Return a small batch of compatible candidates for coarse hardware scans.
+
+        The first candidate decides the batch phase. Baseline, pairwise, and local
+        refine stay single-candidate so adaptive tuning still waits for the latest
+        result before choosing the next point. Coordinate candidates are independent
+        enough to be measured in small batches.
+        """
+
+        remaining = max(0, _total_iteration_budget(self.search) - len(history))
+        limit = max(1, min(int(max_count), remaining))
+        first = self.next_candidate(history, best)
+        if first is None:
+            return []
+        if first.phase != "coordinate" or limit == 1:
+            return [first]
+
+        candidates = [first]
+        while len(candidates) < limit:
+            candidate = self.next_candidate(history, best)
+            if candidate is None:
+                break
+            if candidate.phase != first.phase:
+                self._queue.insert(0, candidate)
+                self._seen.discard(hardware_candidate_key(candidate))
+                break
+            candidates.append(candidate)
+        return candidates
 
     def _center_candidate(self, phase: str) -> HardwarePidCandidate:
         values = {
@@ -122,45 +164,73 @@ class HardwareGridHeuristicTuner:
 
     def _coordinate_grid(self) -> list[HardwarePidCandidate]:
         center = self._center_candidate("coordinate")
-        candidates: list[HardwarePidCandidate] = []
-        for name in HARDWARE_TUNING_FIELD_NAMES:
-            for value in _range_values(_range_for(self.search, name), name):
-                if _typed_value(name, value) == getattr(center, name):
-                    continue
-                candidates.append(_candidate_with(center, name, value, "coordinate"))
-        return candidates
+        value_sets = {
+            name: _range_values(_range_for(self.search, name), name)
+            for name in HARDWARE_TUNING_FIELD_NAMES
+        }
+        return _sample_coordinate_combinations(center, value_sets, max(0, _coarse_iteration_budget(self.search) - 1))
 
-    def _pairwise_refine(self, history: list[IterationRecord], best: IterationRecord) -> list[HardwarePidCandidate]:
-        base = best.candidate or self._center_candidate("pairwise")
+    def _pairwise_coarse(self, history: list[IterationRecord], best: IterationRecord) -> list[HardwarePidCandidate]:
+        base = best.candidate or self._center_candidate("pairwise_coarse")
         ranked_fields = _rank_coordinate_fields(history)
         if not ranked_fields:
-            ranked_fields = list(HARDWARE_TUNING_FIELD_NAMES[:4])
-        fields = ranked_fields[:4]
+            ranked_fields = list(HARDWARE_TUNING_FIELD_NAMES)
+        fields = list(dict.fromkeys([*ranked_fields, *HARDWARE_TUNING_FIELD_NAMES]))
         candidates: list[HardwarePidCandidate] = []
         for index, first in enumerate(fields):
             for second in fields[index + 1:]:
-                for first_value in _neighbor_values(_range_for(self.search, first), getattr(base, first), first):
-                    for second_value in _neighbor_values(_range_for(self.search, second), getattr(base, second), second):
-                        candidate = _candidate_with(base, first, first_value, "pairwise_refine")
-                        candidates.append(_candidate_with(candidate, second, second_value, "pairwise_refine"))
+                for first_value in _range_values(_range_for(self.search, first), first):
+                    for second_value in _range_values(_range_for(self.search, second), second):
+                        candidate = _candidate_with(base, first, first_value, "pairwise_coarse")
+                        candidates.append(_candidate_with(candidate, second, second_value, "pairwise_coarse"))
         return candidates
 
-    def _local_refine(self, best: IterationRecord) -> list[HardwarePidCandidate]:
+    def _load_next_local_pass(self, history: list[IterationRecord], best: IterationRecord) -> bool:
+        max_passes = max(1, _refined_iteration_budget(self.search) or _total_iteration_budget(self.search))
+        while self._local_pass_index < max_passes:
+            remaining = self._remaining_refined_budget(history)
+            if remaining <= 0:
+                return False
+            candidates = self._local_refine(best, self._local_pass_index)
+            self._local_pass_index += 1
+            fresh = _dedupe_candidates(candidates, self._seen)
+            if fresh:
+                self._queue.extend(fresh[:remaining])
+                return True
+        return False
+
+    def _remaining_coordinate_budget(self, history: list[IterationRecord]) -> int:
+        coordinate_budget, _ = _coarse_phase_budgets(self.search)
+        used = sum(1 for record in history if record.phase == "coordinate")
+        queued = sum(1 for candidate in self._queue if candidate.phase == "coordinate")
+        return max(0, coordinate_budget - used - queued)
+
+    def _remaining_pairwise_coarse_budget(self, history: list[IterationRecord]) -> int:
+        _, pairwise_budget = _coarse_phase_budgets(self.search)
+        used = sum(1 for record in history if record.phase == "pairwise_coarse")
+        queued = sum(1 for candidate in self._queue if candidate.phase == "pairwise_coarse")
+        return max(0, pairwise_budget - used - queued)
+
+    def _remaining_refined_budget(self, history: list[IterationRecord]) -> int:
+        local_budget = _refined_iteration_budget(self.search)
+        used = sum(1 for record in history if record.phase == "local_refine")
+        queued = sum(1 for candidate in self._queue if candidate.phase == "local_refine")
+        return max(0, local_budget - used - queued)
+
+    def _local_refine(self, best: IterationRecord, pass_index: int = 0) -> list[HardwarePidCandidate]:
         base = best.candidate or self._center_candidate("local")
         candidates: list[HardwarePidCandidate] = []
+        divisor = 2.0 ** (pass_index + 1)
         for name in HARDWARE_TUNING_FIELD_NAMES:
             parameter = _range_for(self.search, name)
-            step = _parameter_step(parameter, name) / 2.0
+            step = _parameter_step(parameter, name) / divisor
             if _is_int_field(name):
                 step = max(1.0, step)
-            local_parameter = SearchParameter(
-                center=getattr(base, name),
-                min=parameter.min,
-                max=parameter.max,
-                step=step,
-                points=3,
-            )
-            for value in _neighbor_values(local_parameter, getattr(base, name), name):
+            center = getattr(base, name)
+            for value in (
+                _typed_value(name, parameter.clamped(center - step)),
+                _typed_value(name, parameter.clamped(center + step)),
+            ):
                 candidates.append(_candidate_with(base, name, value, "local_refine"))
         return candidates
 
@@ -168,9 +238,42 @@ class HardwareGridHeuristicTuner:
 def select_best_result(records: list[IterationRecord]) -> IterationRecord | None:
     if not records:
         return None
-    passing = [record for record in records if record.metrics.passed]
-    pool = passing or records
+    valid = [record for record in records if not _is_invalid_hardware_record(record)]
+    passing = [record for record in valid if record.metrics.passed]
+    pool = passing or valid or records
     return min(pool, key=_record_priority)
+
+
+def _total_iteration_budget(search: SearchSpace) -> int:
+    total = getattr(search, "total_iteration_budget", None)
+    if callable(total):
+        return total()
+    return max(1, int(getattr(search, "max_iterations", 40)))
+
+
+def _coarse_iteration_budget(search: SearchSpace) -> int:
+    coarse = getattr(search, "coarse_iteration_budget", None)
+    if callable(coarse):
+        return coarse()
+    return max(1, int(getattr(search, "max_iterations", 40)))
+
+
+def _refined_iteration_budget(search: SearchSpace) -> int:
+    refined = getattr(search, "refined_iteration_budget", None)
+    if callable(refined):
+        return refined()
+    return max(0, int(getattr(search, "max_iterations", 40)) - _coarse_iteration_budget(search))
+
+
+def _coarse_phase_budgets(search: SearchSpace) -> tuple[int, int]:
+    # Baseline consumes one coarse slot. The remaining coarse budget is split
+    # between independent coordinate combinations and best-based pairwise coarse.
+    coarse_remaining = max(0, _coarse_iteration_budget(search) - 1)
+    if coarse_remaining <= 0:
+        return (0, 0)
+    coordinate_budget = int(math.ceil(coarse_remaining * HardwareGridHeuristicTuner.COORDINATE_COARSE_FRACTION))
+    coordinate_budget = min(max(0, coordinate_budget), coarse_remaining)
+    return (coordinate_budget, coarse_remaining - coordinate_budget)
 
 
 def hardware_candidate_key(candidate: HardwarePidCandidate) -> tuple:
@@ -180,18 +283,117 @@ def hardware_candidate_key(candidate: HardwarePidCandidate) -> tuple:
         int(candidate.mod0_kd),
         int(candidate.mod0_kpole1),
         int(candidate.mod0_kpole2),
+        int(candidate.mod0_cm_gain),
         round(float(candidate.output_inductance_nh), 6),
         round(float(candidate.effective_lc_inductance_nh), 6),
     )
 
 
+def _dedupe_candidates(candidates: list[HardwarePidCandidate], seen: set[tuple]) -> list[HardwarePidCandidate]:
+    fresh: list[HardwarePidCandidate] = []
+    local_seen: set[tuple] = set()
+    for candidate in candidates:
+        key = hardware_candidate_key(candidate)
+        if key in seen or key in local_seen:
+            continue
+        local_seen.add(key)
+        fresh.append(candidate)
+    return fresh
+
+
+def _sample_coordinate_combinations(
+    center: HardwarePidCandidate,
+    value_sets: dict[str, list[float]],
+    target_count: int,
+) -> list[HardwarePidCandidate]:
+    """Sample multi-parameter coarse-grid combinations without exploding runtime."""
+
+    if target_count <= 0:
+        return []
+    fields = [name for name in HARDWARE_TUNING_FIELD_NAMES if len(value_sets.get(name, [])) > 1]
+    if not fields:
+        return []
+
+    total = 1
+    for name in fields:
+        total *= len(value_sets[name])
+
+    candidates: list[HardwarePidCandidate] = []
+    local_seen: set[tuple] = set()
+
+    def add_from_values(values_by_field: dict[str, float]) -> None:
+        nonlocal candidates
+        values = {field: getattr(center, field) for field in HARDWARE_TUNING_FIELD_NAMES}
+        for field, value in values_by_field.items():
+            if field in {"mod0_kpole1", "mod0_kpole2"}:
+                kpole_value = _kpole_pair_value(float(value))
+                values["mod0_kpole1"] = kpole_value
+                values["mod0_kpole2"] = kpole_value
+            else:
+                values[field] = _typed_value(field, value)
+        candidate = HardwarePidCandidate(**values, phase="coordinate")
+        key = hardware_candidate_key(candidate)
+        if key == hardware_candidate_key(center) or key in local_seen:
+            return
+        local_seen.add(key)
+        candidates.append(candidate)
+
+    lengths = [len(value_sets[name]) for name in fields]
+    target = min(target_count, total - 1)
+    if target <= 0:
+        return []
+
+    stride = max(1, total // target)
+    while math.gcd(stride, total) != 1:
+        stride += 1
+
+    attempts = 0
+    index = 0
+    max_attempts = min(total, max(target_count * 100, 500))
+    while len(candidates) < target_count and attempts < max_attempts:
+        combo_indexes = _mixed_radix_indexes(index, lengths)
+        values = {
+            name: value_sets[name][combo_indexes[field_index]]
+            for field_index, name in enumerate(fields)
+        }
+        add_from_values(values)
+        index = (index + stride) % total
+        attempts += 1
+
+    return candidates
+
+
+def _mixed_radix_indexes(index: int, lengths: list[int]) -> list[int]:
+    indexes = [0] * len(lengths)
+    for position in range(len(lengths) - 1, -1, -1):
+        length = max(1, lengths[position])
+        indexes[position] = index % length
+        index //= length
+    return indexes
+
+
 def _record_priority(record: IterationRecord) -> tuple[float, float, float, int, float, int]:
     metrics = record.metrics
+    if _is_invalid_hardware_record(record):
+        return (2.0, metrics.score, max(metrics.overshoot_pct, metrics.undershoot_pct), metrics.oscillations, metrics.settling_time_s, record.iteration)
     if metrics.passed:
         balance = metrics.overshoot_pct**2 + metrics.undershoot_pct**2
         worst = max(metrics.overshoot_pct, metrics.undershoot_pct)
         return (0.0, balance, worst, metrics.oscillations, metrics.settling_time_s, record.iteration)
     return (1.0, metrics.score, max(metrics.overshoot_pct, metrics.undershoot_pct), metrics.oscillations, metrics.settling_time_s, record.iteration)
+
+
+def _is_invalid_hardware_record(record: IterationRecord) -> bool:
+    reasons = " ".join(str(item).lower() for item in (record.metrics.pass_reasons or []))
+    if (
+        "transient protection skipped" in reasons
+        or "protection skipped" in reasons
+        or "invalid bode" in reasons
+        or "duplicate 0 db crossover" in reasons
+        or "second 0 db crossover" in reasons
+    ):
+        return True
+    return math.isfinite(record.metrics.score) and record.metrics.score >= 1.0e6
 
 
 def _linspace(start: float, stop: float, count: int) -> list[float]:
@@ -257,8 +459,18 @@ def _parameter_step(parameter: SearchParameter, name: str) -> float:
 
 def _candidate_with(base: HardwarePidCandidate, name: str, value: float, phase: str) -> HardwarePidCandidate:
     values = {field: getattr(base, field) for field in HARDWARE_TUNING_FIELD_NAMES}
-    values[name] = _typed_value(name, _range_value_for_base(base, name, value))
+    typed_value = _typed_value(name, _range_value_for_base(base, name, value))
+    if name in {"mod0_kpole1", "mod0_kpole2"}:
+        kpole_value = _kpole_pair_value(float(typed_value))
+        values["mod0_kpole1"] = kpole_value
+        values["mod0_kpole2"] = kpole_value
+    else:
+        values[name] = typed_value
     return HardwarePidCandidate(**values, phase=phase)
+
+
+def _kpole_pair_value(value: float) -> int:
+    return 3 if abs(value - 3) <= abs(value - 6) else 6
 
 
 def _range_value_for_base(base: HardwarePidCandidate, name: str, value: float) -> float:
@@ -269,6 +481,8 @@ def _range_value_for_base(base: HardwarePidCandidate, name: str, value: float) -
         return min(max(value, 0), 255)
     if name in {"mod0_kpole1", "mod0_kpole2"}:
         return min(max(value, 0), 15)
+    if name == "mod0_cm_gain":
+        return min(max(value, 0), 127)
     return value
 
 

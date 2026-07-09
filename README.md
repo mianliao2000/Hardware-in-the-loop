@@ -1,277 +1,389 @@
-# TPU A1 Hardware PID Auto-Tuner
+# TPU A1 Hardware-in-the-Loop Power Auto-Tuner
 
-This project is the hardware-testbench version of the simulation auto-tuner.
-The first milestone is instrument connectivity over USB, starting with a
-function generator.
+This repository contains a local hardware-in-the-loop workbench for tuning a
+TPU power-board multiphase buck regulator. The main application is a localhost
+web GUI named **Google Power Auto-Tuner (V1.0)**. It can manually control the
+lab instruments, run repeatable data acquisition, and perform real hardware PID
+auto-tuning against Bode and transient-response targets.
+
+The system is intended for bench use by people who do not want to edit Python
+or SCPI scripts for every experiment. The GUI exposes the important knobs, while
+the backend handles PMBus writes, instrument sequencing, safety checks, data
+capture, plotting, result storage, and GIF generation.
+
+## Safety
+
+This code controls real power hardware. Before running any write operation:
+
+- Confirm the power stage, load, probes, and injection setup are correct.
+- Use the GUI self-test before starting tuning.
+- Keep conservative search ranges until the board behavior is understood.
+- Remember that only one program should own the XDP USB dongle at a time.
+- The function generator output is disabled in `finally` blocks after
+  transient captures, but the operator is still responsible for bench safety.
+
+## Hardware Stack
+
+The current bench integration covers:
+
+- Infineon XDPE1A2G5C controller over PMBus/I2C through an Infineon XDP USB
+  dongle.
+- Tektronix AFG31000 function generator over VISA.
+- Tektronix MSO58 oscilloscope over VISA using binary waveform transfer.
+- OMICRON Bode 100 through Bode Analyzer Suite's SCPI runner.
+- Keysight N5767A power supply over VISA. In the current bench this represents
+  the master unit of a physically paralleled supply pair.
+
+The board communication path is:
+
+```text
+Browser GUI
+  -> gui/server.py
+  -> BoardController / PmbusDevice
+  -> XdpNodeUsbI2cAdapter
+  -> hardware/instruments/xdp_usb_bridge.js
+  -> Infineon XDP USB dongle
+  -> PMBus/I2C
+  -> XDPE1A2G5C controller
+```
+
+The instrument communication path is:
+
+```text
+Browser GUI
+  -> gui/server.py
+  -> hardware/instruments/*.py
+  -> VISA / TCP SCPI
+  -> AFG31000, MSO58, Bode 100, N5767A
+```
+
+## Repository Layout
+
+```text
+gui/
+  server.py                 Local API server and static frontend server.
+  frontend/                 React + Vite + TypeScript GUI.
+
+hardware/instruments/
+  board_controller.py       High-level XDPE board control.
+  pmbus.py                  PMBus command encoding/decoding.
+  i2c_adapters.py           XDP USB adapter process management.
+  xdp_usb_bridge.js         Node USB bridge for the Infineon XDP dongle.
+  oscilloscope.py           Tektronix MSO58 control and binary waveform reads.
+  function_generator.py     Tektronix AFG31000 control.
+  bode_analyzer.py          Bode 100 SCPI runner integration.
+  bode100.py                Bode sweep helpers and metrics.
+  power_supply.py           Keysight N5767A control.
+  self_test.py              Reversible connection checks.
+
+hardware/tuning/
+  models.py                 Tuning dataclasses and result models.
+  search.py                 Coarse/pairwise/refined candidate generation.
+  analyzer.py               Transient, Bode, and penalty calculations.
+  runner.py                 Real hardware tuning session orchestration.
+  pid_programmer.py         PID programming interface.
+
+scripts/
+  compact_scope_npz.py      Repack old scope captures into compact NPZ files.
+  recompute_tuning_results.py
+                            Recompute saved metrics/plots from stored data.
+
+docs/
+  hardware_in_loop_lab_notes.md
+                            Lab notes and reverse-engineering history.
+  i2c_pmbus_vout_control.md PMBus VOUT control notes.
+
+results/                    Runtime tuning results. Ignored by git.
+data/                       Runtime captures/cache. Ignored by git.
+snapshots/                  Local reverse-engineering snapshots. Ignored by git.
+```
 
 ## Setup
+
+Python 3.11+ is recommended.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-You also need a VISA backend installed on Windows, usually one of:
-
-- NI-VISA
-- Keysight IO Libraries Suite
-- TekVISA
-
-## First Function Generator Check
-
-List visible VISA resources:
+Install frontend dependencies:
 
 ```powershell
-python scripts/list_visa_resources.py
-```
-
-Connect to the first USB instrument and read its identity:
-
-```powershell
-python scripts/connect_function_generator.py
-```
-
-Or pass a resource explicitly:
-
-```powershell
-python scripts/connect_function_generator.py --resource "USB0::0x0957::0x2807::MY12345678::INSTR"
-```
-
-Try a safe output-off configuration:
-
-```powershell
-python scripts/connect_function_generator.py --resource "USB0::..." --configure-sine --frequency 1000 --amplitude 0.2 --offset 0
-```
-
-The script leaves output disabled unless `--enable-output` is provided.
-
-## Board Controller Over I2C/PMBus
-
-Infineon XDP Designer and ADI Power Studio are useful for manual validation and
-exporting configuration, but the auto-tuner controls the board directly from
-Python over I2C/PMBus. Keep tuning writes volatile until the exact controller,
-register map, and safe limits are confirmed.
-
-Validate the Python path with the mock adapter:
-
-```powershell
-python scripts/connect_board.py --adapter mock --address 0x40 --identify --status
-```
-
-When an I2C adapter is connected, start with read-only checks:
-
-```powershell
-python scripts/connect_board.py --adapter aardvark --address 0x40 --kind infineon_xdp --identify --status
-```
-
-The board script does not enable outputs or change PID values by default.
-State-changing commands such as `--clear-faults` must be requested explicitly.
-
-## Keysight N5767A Parallel Power Supply
-
-The two N5767A supplies are physically wired in master/slave parallel mode. The
-software talks to the master VISA resource only and does not configure the
-parallel wiring, tracking, analog programming, or master/slave role.
-
-Read the current state without changing output:
-
-```powershell
-python scripts/connect_power_supply.py --resource "USB0::0x0957::0xA407::US17M5136P::INSTR"
-```
-
-Set conservative limits while leaving output state unchanged:
-
-```powershell
-python scripts/connect_power_supply.py --resource "USB0::0x0957::0xA407::US17M5136P::INSTR" --voltage 12 --current-limit 1
-```
-
-Enable output only when voltage and current limit are both provided:
-
-```powershell
-python scripts/connect_power_supply.py --resource "USB0::0x0957::0xA407::US17M5136P::INSTR" --voltage 12 --current-limit 1 --output-on
-```
-
-## Infineon XDPE1A2G5C Vout Over PMBus
-
-The XDPE1A2G5C controller uses PMBus over SMBus/I2C. For the Yosemite board,
-the active controller address shown by XDP Designer is `0x5E`.
-
-Relevant PMBus commands:
-
-- `PAGE` `0x00`: page `0` = Loop A, page `1` = Loop B
-- `VOUT_MODE` `0x20`: read this first to determine VOUT encoding
-- `VOUT_COMMAND` `0x21`: set target Vout in the format selected by `VOUT_MODE`
-- `READ_VOUT` `0x8B`: read Vout telemetry in the same VOUT format
-
-Dry-run the encoding path:
-
-```powershell
-python scripts/set_xdpe_vout.py --adapter mock --address 0x5E --page 0 --voltage 0.95 --read --dry-run
-```
-
-When a supported I2C adapter is connected, read before writing:
-
-```powershell
-python scripts/set_xdpe_vout.py --adapter aardvark --address 0x5E --page 0 --read
-```
-
-The Total Phase `aardvark_py` package currently works with Python 3.5-3.8.
-Use a Python 3.8 environment for Aardvark hardware access:
-
-```powershell
-py -3.8 -m pip install aardvark_py
-py -3.8 scripts/list_aardvark.py
-py -3.8 scripts/set_xdpe_vout.py --adapter aardvark --address 0x5E --page 0 --read
-```
-
-For the current Yosemite/XDPE setup, Vout control must follow the XDP Designer
-PMBus sequence: write the operating-memory `VOUT_COMMAND`, then set
-`OPERATION = 0x80` so the output follows the PMBus nominal target. See the
-bring-up notes for the full reasoning:
-
-```text
-docs/i2c_pmbus_vout_control.md
-```
-
-The older standalone script writes only `VOUT_COMMAND` and is mainly useful for
-encoding/readback checks:
-
-```powershell
-python scripts/set_xdpe_vout.py --adapter aardvark --address 0x5E --page 0 --voltage 0.95 --write
-```
-
-Do not use `STORE_*` commands during tuning; those copy settings to non-volatile
-memory.
-
-## Local PID Auto-Tuner GUI
-
-The browser GUI lives in the standalone `gui/` folder. The Python server exposes
-the instrument APIs and serves the React/Vite workbench build.
-
-- `gui/server.py`: localhost API and React build server
-- `gui/frontend/`: React/Vite/TypeScript workbench
-- `hardware/tuning/`: hardware PID candidate search, scoring, and run state
-
-Build the frontend once after changing GUI code:
-
-```powershell
-cd gui\frontend
+cd gui/frontend
 npm install
 npm run build
-cd ..\..
+cd ../..
 ```
 
-Start the local server with:
+The XDP bridge uses Node.js and USB access. The Bode 100 path expects Bode
+Analyzer Suite to be installed and able to start or expose its SCPI runner.
+
+## Environment
+
+Copy `.env.example` to `.env` and fill in local values. `.env` is ignored by
+git and must not be committed.
+
+The GUI assistant uses an OpenAI-compatible chat-completions style API. The
+default example is configured for MiniMax:
+
+```env
+LLM_API_BASE_URL=https://api.minimax.io/v1
+LLM_API_KEY=your_minimax_api_key_here
+LLM_MODEL=MiniMax-M3
+LLM_TIMEOUT_S=30
+LLM_TEMPERATURE=0.2
+LLM_MAX_TOKENS=700
+
+MINIMAX_API_KEY=your_minimax_api_key_here
+MINIMAX_BASE_URL=https://api.minimax.io/v1
+MINIMAX_MODEL=MiniMax-M3
+```
+
+## Running The GUI
+
+Start the localhost server:
 
 ```powershell
 python gui/server.py --host 127.0.0.1 --port 8765
 ```
 
-Then open:
+Open:
 
 ```text
 http://127.0.0.1:8765
 ```
 
-The current auto-tuner GUI runs real hardware-in-the-loop iterations. Each
-iteration can write Loop A/page 0 XDPE parameters, run a Bode 100 gain/phase
-sweep, apply the configured function-generator load step, capture the MSO58
-scope response, disable the function-generator output, and score the candidate.
+If the port is already in use, stop the old server process or start on another
+port.
 
-The hardware search space is centered on the current manual parameters and
-includes:
+## GUI Tabs
 
-- `mod0_kp`, `mod0_ki`, `mod0_kd`
-- `mod0_kpole1`, `mod0_kpole2`
+### PID Auto-Tune
+
+Runs the real hardware tuning flow. The tab includes:
+
+- Run control: start, single iteration, pause, resume, stop, reset, GIF save,
+  and GIF open.
+- Transient and Bode enable checkboxes. At least one analysis must be enabled.
+- Function generator settings used by the tuning transient step.
+- Bode analysis settings used by the tuning Bode sweep.
+- Targets for transient and loop metrics.
+- Search space for the hardware parameters.
+- Result library for recent and permanent runs.
+- Transient, Bode, penalty trend, iteration history, current result, and best
+  result panels.
+
+### Manual Tuning
+
+Provides direct manual control of the bench:
+
+- VOUT command and PMBus output control.
+- PID/current-emulation register writes.
+- Function generator setup and output enable/disable.
+- Bode 100 sweep and plot.
+- Scope capture with channel-axis assignment and binary waveform transfer.
+- Power supply read/write and output enable/disable.
+- Full Data Acquisition: Bode sweep, function generator step, scope capture,
+  and function generator shutdown in one sequence.
+
+### Self Testing
+
+Runs reversible connection checks. These checks avoid turning outputs on or off
+for safety. For devices where a setting check is needed, the test changes a
+small reversible setting and restores it.
+
+### AI Help
+
+The assistant panel explains GUI concepts and workflows using the configured
+LLM API. It is a helper only; it does not directly operate the hardware.
+
+## Auto-Tune Hardware Flow
+
+Each real tuning iteration uses the same backend path as Manual Tuning:
+
+1. Write the target `VOUT_COMMAND`.
+2. Write candidate PID/current-emulation parameters to the XDPE controller.
+3. Run the Bode 100 sweep if Bode analysis is enabled.
+4. Apply the current function-generator settings.
+5. Enable the function-generator output.
+6. Capture the scope using single acquisition if transient analysis is enabled.
+7. Disable the function-generator output in a `finally` block.
+8. Compute metrics, update the penalty, store plots/data, and update best
+   candidate.
+
+If a transient trips protection or a candidate is invalid, the point is marked
+invalid and bypassed. Invalid/tripped points use a bounded penalty instead of
+stopping the whole run. The output-control recovery path can disable and
+re-enable the PMBus/XDP output control before continuing.
+
+## Search Strategy
+
+The search operates on real hardware parameters:
+
+- `mod0_kp`
+- `mod0_ki`
+- `mod0_kd`
+- `mod0_kpole1`
+- `mod0_kpole2`
+- `mod0_cm_gain`
 - output inductance
 - effective LC inductance
 
-The target panel defines transient and loop-stability goals such as overshoot,
-undershoot, settling time, phase margin, crossover frequency, and gain margin.
-The penalty value is lower-is-better. Recent auto-tune runs are saved locally
-with transient/Bode PNG snapshots, and a combined transient+Bode GIF can be
-generated from the iteration history.
+The UI separates **Max Coarse Iterations** and **Max Refined Iterations**.
+Coarse search samples combinations from the configured min/max/points table.
+Pairwise exploration is part of the coarse stage. Refined search then performs
+local refinement around the best candidates.
 
-Search-space inputs are edited locally and committed only on blur or Enter so
-that values can be cleared and rewritten without being overwritten by status
-polling. The status endpoint is intentionally lightweight and does not perform
-disk persistence on every GUI refresh; result persistence happens on tuning
-events and iteration completion.
+Current default PID ranges are intentionally broad:
 
-The Vout and PMBus output controls use the XDP USB dongle path and perform
-volatile PMBus writes only. Vout control writes `VOUT_COMMAND` followed by
-`OPERATION = 0x80` when PMBus output control is active. Close XDP Designer
-before using these controls, because the XDP dongle is exclusive and cannot be
-controlled by both programs at the same time.
+- `mod0_kp`: 100 to 255
+- `mod0_ki`: 150 to 255
+- `mod0_kd`: 100 to 200
+- `mod0_kpole1` and `mod0_kpole2`: usually tested as matched 3 or 6 values
 
-## Bode 100 SCPI Server Automation
+## Metrics And Penalty
 
-The OMICRON Lab Bode 100 is not exposed to Python as a normal USBTMC VISA
-instrument. The supported control path is:
+Lower penalty is better.
 
-```text
-Python backend -> PyVISA TCP socket -> Bode Analyzer Suite ScpiRunner -> USB -> Bode 100
-```
+Transient metrics are computed from the scope capture:
 
-Install Bode Analyzer Suite on Windows. The SCPI runner is normally located at:
+- CH1 is the function-generator/load-step signal.
+- CH3 is the output-voltage response.
+- CH3 is low-pass filtered at 5 MHz for OS/US/settling calculations.
+- Raw CH3 is still plotted for visibility, but the filtered trace is the
+  metric trace.
+- Rising and falling CH1 edges define the load segments.
+- Low-load and high-load steady-state Vout are computed from the corresponding
+  load windows.
+- Overshoot and undershoot are measured relative to the load-state steady
+  voltage.
+- OS settling and US settling are reported separately in microseconds.
 
-```text
-C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe
-```
+Current default transient targets:
 
-Python also needs `pyvisa` and a VISA backend such as NI-VISA, Keysight IO
-Libraries, or TekVISA. The dependencies in `requirements.txt` include PyVISA.
+- Overshoot max: 3 percent.
+- Undershoot max: 3 percent.
+- Settling target: 1 us.
 
-Configure the Bode 100 connection with environment variables:
+Bode metrics are computed from the Bode 100 sweep:
 
-```powershell
-$env:BODE100_SERIAL = "Bode100R2-XXXXXX"
-$env:BODE100_HOST = "127.0.0.1"
-$env:BODE100_PORT = "5025"
-$env:BODE100_SCPI_RUNNER_PATH = "C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe"
-# Optional override:
-$env:BODE100_VISA_RESOURCE = "TCPIP::127.0.0.1::5025::SOCKET"
-```
+- Phase margin target: greater than 45 deg.
+- Crossover frequency upper limit: 200 kHz.
+- Crossover below the upper limit can receive a small reward.
+- Crossover above the upper limit receives a percent-based penalty.
+- Gain margin is displayed, but it is not currently used in the penalty.
+- A duplicated gain crossover is treated as an invalid Bode result.
 
-Find the serial number from the Bode Analyzer Suite device-selection screen, the
-Windows device label, or the device information shown by the suite. Do not
-hard-code a lab-specific serial number in source code.
+Invalid/tripped candidates use a bounded penalty so they remain visible in the
+history without dominating plots.
 
-Manual one-time ScpiRunner test:
+## Result Storage
 
-```powershell
-& "C:\Program Files\OMICRON\BodeAnalyzerSuite\OmicronLab.VectorNetworkAnalysis.ScpiRunner.exe" -s "Bode100R2-XXXXXX"
-```
-
-Then connect from Python:
-
-```powershell
-python scripts/connect_bode100.py --serial "Bode100R2-XXXXXX"
-```
-
-Or rely on the environment variables:
-
-```powershell
-python scripts/connect_bode100.py
-```
-
-The GUI backend exposes a small IDN endpoint:
+Runtime results are stored under:
 
 ```text
-GET http://127.0.0.1:8765/api/instruments/bode100/idn
+results/autotune_runs/recent/
+results/autotune_runs/saved/
 ```
 
-The Bode sweep API also uses the same automation path, so the Bode Analyzer
-Suite GUI does not need to be opened manually when ScpiRunner can claim the
-device.
+Recent runs are temporary. Saving a run permanently moves it out of recent and
+into saved results. Permanent runs are only removed by user action.
 
-Troubleshooting:
+Each iteration may store:
 
-- Port 5025 already used: stop the other SCPI server or set `BODE100_PORT`.
-- Wrong serial number: ScpiRunner may start but never expose a listener.
-- Bode 100 not connected: verify USB, power, and Windows Device Manager.
-- Different BAS path: set `BODE100_SCPI_RUNNER_PATH`.
-- VISA backend missing: install NI-VISA, Keysight IO Libraries, or TekVISA.
-- BAS GUI and SCPI server competing: close the GUI if ScpiRunner cannot claim
-  the Bode 100.
+- Scope full-data capture.
+- Bode full-data capture.
+- Scope PNG.
+- Bode PNG.
+- Combined GIF frames.
+- Iteration metadata and metrics.
+
+Scope full-data files use a compact NPZ format:
+
+- One capture per file.
+- `x` is stored as `x0`, `dx`, and `n` instead of a full array.
+- Each channel `y` array is stored as `float32`.
+
+This keeps complete data for future automation while reducing disk usage.
+
+## Plotting And GIFs
+
+Transient plots show CH1, raw CH3, and CH3 5 MHz LPF. Edge and settling markers
+are drawn to make the settling-time decision visible.
+
+Bode plots show gain and phase together. GIF generation supports:
+
+- transient-only runs,
+- Bode-only runs,
+- combined transient + Bode + penalty-trend runs.
+
+Trip/invalid points can be skipped in the GIF animation.
+
+## Instrument Notes
+
+### XDP / PMBus
+
+The Infineon XDP dongle is accessed through a Node USB bridge. XDP Designer and
+this backend should not own the dongle at the same time. If XDP Designer grabs
+the dongle, close it and let the backend reconnect.
+
+### Bode 100
+
+Bode control uses Bode Analyzer Suite's SCPI runner over TCP. If the SCPI
+listener is missing, open Bode Analyzer Suite once or verify the runner path and
+device serial.
+
+### MSO58 Scope
+
+Scope waveform reads use binary transfer instead of ASCII. This is much faster
+for large captures and allows the backend to retain complete waveform data.
+
+### Power Supply
+
+For the paralleled Keysight N5767A setup, control the master supply interface.
+Do not reconfigure the physical parallel mode from this software.
+
+## Useful Commands
+
+Compile Python:
+
+```powershell
+python -m compileall hardware gui scripts
+```
+
+Run Python tests:
+
+```powershell
+python -m unittest tests.test_tuning
+```
+
+Build the frontend:
+
+```powershell
+cd gui/frontend
+npm run build
+```
+
+Recompute saved tuning results after analyzer changes:
+
+```powershell
+python scripts/recompute_tuning_results.py --help
+```
+
+Compact older scope capture files:
+
+```powershell
+python scripts/compact_scope_npz.py --help
+```
+
+## Development Rules
+
+- Keep secrets in `.env`; never commit them.
+- Keep runtime data under ignored `results/`, `data/`, and `snapshots/`
+  directories unless a specific artifact is intentionally exported.
+- Prefer adding new hardware behavior behind backend helpers instead of wiring
+  raw SCPI or PMBus commands directly into the frontend.
+- Treat GUI defaults as bench defaults. If a default changes, update the
+  frontend, backend model defaults, and this README together.

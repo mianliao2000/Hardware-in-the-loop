@@ -13,6 +13,7 @@ from .compensator import CompensatorDesign
 from .models import (
     AutotuneExperimentConfig,
     ExperimentResult,
+    HARDWARE_TUNING_FIELD_NAMES,
     HardwarePidCandidate,
     IterationRecord,
     PidParameters,
@@ -28,6 +29,11 @@ from .models import (
 )
 from .pid_programmer import PidProgrammer, StubPidProgrammer
 from .search import GridRefinePidTuner, HardwareGridHeuristicTuner, TuningCandidate, select_best_result
+
+
+LOCAL_REFINE_IMPROVEMENT_EPSILON = 1e-9
+LOCAL_REFINE_STALL_PATIENCE = 2 * len(HARDWARE_TUNING_FIELD_NAMES)
+COORDINATE_BATCH_SIZE = 20
 
 
 class AutotuneExperimentRunner(Protocol):
@@ -115,6 +121,7 @@ class PidAutotuneSession:
         self._tuner = HardwareGridHeuristicTuner(self._snapshot.config.search)
         self._stop_requested = False
         self._worker: threading.Thread | None = None
+        self._local_refine_no_improvement_count = 0
 
     def configure(self, config: TuningConfig, experiment: AutotuneExperimentConfig | None = None) -> dict:
         with self._lock:
@@ -127,6 +134,7 @@ class PidAutotuneSession:
                 experiment=experiment or self._snapshot.experiment,
             )
             self._tuner = HardwareGridHeuristicTuner(config.search)
+            self._local_refine_no_improvement_count = 0
             return self.status()
 
     def update_context(self, config: TuningConfig | None = None, experiment: AutotuneExperimentConfig | None = None) -> None:
@@ -155,7 +163,7 @@ class PidAutotuneSession:
             if self._snapshot.state == "running":
                 return self.status()
             self._stop_requested = False
-            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=True)
+            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=False)
             self._snapshot.state = "running"
             self._snapshot.message = "Hardware auto-tune started."
             self._worker = threading.Thread(target=self._run_loop, name="pid-autotune", daemon=True)
@@ -176,7 +184,7 @@ class PidAutotuneSession:
             if self._snapshot.state not in {"paused", "stopped", "idle"}:
                 raise RuntimeError(f"Cannot resume from state '{self._snapshot.state}'.")
             self._stop_requested = False
-            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=True)
+            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=False)
             self._snapshot.state = "running"
             self._snapshot.message = "Hardware auto-tune resumed."
             self._worker = threading.Thread(target=self._run_loop, name="pid-autotune", daemon=True)
@@ -197,6 +205,7 @@ class PidAutotuneSession:
             self._snapshot = snapshot
             self._tuner = HardwareGridHeuristicTuner(snapshot.config.search)
             self._stop_requested = False
+            self._local_refine_no_improvement_count = 0
             return self.status()
 
     def stop(self) -> dict:
@@ -228,7 +237,7 @@ class PidAutotuneSession:
     def status(self) -> dict:
         with self._lock:
             self._snapshot.pid_programming = self._pid_programmer.status()
-            return _compact_status(to_jsonable(self._snapshot))
+            return _snapshot_to_compact_status(self._snapshot)
 
     def _run_loop(self) -> None:
         while True:
@@ -238,7 +247,7 @@ class PidAutotuneSession:
                         self._snapshot.state = "paused"
                         self._snapshot.message = "Paused."
                     return
-            did_run = self._run_one_iteration()
+            did_run = self._run_next_background_unit()
             if not did_run:
                 return
             with self._lock:
@@ -248,6 +257,34 @@ class PidAutotuneSession:
                     return
             time.sleep(0.2)
 
+    def _run_next_background_unit(self) -> bool:
+        with self._lock:
+            config = self._snapshot.config
+            experiment = self._snapshot.experiment
+            best = self._snapshot.best
+            if experiment.enable_transient_analysis and experiment.enable_bode_analysis:
+                candidates = self._tuner.next_candidate_batch(
+                    self._snapshot.history,
+                    best,
+                    COORDINATE_BATCH_SIZE,
+                )
+            else:
+                candidate = self._tuner.next_candidate(self._snapshot.history, best)
+                candidates = [candidate] if candidate is not None else []
+            if not candidates:
+                self._mark_search_complete_locked(config, best)
+                return False
+
+        if (
+            len(candidates) > 1
+            and candidates[0].phase == "coordinate"
+            and experiment.enable_transient_analysis
+            and experiment.enable_bode_analysis
+        ):
+            return self._run_coordinate_batch(candidates, config, experiment)
+
+        return self._run_candidate_serial(candidates[0], config, experiment)
+
     def _run_one_iteration(self) -> bool:
         with self._lock:
             config = self._snapshot.config
@@ -255,45 +292,89 @@ class PidAutotuneSession:
             best = self._snapshot.best
             candidate = self._tuner.next_candidate(self._snapshot.history, best)
             if candidate is None:
-                self._snapshot.state = "complete"
-                self._snapshot.message = "Tuning search complete."
+                self._mark_search_complete_locked(config, best)
                 return False
 
+        return self._run_candidate_serial(candidate, config, experiment)
+
+    def _run_candidate_serial(
+        self,
+        candidate: HardwarePidCandidate,
+        config: TuningConfig,
+        experiment: AutotuneExperimentConfig,
+    ) -> bool:
         try:
             started = time.perf_counter()
             result = self._experiment_runner.evaluate(candidate, config, experiment)
-            pid = PidParameters(
-                kp=float(candidate.mod0_kp),
-                ki=float(candidate.mod0_ki),
-                kd=float(candidate.mod0_kd),
-                kf=float(candidate.mod0_kpole1),
-            )
+            return self._append_iteration_result(candidate, result, started, config)
+        except Exception as exc:
+            if experiment.enable_transient_analysis and _is_recoverable_transient_failure(exc):
+                try:
+                    recovery = self._recover_after_transient_protection(experiment)
+                    failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
+                    return self._append_iteration_result(candidate, failed_result, started, config)
+                except Exception as recovery_exc:
+                    exc = recovery_exc
             with self._lock:
-                record = IterationRecord(
-                    iteration=len(self._snapshot.history) + 1,
-                    phase=candidate.phase,
-                    wc_rad_s=0.0,
-                    phi_deg=0.0,
-                    pid=pid,
-                    metrics=result.metrics,
-                    waveform=result.waveform,
-                    timestamp=time.time(),
-                    candidate=candidate,
-                    write_results=result.write_results,
-                    bode_result=result.bode_result,
-                    scope_result=result.scope_result,
-                    duration_s=result.duration_s or (time.perf_counter() - started),
+                self._snapshot.state = "error"
+                self._snapshot.message = str(exc)
+            return False
+
+    def _run_coordinate_batch(
+        self,
+        candidates: list[HardwarePidCandidate],
+        config: TuningConfig,
+        experiment: AutotuneExperimentConfig,
+    ) -> bool:
+        transient_experiment = replace(experiment, enable_transient_analysis=True, enable_bode_analysis=False)
+        bode_experiment = replace(experiment, enable_transient_analysis=False, enable_bode_analysis=True)
+        transient_results: list[tuple[HardwarePidCandidate, ExperimentResult, float]] = []
+        try:
+            for index, candidate in enumerate(candidates, 1):
+                with self._lock:
+                    self._snapshot.message = (
+                        f"Coordinate batch transient {index}/{len(candidates)} "
+                        f"({len(self._snapshot.history) + index}/{_total_iteration_budget(config.search)})."
                 )
-                self._snapshot.history.append(record)
-                self._snapshot.current = record
-                self._snapshot.best = select_best_result(self._snapshot.history)
-                self._snapshot.message = f"Iteration {record.iteration} complete ({record.phase})."
-                if record.metrics.passed:
-                    self._snapshot.state = "complete"
-                    self._snapshot.message = f"Auto-tune passed at iteration {record.iteration}."
-                elif len(self._snapshot.history) >= config.search.max_iterations:
-                    self._snapshot.state = "complete"
-                    self._snapshot.message = "Reached max iterations."
+                started = time.perf_counter()
+                try:
+                    transient_results.append(
+                        (candidate, self._experiment_runner.evaluate(candidate, config, transient_experiment), started)
+                    )
+                except Exception as exc:
+                    if not _is_recoverable_transient_failure(exc):
+                        raise
+                    recovery = self._recover_after_transient_protection(experiment)
+                    failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
+                    keep_running = self._append_iteration_result(candidate, failed_result, started, config)
+                    if not keep_running:
+                        return False
+
+            for index, (candidate, transient_result, started) in enumerate(transient_results, 1):
+                with self._lock:
+                    self._snapshot.message = (
+                        f"Coordinate batch Bode {index}/{len(transient_results)} "
+                        f"({len(self._snapshot.history) + 1}/{_total_iteration_budget(config.search)})."
+                    )
+                try:
+                    bode_result = self._experiment_runner.evaluate(candidate, config, bode_experiment)
+                except Exception as exc:
+                    if not _is_recoverable_transient_failure(exc):
+                        raise
+                    recovery = self._recover_after_transient_protection(experiment)
+                    failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
+                    keep_running = self._append_iteration_result(candidate, failed_result, started, config)
+                    if not keep_running:
+                        return False
+                    continue
+                combined_result = self._merge_split_experiment_results(
+                    transient_result,
+                    bode_result,
+                    config,
+                )
+                keep_running = self._append_iteration_result(candidate, combined_result, started, config)
+                if not keep_running:
+                    return False
             return True
         except Exception as exc:
             with self._lock:
@@ -301,9 +382,204 @@ class PidAutotuneSession:
                 self._snapshot.message = str(exc)
             return False
 
+    def _recover_after_transient_protection(self, experiment: AutotuneExperimentConfig) -> dict[str, Any]:
+        recover = getattr(self._experiment_runner, "recover_after_transient_protection", None)
+        if not callable(recover):
+            return {"ok": False, "error": "Experiment runner does not support output recovery."}
+        result = recover(experiment)
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "Experiment runner returned invalid output recovery result."}
+        if not result.get("ok"):
+            raise RuntimeError(f"Transient protection recovery failed: {result.get('error')}")
+        return result
+
+    def _merge_split_experiment_results(
+        self,
+        transient_result: ExperimentResult,
+        bode_result: ExperimentResult,
+        config: TuningConfig,
+    ) -> ExperimentResult:
+        metrics = ResponseAnalyzer(config.targets).analyze_hardware(
+            transient_result.waveform,
+            bode_result.bode_result.get("margins") if bode_result.bode_result else None,
+            enable_transient=True,
+            enable_bode=True,
+        )
+        write_results = {
+            "split_coordinate_batch": True,
+            "transient": transient_result.write_results,
+            "bode": bode_result.write_results,
+        }
+        transient_duration = float(transient_result.duration_s or 0.0)
+        bode_duration = float(bode_result.duration_s or 0.0)
+        return ExperimentResult(
+            waveform=transient_result.waveform,
+            metrics=metrics,
+            write_results=write_results,
+            bode_result=bode_result.bode_result,
+            scope_result=transient_result.scope_result,
+            duration_s=transient_duration + bode_duration,
+        )
+
+    def _append_iteration_result(
+        self,
+        candidate: HardwarePidCandidate,
+        result: ExperimentResult,
+        started: float,
+        config: TuningConfig,
+    ) -> bool:
+        pid = PidParameters(
+            kp=float(candidate.mod0_kp),
+            ki=float(candidate.mod0_ki),
+            kd=float(candidate.mod0_kd),
+            kf=float(candidate.mod0_kpole1),
+        )
+        with self._lock:
+            previous_best = self._snapshot.best
+            record = IterationRecord(
+                iteration=len(self._snapshot.history) + 1,
+                phase=candidate.phase,
+                wc_rad_s=0.0,
+                phi_deg=0.0,
+                pid=pid,
+                metrics=result.metrics,
+                waveform=result.waveform,
+                timestamp=time.time(),
+                candidate=candidate,
+                write_results=result.write_results,
+                bode_result=result.bode_result,
+                scope_result=result.scope_result,
+                duration_s=result.duration_s or (time.perf_counter() - started),
+            )
+            self._snapshot.history.append(record)
+            self._snapshot.current = record
+            self._snapshot.best = select_best_result(self._snapshot.history)
+            self._snapshot.message = f"Iteration {record.iteration} complete ({record.phase})."
+            if record.metrics.passed and not self._snapshot.experiment.ignore_pass_until_max_iterations:
+                self._snapshot.state = "complete"
+                self._snapshot.message = f"Auto-tune passed at iteration {record.iteration}."
+            elif len(self._snapshot.history) >= _total_iteration_budget(config.search):
+                self._snapshot.state = "complete"
+                self._snapshot.message = "Reached max iterations."
+            return self._snapshot.state == "running"
+
+    def _mark_search_complete_locked(self, config: TuningConfig, best: IterationRecord | None) -> None:
+        self._snapshot.state = "complete"
+        if best is not None and len(self._snapshot.history) < _total_iteration_budget(config.search):
+            self._snapshot.message = "Tuning search complete: no fresh candidates remain."
+        else:
+            self._snapshot.message = "Tuning search complete."
+
+    def _fine_tune_is_saturated(self, record: IterationRecord, previous_best: IterationRecord | None) -> bool:
+        if record.phase != "local_refine":
+            self._local_refine_no_improvement_count = 0
+            return False
+        if _record_improves_penalty(record, previous_best):
+            self._local_refine_no_improvement_count = 0
+            return False
+        self._local_refine_no_improvement_count += 1
+        return self._local_refine_no_improvement_count >= LOCAL_REFINE_STALL_PATIENCE
+
+
+def _record_improves_penalty(record: IterationRecord, previous_best: IterationRecord | None) -> bool:
+    if previous_best is None:
+        return True
+    if record.metrics.passed and not previous_best.metrics.passed:
+        return True
+    return record.metrics.score < previous_best.metrics.score - LOCAL_REFINE_IMPROVEMENT_EPSILON
+
+
+def _total_iteration_budget(search: SearchSpace) -> int:
+    total = getattr(search, "total_iteration_budget", None)
+    if callable(total):
+        return total()
+    return max(1, int(getattr(search, "max_iterations", 40)))
+
+
+def _is_recoverable_transient_failure(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "scope safety check failed" in message
+        or "transient protection" in message
+        or "vout safety check failed: read 0.0000" in message
+        or "vout write failed: vout safety check failed: read 0.0000" in message
+    )
+
+
+def _skipped_protection_result(
+    candidate: HardwarePidCandidate,
+    exc: Exception,
+    recovery: dict[str, Any],
+    duration_s: float,
+) -> ExperimentResult:
+    reason = f"transient protection skipped: {exc}"
+    metrics = ResponseMetrics(
+        overshoot_pct=0.0,
+        undershoot_pct=0.0,
+        settling_time_s=0.0,
+        oscillations=0,
+        score=300.0,
+        passed=False,
+        pass_reasons=[reason],
+    )
+    return ExperimentResult(
+        waveform=Waveform(time_s=[], vout_v=[], input_v=[]),
+        metrics=metrics,
+        write_results={
+            "skipped": True,
+            "skip_reason": reason,
+            "candidate": {**candidate.pid_values(), **candidate.current_mode_values()},
+            "recovery": recovery,
+        },
+        bode_result={"skipped": True, "reason": "transient protection"},
+        scope_result={"skipped": True, "reason": "transient protection"},
+        duration_s=duration_s,
+    )
+
+
+def _snapshot_to_compact_status(snapshot: TuningRunSnapshot) -> dict[str, Any]:
+    """Keep tuning status lightweight enough for frequent GUI polling.
+
+    The full in-memory snapshot intentionally keeps response waveforms for
+    analysis and future automation, but the GUI status endpoint should never
+    serialize those large arrays. Convert records directly into their compact
+    JSON shape instead of converting the full dataclass tree first.
+    """
+
+    return {
+        "state": snapshot.state,
+        "message": snapshot.message,
+        "config": to_jsonable(snapshot.config),
+        "experiment": to_jsonable(snapshot.experiment),
+        "current": _compact_iteration_record(snapshot.current),
+        "best": _compact_iteration_record(snapshot.best),
+        "history": [_compact_iteration_record(record) for record in snapshot.history],
+        "pid_programming": to_jsonable(snapshot.pid_programming),
+    }
+
+
+def _compact_iteration_record(record: IterationRecord | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    return {
+        "iteration": record.iteration,
+        "phase": record.phase,
+        "wc_rad_s": record.wc_rad_s,
+        "phi_deg": record.phi_deg,
+        "pid": to_jsonable(record.pid),
+        "metrics": to_jsonable(record.metrics),
+        "waveform": {"time_s": [], "vout_v": [], "input_v": []},
+        "timestamp": record.timestamp,
+        "candidate": to_jsonable(record.candidate),
+        "write_results": to_jsonable(record.write_results),
+        "bode_result": _compact_bode_result(to_jsonable(record.bode_result)),
+        "scope_result": _compact_scope_result(to_jsonable(record.scope_result)),
+        "duration_s": record.duration_s,
+    }
+
 
 def _compact_status(status: dict[str, Any]) -> dict[str, Any]:
-    """Keep tuning status lightweight enough for frequent GUI polling."""
+    """Keep already-materialized tuning status lightweight."""
 
     for key in ("current", "best"):
         if isinstance(status.get(key), dict):
@@ -426,6 +702,14 @@ def _config_from_payload(payload: Any) -> TuningConfig:
     targets = _dict_payload(payload.get("targets"))
     search = _dict_payload(payload.get("search"))
     default_search = SearchSpace()
+    legacy_max_iterations = _int_payload(search, "max_iterations", default_search.max_iterations)
+    default_coarse = getattr(default_search, "max_coarse_iterations", max(1, legacy_max_iterations // 2))
+    default_refined = getattr(default_search, "max_refined_iterations", max(0, legacy_max_iterations - default_coarse))
+    max_coarse_iterations = _int_payload(search, "max_coarse_iterations", default_coarse)
+    max_refined_iterations = _int_payload(search, "max_refined_iterations", default_refined)
+    if legacy_max_iterations > max_coarse_iterations + max_refined_iterations:
+        max_coarse_iterations += legacy_max_iterations - (max_coarse_iterations + max_refined_iterations)
+    total_iterations = max(1, max_coarse_iterations + max_refined_iterations)
     return TuningConfig(
         plant=PlantParams(
             vdc=_float_payload(plant, "vdc", 12.0),
@@ -438,7 +722,7 @@ def _config_from_payload(payload: Any) -> TuningConfig:
             vout_target_v=_float_payload(targets, "vout_target_v", 0.9296875),
             overshoot_pct=_float_payload(targets, "overshoot_pct", 3.0),
             undershoot_pct=_float_payload(targets, "undershoot_pct", 3.0),
-            settling_time_s=_float_payload(targets, "settling_time_s", 4e-6),
+            settling_time_s=_float_payload(targets, "settling_time_s", 1e-6),
             oscillations=_int_payload(targets, "oscillations", 0),
             phase_margin_deg=_float_payload(targets, "phase_margin_deg", 45.0),
             crossover_frequency_hz=_float_payload(targets, "crossover_frequency_hz", 200_000.0),
@@ -453,12 +737,15 @@ def _config_from_payload(payload: Any) -> TuningConfig:
             phi_max_deg=_float_payload(search, "phi_max_deg", default_search.phi_max_deg),
             initial_wc_rad_s=_float_payload(search, "initial_wc_rad_s", default_search.initial_wc_rad_s),
             initial_phi_deg=_float_payload(search, "initial_phi_deg", default_search.initial_phi_deg),
-            max_iterations=_int_payload(search, "max_iterations", default_search.max_iterations),
+            max_iterations=total_iterations,
+            max_coarse_iterations=max_coarse_iterations,
+            max_refined_iterations=max_refined_iterations,
             mod0_kp=_search_parameter_from_payload(search.get("mod0_kp"), default_search.mod0_kp),
             mod0_ki=_search_parameter_from_payload(search.get("mod0_ki"), default_search.mod0_ki),
             mod0_kd=_search_parameter_from_payload(search.get("mod0_kd"), default_search.mod0_kd),
             mod0_kpole1=_search_parameter_from_payload(search.get("mod0_kpole1"), default_search.mod0_kpole1),
             mod0_kpole2=_search_parameter_from_payload(search.get("mod0_kpole2"), default_search.mod0_kpole2),
+            mod0_cm_gain=_search_parameter_from_payload(search.get("mod0_cm_gain"), default_search.mod0_cm_gain),
             output_inductance_nh=_search_parameter_from_payload(search.get("output_inductance_nh"), default_search.output_inductance_nh),
             effective_lc_inductance_nh=_search_parameter_from_payload(search.get("effective_lc_inductance_nh"), default_search.effective_lc_inductance_nh),
         ),
@@ -480,6 +767,7 @@ def _experiment_from_payload(payload: Any) -> AutotuneExperimentConfig:
         vout_tolerance_v=_float_payload(payload, "vout_tolerance_v", 0.15),
         response_abs_limit_v=_float_payload(payload, "response_abs_limit_v", 0.25),
         async_artifacts=bool(payload.get("async_artifacts", False)),
+        ignore_pass_until_max_iterations=bool(payload.get("ignore_pass_until_max_iterations", True)),
     )
 
 
@@ -550,6 +838,7 @@ def _candidate_from_payload(payload: Any) -> HardwarePidCandidate | None:
         mod0_kd=_int_payload(payload, "mod0_kd", 175),
         mod0_kpole1=_int_payload(payload, "mod0_kpole1", 3),
         mod0_kpole2=_int_payload(payload, "mod0_kpole2", 3),
+        mod0_cm_gain=_int_payload(payload, "mod0_cm_gain", 2),
         output_inductance_nh=_float_payload(payload, "output_inductance_nh", 100.024),
         effective_lc_inductance_nh=_float_payload(payload, "effective_lc_inductance_nh", 369.276),
         phase=str(payload.get("phase") or "loaded"),

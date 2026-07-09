@@ -36,6 +36,23 @@ High-rate telemetry polling can generate thousands of HTTP access lines. The ser
 
 This keeps the terminal readable when Live Data runs at high rates.
 
+## Scope Data File Format
+
+Scope captures are saved in a compact NPZ format so long autotune runs do not create excessively large result folders.
+
+Current format:
+
+- One capture is saved as one `.npz` file.
+- The time axis is not stored as a full array. The file stores `x_start`, `x_increment`, and `points`; the full time axis is reconstructed as `x_start + arange(points) * x_increment`.
+- Each channel waveform is stored as `float32`, for example `y_CH1` and `y_CH3`.
+- Metadata stores channel names, units, capture ID, timestamp, original point count, and transfer encoding.
+
+This keeps the full waveform available for future analysis while avoiding repeated `float64` time arrays and per-channel duplicate files. Older per-channel files can be converted with:
+
+```powershell
+python scripts/compact_scope_npz.py results/autotune_runs/recent/Recent_YYYY-MM-DD_NN
+```
+
 ## XDP / PMBus Board Control
 
 The board is controlled through PMBus over the XDP dongle. The active controller address used during testing was:

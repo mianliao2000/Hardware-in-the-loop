@@ -20,13 +20,19 @@ class BodeStabilityMargins:
     phase_crossover_hz: float | None
     gain_margin_db: float | None
     gain_crossover_hz: float | None
+    gain_crossover_count: int = 0
+    duplicate_gain_crossover: bool = False
+    second_phase_crossover_hz: float | None = None
 
-    def as_dict(self) -> dict[str, float | None]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "phase_margin_deg": self.phase_margin_deg,
             "phase_crossover_hz": self.phase_crossover_hz,
             "gain_margin_db": self.gain_margin_db,
             "gain_crossover_hz": self.gain_crossover_hz,
+            "gain_crossover_count": self.gain_crossover_count,
+            "duplicate_gain_crossover": self.duplicate_gain_crossover,
+            "second_phase_crossover_hz": self.second_phase_crossover_hz,
         }
 
 
@@ -206,18 +212,22 @@ def calculate_stability_margins(
     if len(points) < 2:
         return BodeStabilityMargins(None, None, None, None)
 
-    gain_crossover_hz = None
-    phase_at_gain_crossover = None
-    phase_crossover_hz = None
-    gain_at_phase_crossover = None
+    gain_crossovers: list[tuple[float, float]] = []
+    phase_crossovers: list[tuple[float, float]] = []
 
     for (f0, m0, p0), (f1, m1, p1) in zip(points, points[1:]):
-        if gain_crossover_hz is None and _crosses(m0, m1, 0.0):
-            gain_crossover_hz, phase_at_gain_crossover = _interpolate_log_frequency(f0, p0, m0, f1, p1, m1, 0.0)
-        if phase_crossover_hz is None and _crosses(p0, p1, 0.0):
-            phase_crossover_hz, gain_at_phase_crossover = _interpolate_log_frequency(f0, m0, p0, f1, m1, p1, 0.0)
-        if gain_crossover_hz is not None and phase_crossover_hz is not None:
-            break
+        if _crosses(m0, m1, 0.0):
+            gain_crossovers.append(_interpolate_log_frequency(f0, p0, m0, f1, p1, m1, 0.0))
+        if _crosses(p0, p1, 0.0):
+            phase_crossovers.append(_interpolate_log_frequency(f0, m0, p0, f1, m1, p1, 0.0))
+
+    gain_crossovers = _dedupe_crossovers(gain_crossovers)
+    phase_crossovers = _dedupe_crossovers(phase_crossovers)
+
+    gain_crossover_hz = gain_crossovers[0][0] if gain_crossovers else None
+    phase_at_gain_crossover = gain_crossovers[0][1] if gain_crossovers else None
+    phase_crossover_hz = phase_crossovers[0][0] if phase_crossovers else None
+    gain_at_phase_crossover = phase_crossovers[0][1] if phase_crossovers else None
 
     phase_margin = (
         _phase_margin_from_gain_crossover_phase(phase_at_gain_crossover)
@@ -230,6 +240,9 @@ def calculate_stability_margins(
         phase_crossover_hz=gain_crossover_hz,
         gain_margin_db=gain_margin,
         gain_crossover_hz=phase_crossover_hz,
+        gain_crossover_count=len(gain_crossovers),
+        duplicate_gain_crossover=len(gain_crossovers) > 1,
+        second_phase_crossover_hz=gain_crossovers[1][0] if len(gain_crossovers) > 1 else None,
     )
 
 
@@ -258,6 +271,19 @@ def _unwrap_phase_deg(values: list[float]) -> list[float]:
 
 def _crosses(a: float, b: float, target: float) -> bool:
     return (a - target) == 0.0 or (b - target) == 0.0 or (a - target) * (b - target) < 0.0
+
+
+def _dedupe_crossovers(crossovers: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    deduped: list[tuple[float, float]] = []
+    for frequency, value in crossovers:
+        if not deduped:
+            deduped.append((frequency, value))
+            continue
+        previous_frequency = deduped[-1][0]
+        if previous_frequency > 0 and abs(frequency - previous_frequency) / previous_frequency < 1e-6:
+            continue
+        deduped.append((frequency, value))
+    return deduped
 
 
 def _interpolate_log_frequency(
