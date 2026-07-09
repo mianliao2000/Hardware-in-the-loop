@@ -11,7 +11,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-from .visa_resource import VisaConnectionError, VisaInstrument
+from .visa_resource import VisaInstrument
 
 
 @dataclass

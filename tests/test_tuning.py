@@ -312,6 +312,33 @@ class TuningFrameworkTest(unittest.TestCase):
         self.assertAlmostEqual(metrics.low_load_steady_v, 0.937, places=6)
         self.assertAlmostEqual(metrics.undershoot_pct, (0.837 - 0.826) / 0.837 * 100.0, places=3)
 
+    def test_high_load_steady_ignores_trailing_falling_edge(self) -> None:
+        dt = 0.1e-6
+        count = 1100
+        time_s = [index * dt for index in range(count)]
+        input_v = []
+        vout_v = []
+        for index in range(count):
+            t_us = time_s[index] * 1e6
+            if t_us < 2.0:
+                input_v.append(0.0)
+                vout_v.append(0.93)
+            elif t_us < 50.0:
+                input_v.append(2.0)
+                vout_v.append(0.83)
+            elif t_us < 100.0:
+                input_v.append(0.0)
+                vout_v.append(0.93)
+            else:
+                input_v.append(-0.2)
+                vout_v.append(0.84)
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v))
+
+        self.assertAlmostEqual(metrics.high_load_steady_v, 0.83, places=3)
+        self.assertLess(metrics.undershoot_pct, 1.0)
+        self.assertLess(metrics.settling_time_s, 10e-6)
+
     def test_settling_uses_smoothed_waveform_so_ripple_does_not_extend_time(self) -> None:
         dt = 0.05e-6
         count = 1200
@@ -378,6 +405,30 @@ class TuningFrameworkTest(unittest.TestCase):
         metrics = ResponseAnalyzer(TuningTargets()).analyze(Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v))
 
         self.assertGreater(metrics.overshoot_settling_time_s, 10e-6)
+
+    def test_overshoot_settling_catches_shallow_dip_after_first_recovery(self) -> None:
+        dt = 0.05e-6
+        count = 1200
+        time_s = [index * dt for index in range(count)]
+        input_v = [2.0 if index < 200 or index >= 900 else 0.0 for index in range(count)]
+        vout_v = []
+        for index in range(count):
+            t_us = time_s[index] * 1e6
+            if t_us < 10.0:
+                vout_v.append(0.84)
+            elif t_us < 10.75:
+                vout_v.append(0.86 + (t_us - 10.0) / 0.75 * 0.06)
+            elif t_us < 11.75:
+                vout_v.append(0.925)
+            elif t_us < 12.75:
+                vout_v.append(0.920)
+            else:
+                vout_v.append(0.928)
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v))
+
+        self.assertGreater(metrics.overshoot_settling_time_s, 2e-6)
+        self.assertLess(metrics.overshoot_settling_time_s, 8e-6)
 
     def test_overshoot_settling_includes_shallow_post_rise_rollback(self) -> None:
         dt = 0.05e-6

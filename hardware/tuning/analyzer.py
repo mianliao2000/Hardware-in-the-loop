@@ -174,6 +174,7 @@ class ResponseAnalyzer:
         events = self._input_edges(waveform.input_v)
         if not events:
             return None
+        analysis_events = self._analysis_edges(events)
 
         overshoot_pct = 0.0
         undershoot_pct = 0.0
@@ -185,8 +186,9 @@ class ResponseAnalyzer:
         low_load_steady_v = _mean(low_load_steady_values)
         high_load_steady_v = _mean(high_load_steady_values)
         overshoot_pct, undershoot_pct = self._load_step_extremes(waveform, events, low_load_steady_v, high_load_steady_v)
-        for event_index, event in enumerate(events):
-            next_index = events[event_index + 1].index if event_index + 1 < len(events) else len(waveform.time_s)
+        for event in analysis_events:
+            next_event = next((candidate for candidate in events if candidate.index > event.index), None)
+            next_index = next_event.index if next_event is not None else len(waveform.time_s)
             if next_index <= event.index:
                 continue
 
@@ -219,6 +221,15 @@ class ResponseAnalyzer:
             low_load_steady_v=low_load_steady_v,
             high_load_steady_v=high_load_steady_v,
         )
+
+    def _analysis_edges(self, events: list[_StepEvent]) -> list[_StepEvent]:
+        first_rising = next((event for event in events if event.edge == "rising"), None)
+        if first_rising is None:
+            return events
+        first_falling = next((event for event in events if event.edge == "falling" and event.index > first_rising.index), None)
+        if first_falling is None:
+            return events
+        return [first_rising, first_falling]
 
     def _load_step_extremes(
         self,
@@ -271,9 +282,18 @@ class ResponseAnalyzer:
             if baseline is not None:
                 low_load_values.append(baseline)
 
-        # In the normal one-period window there is one falling edge; its
-        # pre-window is the representative heavy-load steady-state value.
-        for event in falling_events:
+        # Use falling edges that close a real high-load interval. Some captures
+        # include an extra trailing falling edge whose pre-window is already
+        # back at low load; including it would bias the high-load steady value
+        # upward and make the whole high-load plateau look like undershoot.
+        selected_falling = [
+            event
+            for index, event in enumerate(events)
+            if event.edge == "falling" and index > 0 and events[index - 1].edge == "rising"
+        ]
+        if not selected_falling:
+            selected_falling = falling_events
+        for event in selected_falling:
             baseline = self._mean_before(waveform, event.index, window_s=10e-6)
             if baseline is not None:
                 high_load_values.append(baseline)
@@ -387,9 +407,9 @@ class ResponseAnalyzer:
         # Settling uses a tighter, ripple-aware band than the OS/US pass limit.
         # A full 3% transient limit is too wide for settling: later load-line
         # dips can hide inside that band even though the response is visibly not
-        # settled. The 0.75% cap keeps shallow sustained rollback visible while
+        # settled. The 0.65% cap keeps shallow sustained rollback visible while
         # the ripple tolerance below still suppresses ordinary switching ripple.
-        settling_pct = min(max(tolerance_pct, 0.0), 0.75)
+        settling_pct = min(max(tolerance_pct, 0.0), 0.65)
         percentage_tolerance = max(abs(final_value) * settling_pct / 100.0, 1e-6)
         ripple_tolerance = self._steady_ripple_tolerance(waveform, start_index, end_index)
         ripple_floor = max(6e-3, abs(final_value) * 0.005)

@@ -15,17 +15,20 @@ import shutil
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING
 from urllib import error as urllib_error
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib import request as urllib_request
 import uuid
 import re
 
 import numpy as np
 
+if TYPE_CHECKING:
+    from PIL import Image, ImageFont
+
 
 ROOT = Path(__file__).resolve().parents[1]
-STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_ADDRESS = "0x5E"
 DEFAULT_PAGE = 0
 
@@ -1080,7 +1083,7 @@ class AutotuneRunStore:
         width: int,
         height: int | None = None,
     ) -> "Image.Image":
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
 
         height = height or max(280, min(460, int(width * 0.36)))
         image = Image.new("RGB", (width, height), "white")
@@ -1624,6 +1627,157 @@ def _sanitize_llm_reply(reply: str) -> str:
     return re.sub(r"(?is)<think>.*?</think>\s*", "", reply).strip()
 
 
+def _truthy_env(name: str, default: str = "false") -> bool:
+    return (os.environ.get(name, default) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _latest_user_message(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message["role"] == "user":
+            return message["content"]
+    return ""
+
+
+def _should_web_search(query: str) -> bool:
+    if not _truthy_env("WEB_SEARCH_ENABLED", "true"):
+        return False
+    lowered = query.lower()
+    triggers = [
+        "latest",
+        "newest",
+        "today",
+        "current",
+        "recent",
+        "news",
+        "web",
+        "internet",
+        "search",
+        "lookup",
+        "google",
+        "查一下",
+        "搜索",
+        "联网",
+        "最新",
+        "最近",
+        "今天",
+        "现在",
+        "资料",
+        "官网",
+    ]
+    return any(trigger in lowered for trigger in triggers)
+
+
+def _compact_search_query(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:200]
+
+
+def _search_with_tavily(query: str, max_results: int, timeout_s: float) -> list[dict[str, str]]:
+    api_key = (os.environ.get("TAVILY_API_KEY") or "").strip()
+    if not api_key:
+        return []
+    payload = json.dumps(
+        {
+            "api_key": api_key,
+            "query": query,
+            "search_depth": os.environ.get("TAVILY_SEARCH_DEPTH", "basic"),
+            "max_results": max_results,
+            "include_answer": False,
+            "include_raw_content": False,
+        }
+    ).encode("utf-8")
+    request = urllib_request.Request(
+        "https://api.tavily.com/search",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib_request.urlopen(request, timeout=timeout_s) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    results = data.get("results") if isinstance(data, dict) else []
+    clean: list[dict[str, str]] = []
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        url = str(item.get("url", "")).strip()
+        content = str(item.get("content", "")).strip()
+        if title and url:
+            clean.append({"title": title[:160], "url": url[:500], "snippet": content[:450]})
+    return clean
+
+
+def _search_with_duckduckgo(query: str, max_results: int, timeout_s: float) -> list[dict[str, str]]:
+    url = (
+        "https://api.duckduckgo.com/"
+        f"?q={quote_plus(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1"
+    )
+    request = urllib_request.Request(url, headers={"User-Agent": "PidAutotunerGui/0.2"})
+    with urllib_request.urlopen(request, timeout=timeout_s) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    clean: list[dict[str, str]] = []
+
+    abstract = str(data.get("AbstractText", "") if isinstance(data, dict) else "").strip()
+    abstract_url = str(data.get("AbstractURL", "") if isinstance(data, dict) else "").strip()
+    heading = str(data.get("Heading", "") if isinstance(data, dict) else "").strip()
+    if abstract and abstract_url:
+        clean.append({"title": heading or "DuckDuckGo result", "url": abstract_url, "snippet": abstract[:450]})
+
+    def add_related(items: object) -> None:
+        if len(clean) >= max_results or not isinstance(items, list):
+            return
+        for item in items:
+            if len(clean) >= max_results:
+                return
+            if not isinstance(item, dict):
+                continue
+            nested = item.get("Topics")
+            if nested:
+                add_related(nested)
+                continue
+            title = str(item.get("Text", "")).strip()
+            first_url = str(item.get("FirstURL", "")).strip()
+            if title and first_url:
+                clean.append({"title": title[:160], "url": first_url[:500], "snippet": title[:450]})
+
+    if isinstance(data, dict):
+        add_related(data.get("RelatedTopics"))
+    return clean[:max_results]
+
+
+def _web_search_context(query: str) -> str:
+    query = _compact_search_query(query)
+    if not query:
+        return ""
+    max_results = max(1, min(5, int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "4") or "4")))
+    timeout_s = max(2.0, min(15.0, float(os.environ.get("WEB_SEARCH_TIMEOUT_S", "6") or "6")))
+    results: list[dict[str, str]] = []
+    errors: list[str] = []
+
+    for provider in ("tavily", "duckduckgo"):
+        try:
+            results = _search_with_tavily(query, max_results, timeout_s) if provider == "tavily" else _search_with_duckduckgo(query, max_results, timeout_s)
+            if results:
+                break
+        except Exception as exc:
+            errors.append(f"{provider}: {exc}")
+
+    if not results:
+        if errors:
+            return "Web search was attempted but returned no usable results. Search errors: " + "; ".join(errors)[:700]
+        return ""
+
+    lines = [f"Web search results for: {query}"]
+    for index, item in enumerate(results, start=1):
+        lines.append(
+            f"{index}. {item['title']}\n"
+            f"   URL: {item['url']}\n"
+            f"   Snippet: {item['snippet']}"
+        )
+    lines.append("Use these search results only when relevant, cite URLs in the answer, and say when information comes from search results.")
+    return "\n".join(lines)[:3500]
+
+
 def _call_llm_chat(messages: object, context: object) -> tuple[str, str]:
     api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("MINIMAX_API_KEY") or "").strip()
     if not api_key:
@@ -1635,6 +1789,9 @@ def _call_llm_chat(messages: object, context: object) -> tuple[str, str]:
     temperature = float(os.environ.get("LLM_TEMPERATURE", "0.2") or "0.2")
     max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "700") or "700")
 
+    clean_messages = _coerce_llm_messages(messages)
+    user_query = _latest_user_message(clean_messages)
+    search_context = _web_search_context(user_query) if _should_web_search(user_query) else ""
     gui_context = json.dumps(context if isinstance(context, dict) else {}, ensure_ascii=False, default=str)[:4000]
     system_prompt = (
         "You are a concise assistant embedded inside the Google Power Auto-Tuner GUI. "
@@ -1645,7 +1802,9 @@ def _call_llm_chat(messages: object, context: object) -> tuple[str, str]:
         "or workflow to use. Be safety-aware and practical.\n\n"
         f"Current GUI context JSON:\n{gui_context}"
     )
-    outgoing = [{"role": "system", "content": system_prompt}, *_coerce_llm_messages(messages)]
+    if search_context:
+        system_prompt += f"\n\nExternal web search context:\n{search_context}"
+    outgoing = [{"role": "system", "content": system_prompt}, *clean_messages]
     body = json.dumps(
         {
             "model": model,
@@ -3741,25 +3900,35 @@ def _plot_full_bode_sweep_png(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.style.use("default")
+    plt.rcParams.update(
+        {
+            "font.size": 13,
+            "axes.titlesize": 16,
+            "axes.labelsize": 14,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "legend.fontsize": 15,
+        }
+    )
     fig, gain_ax = plt.subplots(figsize=figsize, dpi=dpi)
     phase_ax = gain_ax.twinx()
-    gain_line, = gain_ax.semilogx(frequency, magnitude, color="#ea4335", linewidth=1.2, label="Gain")
-    phase_line, = phase_ax.semilogx(frequency, phase, color="#1a73e8", linewidth=1.2, label="Phase")
-    gain_ax.axhline(0, color="#9aa0a6", linewidth=0.8)
-    phase_ax.axhline(0, color="#9aa0a6", linewidth=0.8, alpha=0.6)
+    gain_line, = gain_ax.semilogx(frequency, magnitude, color="#ea4335", linewidth=1.6, label="Gain")
+    phase_line, = phase_ax.semilogx(frequency, phase, color="#1a73e8", linewidth=1.6, label="Phase")
+    gain_ax.axhline(0, color="#9aa0a6", linewidth=1.0)
+    phase_ax.axhline(0, color="#9aa0a6", linewidth=1.0, alpha=0.6)
 
     margins = margins or {}
     phase_crossover = margins.get("phase_crossover_hz")
     gain_crossover = margins.get("gain_crossover_hz")
     if phase_crossover:
-        gain_ax.axvline(float(phase_crossover), color="#1a73e8", linestyle="--", linewidth=0.9, alpha=0.7)
+        gain_ax.axvline(float(phase_crossover), color="#1a73e8", linestyle="--", linewidth=1.2, alpha=0.7)
     if gain_crossover:
-        gain_ax.axvline(float(gain_crossover), color="#ea4335", linestyle="--", linewidth=0.9, alpha=0.7)
+        gain_ax.axvline(float(gain_crossover), color="#ea4335", linestyle="--", linewidth=1.2, alpha=0.7)
 
     gain_ax.set_xlim(float(np.min(frequency)), float(np.max(frequency)))
     gain_ax.set_ylim(-100, 100)
     phase_ax.set_ylim(-200, 200)
-    gain_ax.set_title(title)
+    gain_ax.set_title(title, pad=14)
     gain_ax.set_xlabel("Frequency (Hz)")
     gain_ax.set_ylabel("Gain (dB)", color="#ea4335")
     phase_ax.set_ylabel("Phase (deg)", color="#1a73e8")
@@ -3767,10 +3936,19 @@ def _plot_full_bode_sweep_png(
     phase_ax.tick_params(axis="y", colors="#1a73e8")
     gain_ax.spines["left"].set_color("#ea4335")
     phase_ax.spines["right"].set_color("#1a73e8")
-    gain_ax.grid(True, which="both", color="#d9dee7", linewidth=0.7, alpha=0.8)
-    gain_ax.legend([gain_line, phase_line], ["Gain", "Phase"], loc="upper center", ncol=2)
-    fig.tight_layout()
-    fig.savefig(path)
+    gain_ax.grid(True, which="both", color="#d9dee7", linewidth=0.8, alpha=0.8)
+    gain_ax.legend(
+        [gain_line, phase_line],
+        ["Gain", "Phase"],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.995),
+        ncol=2,
+        framealpha=0.92,
+        borderpad=0.45,
+        handlelength=2.2,
+    )
+    fig.subplots_adjust(top=0.86, left=0.075, right=0.925, bottom=0.14)
+    fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return _scope_png_public_path(path)
 
@@ -3882,24 +4060,17 @@ def _draw_scope_settling_markers(
 
     x_min = 0.0
     x_max = max(0.0, (x1 - x0) * x_scale)
-    y_min, y_max = axis.get_ylim()
-    y_span = max(1e-12, y_max - y_min)
-    y_arrow = y_min + 0.82 * y_span
-    y_text = y_min + 0.85 * y_span
     edge_colors = {"rising": "#5f6368", "falling": "#5f6368"}
     settle_color = "#ea4335"
+    label_slots: list[float] = []
 
     for edge_time_s, kind in edge_times:
         settling_time_s = None
         if metrics is not None:
             if kind == "rising":
                 settling_time_s = float(metrics.undershoot_settling_time_s)
-                settling_label = "US Ts"
             else:
                 settling_time_s = float(metrics.overshoot_settling_time_s)
-                settling_label = "OS Ts"
-        else:
-            settling_label = "Ts"
         if settling_time_s is None or not math.isfinite(settling_time_s) or settling_time_s < 0:
             continue
         edge_x = (edge_time_s - x0) * x_scale
@@ -3926,22 +4097,36 @@ def _draw_scope_settling_markers(
                 zorder=0,
             )
         if edge_visible and settle_visible and abs(settle_x - edge_x) > 0:
+            label_x = (edge_x + settle_x) / 2.0
+            label_x = min(max(label_x, x_min + 0.06 * (x_max - x_min)), x_max - 0.06 * (x_max - x_min))
+            y_arrow = 0.78
+            y_text = 0.805
+            for used_x in label_slots:
+                if abs(label_x - used_x) < max(0.08 * (x_max - x_min), 1e-12):
+                    y_text = 0.69
+                    y_arrow = 0.665
+                    break
+            label_slots.append(label_x)
             axis.annotate(
                 "",
                 xy=(edge_x, y_arrow),
                 xytext=(settle_x, y_arrow),
-                arrowprops={"arrowstyle": "<->", "color": settle_color, "linewidth": 0.9},
+                xycoords=axis.get_xaxis_transform(),
+                textcoords=axis.get_xaxis_transform(),
+                arrowprops={"arrowstyle": "<->", "color": settle_color, "linewidth": 1.4},
                 annotation_clip=True,
             )
             axis.text(
-                (edge_x + settle_x) / 2.0,
+                label_x,
                 y_text,
-                f"{settling_label} {settling_time_s * 1e6:.1f} us",
+                f"Ts {settling_time_s * 1e6:.1f} us",
+                transform=axis.get_xaxis_transform(),
                 color=settle_color,
-                fontsize=8,
+                fontsize=13,
+                fontweight="bold",
                 ha="center",
                 va="bottom",
-                bbox={"boxstyle": "round,pad=0.15", "facecolor": "white", "edgecolor": "none", "alpha": 0.75},
+                bbox={"boxstyle": "round,pad=0.28", "facecolor": "white", "edgecolor": "#f3b7b0", "alpha": 0.94},
                 clip_on=True,
             )
 
@@ -4057,6 +4242,16 @@ def _plot_full_scope_capture_png(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.style.use("default")
+    plt.rcParams.update(
+        {
+            "font.size": 13,
+            "axes.titlesize": 16,
+            "axes.labelsize": 14,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "legend.fontsize": 12,
+        }
+    )
     fig, left_ax = plt.subplots(figsize=figsize, dpi=dpi)
     right_ax = left_ax.twinx()
     colors = ["#1a73e8", "#ea4335", "#34a853", "#fbbc04", "#8ab4f8", "#f28b82", "#81c995", "#fde293"]
@@ -4075,7 +4270,7 @@ def _plot_full_scope_capture_png(
             (x_array[:total] - x0) * x_scale,
             y_array[:total],
             label=source,
-            linewidth=0.6,
+            linewidth=0.9,
             color="#111111" if source.upper() == "CH3" else colors[index % len(colors)],
             alpha=0.3 if source.upper() == "CH3" else 1.0,
             rasterized=True,
@@ -4107,7 +4302,7 @@ def _plot_full_scope_capture_png(
     left_ax.set_xlim(0, (x1 - x0) * x_scale)
     left_ax.set_ylim(axis_settings["leftMin"], axis_settings["leftMax"])
     right_ax.set_ylim(axis_settings["rightMin"], axis_settings["rightMax"])
-    left_ax.set_title(title)
+    left_ax.set_title(title, pad=16)
     left_ax.set_xlabel(f"Time ({x_unit})")
     left_ax.set_ylabel("Voltage (V)", color=left_color)
     right_ax.set_ylabel("Voltage (V)", color=right_color)
@@ -4115,7 +4310,7 @@ def _plot_full_scope_capture_png(
     right_ax.tick_params(axis="y", colors=right_color)
     left_ax.spines["left"].set_color(left_color)
     right_ax.spines["right"].set_color(right_color)
-    left_ax.grid(True, color="#d9dee7", linewidth=0.7, alpha=0.8)
+    left_ax.grid(True, color="#d9dee7", linewidth=0.8, alpha=0.8)
     settling_metrics = _scope_response_metrics_from_plot_channels(channels)
     _draw_scope_settling_markers(
         left_ax,
@@ -4126,9 +4321,16 @@ def _plot_full_scope_capture_png(
         metrics=settling_metrics,
     )
     if lines:
-        left_ax.legend(lines, labels, loc="upper center", ncol=min(4, max(1, len(labels))))
-    fig.tight_layout()
-    fig.savefig(path)
+        left_ax.legend(
+            lines,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.0),
+            ncol=min(4, max(1, len(labels))),
+            framealpha=0.92,
+        )
+    fig.subplots_adjust(top=0.78, left=0.075, right=0.925, bottom=0.14)
+    fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return _scope_png_public_path(path)
 

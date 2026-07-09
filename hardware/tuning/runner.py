@@ -9,7 +9,6 @@ from dataclasses import replace
 from typing import Any, Protocol
 
 from .analyzer import ResponseAnalyzer
-from .compensator import CompensatorDesign
 from .models import (
     AutotuneExperimentConfig,
     ExperimentResult,
@@ -28,7 +27,7 @@ from .models import (
     to_jsonable,
 )
 from .pid_programmer import PidProgrammer, StubPidProgrammer
-from .search import GridRefinePidTuner, HardwareGridHeuristicTuner, TuningCandidate, select_best_result
+from .search import HardwareGridHeuristicTuner, TuningCandidate, select_best_result
 
 
 LOCAL_REFINE_IMPROVEMENT_EPSILON = 1e-9
@@ -435,7 +434,6 @@ class PidAutotuneSession:
             kf=float(candidate.mod0_kpole1),
         )
         with self._lock:
-            previous_best = self._snapshot.best
             record = IterationRecord(
                 iteration=len(self._snapshot.history) + 1,
                 phase=candidate.phase,

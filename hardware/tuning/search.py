@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from itertools import product
 
 from .models import HARDWARE_TUNING_FIELD_NAMES, HardwarePidCandidate, IterationRecord, SearchParameter, SearchSpace
 

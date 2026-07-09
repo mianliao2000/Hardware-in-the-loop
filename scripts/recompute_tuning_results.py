@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hardware.tuning.analyzer import ResponseAnalyzer
-from hardware.tuning.models import ResponseMetrics, TuningConfig, Waveform, to_jsonable
+from hardware.tuning.models import ResponseMetrics, Waveform, to_jsonable
 from hardware.tuning.runner import _config_from_payload, _record_from_payload
 from hardware.tuning.search import select_best_result
 

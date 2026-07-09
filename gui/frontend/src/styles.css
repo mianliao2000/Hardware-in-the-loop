@@ -337,6 +337,8 @@ h1 {
   bottom: 58px;
   width: min(390px, calc(100vw - 32px));
   height: min(540px, calc(100vh - 120px));
+  min-width: 320px;
+  min-height: 360px;
   display: grid;
   grid-template-rows: auto 1fr auto;
   overflow: hidden;
@@ -344,6 +346,51 @@ h1 {
   border: 1px solid #d9dee7;
   border-radius: 14px;
   box-shadow: 0 24px 70px rgba(15, 23, 42, 0.25);
+}
+
+.llm-panel-resize-handle {
+  all: unset;
+  position: absolute;
+  z-index: 20;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.llm-panel-resize-handle:hover,
+.llm-panel-resize-handle:focus-visible {
+  background: transparent;
+  outline: none;
+}
+
+.llm-panel-resize-handle.is-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 16px;
+  cursor: ew-resize;
+}
+
+.llm-panel-resize-handle.is-top {
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 14px;
+  cursor: ns-resize;
+}
+
+.llm-panel-resize-handle.is-top-left {
+  top: 0;
+  left: 0;
+  z-index: 21;
+  width: 22px;
+  height: 22px;
+  cursor: nwse-resize;
 }
 
 .llm-chat-panel.is-fullscreen {
@@ -426,29 +473,145 @@ h1 {
   opacity: 0.74;
 }
 
-.llm-message p {
-  margin: 0;
-  white-space: pre-wrap;
+.llm-markdown {
+  min-width: 0;
   overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.llm-markdown > :first-child {
+  margin-top: 0;
+}
+
+.llm-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.llm-markdown p {
+  margin: 0;
   line-height: 1.45;
+}
+
+.llm-markdown p + p,
+.llm-markdown p + ul,
+.llm-markdown p + ol,
+.llm-markdown ul + p,
+.llm-markdown ol + p,
+.llm-markdown pre + p,
+.llm-markdown table + p {
+  margin-top: 10px;
+}
+
+.llm-markdown h1,
+.llm-markdown h2,
+.llm-markdown h3,
+.llm-markdown h4 {
+  margin: 12px 0 6px;
+  line-height: 1.25;
+  font-weight: 760;
+}
+
+.llm-markdown h1 {
+  font-size: 18px;
+}
+
+.llm-markdown h2 {
+  font-size: 16px;
+}
+
+.llm-markdown h3,
+.llm-markdown h4 {
+  font-size: 14px;
+}
+
+.llm-markdown ul,
+.llm-markdown ol {
+  margin: 8px 0;
+  padding-left: 20px;
+}
+
+.llm-markdown li {
+  margin: 4px 0;
+}
+
+.llm-markdown li > p {
+  margin: 0;
+}
+
+.llm-markdown code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: #eef2f7;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+}
+
+.llm-markdown pre {
+  max-width: 100%;
+  margin: 10px 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid #d9dee7;
+  border-radius: 8px;
+  background: #f6f8fa;
+}
+
+.llm-markdown pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.llm-markdown blockquote {
+  margin: 10px 0;
+  padding: 2px 0 2px 12px;
+  color: #64748b;
+  border-left: 3px solid #cbd5e1;
+}
+
+.llm-markdown table {
+  display: block;
+  max-width: 100%;
+  margin: 10px 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.llm-markdown th,
+.llm-markdown td {
+  padding: 6px 8px;
+  border: 1px solid #d9dee7;
+}
+
+.llm-markdown th {
+  background: #f1f5f9;
+  font-weight: 750;
+}
+
+.llm-markdown a {
+  color: #1558b0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .llm-chat-input-row {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
   gap: 10px;
   padding: 12px;
   border-top: 1px solid #e5e7eb;
 }
 
 .llm-chat-input-row textarea {
-  min-height: 46px;
-  max-height: 110px;
-  resize: vertical;
+  width: 100%;
+  height: 50px;
+  min-height: 50px;
+  resize: none;
   padding: 9px 10px;
   border: 1px solid #d9dee7;
   border-radius: 10px;
   font: inherit;
+  overflow-y: auto;
 }
 
 .llm-send-button {
@@ -458,6 +621,18 @@ h1 {
   justify-content: center;
   padding: 0;
   border-radius: 12px;
+}
+
+.llm-clear-button {
+  color: #64748b;
+  background: #ffffff;
+  border-color: #d9dee7;
+}
+
+.llm-clear-button:hover:not(:disabled) {
+  color: #b42318;
+  border-color: #f3b7b0;
+  background: #fff5f3;
 }
 
 body.theme-dark {
@@ -507,6 +682,18 @@ body.theme-dark .llm-chat-input-row textarea {
   color: #f5f5f5;
   background: #202020;
   border-color: #454545;
+}
+
+body.theme-dark .llm-clear-button {
+  color: #cbd5e1;
+  background: #202020;
+  border-color: #454545;
+}
+
+body.theme-dark .llm-clear-button:hover:not(:disabled) {
+  color: #ffb4a8;
+  background: #2a1816;
+  border-color: #7f3128;
 }
 
 body.theme-dark .llm-chat-launcher {
@@ -1213,7 +1400,7 @@ body.theme-dark .instrument-card.failed {
   background: #ffffff;
   border: 1px solid #d9dee7;
   border-radius: 8px;
-  padding: 14px;
+  padding: 10px 14px;
   box-shadow: 0 1px 2px rgba(60, 64, 67, 0.08);
 }
 
@@ -1223,8 +1410,8 @@ body.theme-dark .instrument-card.failed {
   justify-content: space-between;
   gap: 8px;
   width: 100%;
-  min-height: 24px;
-  margin-bottom: 12px;
+  min-height: 22px;
+  margin-bottom: 8px;
   padding: 0;
   border: 0;
   color: #1a73e8;
@@ -1263,7 +1450,8 @@ body.theme-dark .instrument-card.failed {
 }
 
 .panel.collapsed {
-  padding-bottom: 10px;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }
 
 .panel.collapsed .panel-title {
@@ -1277,12 +1465,12 @@ body.theme-dark .instrument-card.failed {
 
 .collapsible-title {
   width: 100%;
-  min-height: 46px;
+  min-height: 36px;
   display: grid;
   grid-template-columns: 1fr auto auto;
   align-items: center;
   gap: 10px;
-  padding: 12px 14px;
+  padding: 8px 14px;
   border: 0;
   background: transparent;
   box-shadow: none;
@@ -1323,7 +1511,7 @@ body.theme-dark .instrument-card.failed {
 }
 
 .collapsible-body {
-  padding: 0 14px 14px;
+  padding: 0 14px 10px;
 }
 
 .plot-toggle-section {
@@ -1336,8 +1524,8 @@ body.theme-dark .instrument-card.failed {
 
 .plot-toggle-title {
   width: 100%;
-  min-height: 34px;
-  padding: 7px 10px;
+  min-height: 30px;
+  padding: 5px 10px;
   display: grid;
   grid-template-columns: auto 1fr auto;
   gap: 10px;
@@ -1470,6 +1658,12 @@ body.theme-dark .instrument-card.failed {
 
 .gif-save-button {
   min-width: 0;
+}
+
+.autotune-control-button.live-playback-button.active {
+  color: #ffffff;
+  border-color: #0f9d58;
+  background: #0f9d58;
 }
 
 .gif-duration-field {

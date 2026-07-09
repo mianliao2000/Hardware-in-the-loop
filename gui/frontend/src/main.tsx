@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import ReactECharts from "echarts-for-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Activity,
   AlertTriangle,
@@ -22,12 +24,13 @@ import {
   MessageCircle,
   Minimize2,
   Send,
+  Trash2,
   XCircle,
   X,
   Sun,
   Zap
 } from "lucide-react";
-import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getTuningRuns, getTuningStatus, loadTuningRun, openTuningAnimationGif, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runSelfTestDevice, saveTuningAnimationGif, sendLlmChat, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopTuning, warmScope } from "./api";
+import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getTuningRuns, getTuningStatus, loadTuningRun, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runSelfTestDevice, saveTuningAnimationGif, sendLlmChat, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopTuning, warmScope } from "./api";
 import type { AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceField, InductanceReadback, InstrumentKey, InstrumentTestResult, IterationRecord, LlmChatMessage, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SearchParameter, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 import "./styles.css";
 
@@ -38,6 +41,8 @@ const searchParameter = (center: number, min: number, max: number, points: numbe
   points,
   step: points > 1 ? (max - min) / (points - 1) : max - min
 });
+
+const AI_COPILOT_HISTORY_KEY = "power-auto-tuner.ai-copilot.messages";
 
 const defaultConfig: TuningConfig = {
   plant: {
@@ -1209,27 +1214,6 @@ function App() {
     }
   };
 
-  const openAutotuneGif = async () => {
-    try {
-      setAutotuneArchiveStatus("Opening GIF animation...");
-      const parsedDurationS = Number.parseFloat(autotuneGifFrameDurationS);
-      const safeDurationS = Number.isFinite(parsedDurationS) ? parsedDurationS : 0.1;
-      const durationMs = Math.round(Math.max(0.05, Math.min(5, safeDurationS)) * 1000);
-      const { targetRunId, targetKind } = selectedAutotuneGifRun();
-      const result = await openTuningAnimationGif(targetRunId, targetKind, durationMs);
-      setAutotuneGif(result);
-      const savedSelection = `${result.kind}:${result.run_id}`;
-      setSelectedAutotuneRun(savedSelection);
-      const openedPath = result.opened_path ? result.opened_path.replace(/\//g, "\\") : gifResultDisplayPath(result);
-      setAutotuneArchiveStatus(openedPath ? `GIF animation opened: ${openedPath}` : "GIF animation opened.");
-      await refreshAutotuneRuns(savedSelection);
-      setError("");
-    } catch (exc) {
-      setAutotuneArchiveStatus("");
-      setError(String(exc));
-    }
-  };
-
   const selectedAutotuneGifRun = () => {
     const selectedParts = selectedAutotuneRun ? selectedAutotuneRun.split(":") : [];
     const selectedKind = selectedParts[0] || undefined;
@@ -1323,7 +1307,6 @@ function App() {
         loadRun={loadAutotuneRunResult}
         deleteRun={deleteAutotuneRunResult}
         saveGif={saveAutotuneGif}
-        openGif={openAutotuneGif}
         gifFrameDurationS={autotuneGifFrameDurationS}
         setGifFrameDurationS={setAutotuneGifFrameDurationS}
         archiveStatus={autotuneArchiveStatus}
@@ -1408,17 +1391,49 @@ function LlmAssistantWidget({
   const greeting = language === "zh"
     ? "你好，我可以帮你理解这个 GUI、Auto-Tune 流程、Manual Tuning、Self Testing，以及 Bode 100 / Scope / Function Generator / PMBus 这些模块。"
     : "Hi, I can help explain this GUI, the Auto-Tune flow, Manual Tuning, Self Testing, and the Bode 100 / Scope / Function Generator / PMBus panels.";
+  const initialMessages = () => {
+    try {
+      const stored = localStorage.getItem(AI_COPILOT_HISTORY_KEY);
+      const parsed = stored ? JSON.parse(stored) : null;
+      if (Array.isArray(parsed) && parsed.length) {
+        const clean = parsed
+          .filter((message) => message && ["user", "assistant", "system"].includes(message.role) && typeof message.content === "string")
+          .slice(-40)
+          .map((message) => ({ role: message.role, content: message.content }));
+        if (clean.length) return clean as LlmChatMessage[];
+      }
+    } catch {
+      localStorage.removeItem(AI_COPILOT_HISTORY_KEY);
+    }
+    return [{ role: "assistant", content: greeting }] as LlmChatMessage[];
+  };
   const [open, setOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [input, setInput] = useState("");
+  const [panelSize, setPanelSize] = useState({ width: 390, height: 540 });
+  const [panelCursor, setPanelCursor] = useState<string | undefined>();
   const [sending, setSending] = useState(false);
-  const [messages, setMessages] = useState<LlmChatMessage[]>([{ role: "assistant", content: greeting }]);
+  const [messages, setMessages] = useState<LlmChatMessage[]>(initialMessages);
   const messagesRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
     messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: "smooth" });
   }, [open, messages, sending]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(AI_COPILOT_HISTORY_KEY, JSON.stringify(messages.slice(-40)));
+    } catch {
+      // Ignore storage quota/private-mode failures; chat still works for this session.
+    }
+  }, [messages]);
+
+  const clearHistory = () => {
+    const resetMessages = [{ role: "assistant", content: greeting }] as LlmChatMessage[];
+    setMessages(resetMessages);
+    localStorage.removeItem(AI_COPILOT_HISTORY_KEY);
+  };
 
   const handleSend = async () => {
     const text = input.trim();
@@ -1454,19 +1469,108 @@ function LlmAssistantWidget({
     }
   };
 
+  const startPanelResize = (direction: "left" | "top" | "top-left", event: React.MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startWidth = panelSize.width;
+    const startHeight = panelSize.height;
+    const maxWidth = Math.max(320, window.innerWidth - 44);
+    const maxHeight = Math.max(360, window.innerHeight - 120);
+
+    const handlePointerMove = (moveEvent: MouseEvent) => {
+      const nextWidth = direction.includes("left")
+        ? Math.min(maxWidth, Math.max(320, startWidth + startX - moveEvent.clientX))
+        : startWidth;
+      const nextHeight = direction.includes("top")
+        ? Math.min(maxHeight, Math.max(360, startHeight + startY - moveEvent.clientY))
+        : startHeight;
+      setPanelSize({ width: nextWidth, height: nextHeight });
+    };
+
+    const stopResize = () => {
+      window.removeEventListener("mousemove", handlePointerMove);
+      window.removeEventListener("mouseup", stopResize);
+    };
+
+    window.addEventListener("mousemove", handlePointerMove);
+    window.addEventListener("mouseup", stopResize);
+  };
+
+  const getPanelResizeDirection = (event: React.MouseEvent<HTMLElement>) => {
+    if (fullscreen) return null;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const nearLeft = event.clientX - bounds.left <= 12;
+    const nearTop = event.clientY - bounds.top <= 12;
+    if (nearLeft && nearTop) return "top-left";
+    if (nearLeft) return "left";
+    if (nearTop) return "top";
+    return null;
+  };
+
+  const handlePanelMouseMove = (event: React.MouseEvent<HTMLElement>) => {
+    const direction = getPanelResizeDirection(event);
+    setPanelCursor(direction === "left" ? "ew-resize" : direction === "top" ? "ns-resize" : direction ? "nwse-resize" : undefined);
+  };
+
+  const handlePanelMouseDown = (event: React.MouseEvent<HTMLElement>) => {
+    const direction = getPanelResizeDirection(event);
+    if (direction) startPanelResize(direction, event);
+  };
+
   return (
     <div className="llm-chat-root">
       {open && (
-        <section className={`llm-chat-panel${fullscreen ? " is-fullscreen" : ""}`} aria-label="LLM assistant chat">
+        <section
+          className={`llm-chat-panel${fullscreen ? " is-fullscreen" : ""}`}
+          style={fullscreen ? undefined : { width: `${panelSize.width}px`, height: `${panelSize.height}px`, cursor: panelCursor }}
+          aria-label="AI Copilot chat"
+          onMouseMove={handlePanelMouseMove}
+          onMouseLeave={() => setPanelCursor(undefined)}
+          onMouseDown={handlePanelMouseDown}
+        >
+          {!fullscreen && (
+            <>
+              <button
+                className="llm-panel-resize-handle is-left"
+                aria-label="Resize AI Copilot wider from the left"
+                type="button"
+                onMouseDown={(event) => startPanelResize("left", event)}
+              />
+              <button
+                className="llm-panel-resize-handle is-top"
+                aria-label="Resize AI Copilot taller from the top"
+                type="button"
+                onMouseDown={(event) => startPanelResize("top", event)}
+              />
+              <button
+                className="llm-panel-resize-handle is-top-left"
+                aria-label="Resize AI Copilot from the top left"
+                type="button"
+                onMouseDown={(event) => startPanelResize("top-left", event)}
+              />
+            </>
+          )}
           <div className="llm-chat-header">
             <div>
-              <h2>AI Help</h2>
+              <h2>AI Copilot</h2>
             </div>
             <div className="llm-chat-header-actions">
               <button
+                className="llm-chat-icon-button llm-clear-button"
+                onClick={clearHistory}
+                aria-label="Clear AI Copilot history"
+                title="Clear history"
+                type="button"
+                disabled={sending}
+              >
+                <Trash2 size={16} />
+              </button>
+              <button
                 className="llm-chat-icon-button"
                 onClick={() => setFullscreen((current) => !current)}
-                aria-label={fullscreen ? "Exit fullscreen AI Help" : "Open AI Help fullscreen"}
+                aria-label={fullscreen ? "Exit fullscreen AI Copilot" : "Open AI Copilot fullscreen"}
                 title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
               >
                 {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
@@ -1477,7 +1581,7 @@ function LlmAssistantWidget({
                   setOpen(false);
                   setFullscreen(false);
                 }}
-                aria-label="Close LLM chat"
+                aria-label="Close AI Copilot"
               >
                 <X size={18} />
               </button>
@@ -1487,13 +1591,13 @@ function LlmAssistantWidget({
             {messages.map((message, index) => (
               <div className={`llm-message ${message.role}`} key={`${message.role}-${index}`}>
                 <span>{message.role === "user" ? "You" : "Assistant"}</span>
-                <p>{message.content}</p>
+                <MarkdownMessage content={message.content} />
               </div>
             ))}
             {sending && (
               <div className="llm-message assistant">
                 <span>Assistant</span>
-                <p>Thinking...</p>
+                <MarkdownMessage content="Thinking..." />
               </div>
             )}
           </div>
@@ -1507,7 +1611,7 @@ function LlmAssistantWidget({
                   handleSend();
                 }
               }}
-              placeholder={language === "zh" ? "问一下这个 GUI 怎么用..." : "Ask about this GUI..."}
+              placeholder="Ask and Revise the Project"
               rows={2}
             />
             <button className="primary llm-send-button" onClick={handleSend} disabled={!input.trim() || sending}>
@@ -1518,8 +1622,27 @@ function LlmAssistantWidget({
       )}
       <button className="llm-chat-launcher" onClick={() => setOpen((current) => !current)} aria-pressed={open}>
         <MessageCircle size={19} />
-        <span>AI Help</span>
+        <span>AI Copilot</span>
       </button>
+    </div>
+  );
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <div className="llm-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) => (
+            <a href={href} target="_blank" rel="noreferrer">
+              {children}
+            </a>
+          )
+        }}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -1716,7 +1839,6 @@ function AutotuneWorkbench({
   loadRun,
   deleteRun,
   saveGif,
-  openGif,
   gifFrameDurationS,
   setGifFrameDurationS,
   archiveStatus,
@@ -1755,7 +1877,6 @@ function AutotuneWorkbench({
   loadRun: (selection?: string) => Promise<void>;
   deleteRun: (selection?: string) => Promise<void>;
   saveGif: () => Promise<void>;
-  openGif: () => Promise<void>;
   gifFrameDurationS: string;
   setGifFrameDurationS: React.Dispatch<React.SetStateAction<string>>;
   archiveStatus: string;
@@ -1767,6 +1888,7 @@ function AutotuneWorkbench({
   const fgConfig = experimentSettings.fgConfig;
   const canRunAnalysis = analysisSelection.transient || analysisSelection.bode;
   const [selectedIteration, setSelectedIteration] = useState<number | null>(null);
+  const [livePlayback, setLivePlayback] = useState(false);
   const selectedRecord = selectedIteration === null ? null : history.find((item) => item.iteration === selectedIteration) ?? null;
   const visibleRecord = selectedRecord ?? current;
   useEffect(() => {
@@ -1776,6 +1898,54 @@ function AutotuneWorkbench({
       setSelectedIteration(null);
     }
   }, [status?.state, history, selectedIteration]);
+  useEffect(() => {
+    if (selectedIteration === null || history.length === 0) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, button, [contenteditable='true']")) return;
+      const ordered = history.slice().reverse();
+      const currentIndex = ordered.findIndex((item) => item.iteration === selectedIteration);
+      if (currentIndex < 0) return;
+      event.preventDefault();
+      const direction = event.key === "ArrowUp" ? -1 : 1;
+      const nextIndex = Math.max(0, Math.min(ordered.length - 1, currentIndex + direction));
+      if (nextIndex === currentIndex) return;
+      setSelectedIteration(ordered[nextIndex].iteration);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [history, selectedIteration]);
+  useEffect(() => {
+    if (status?.state === "running" || history.length < 2) {
+      setLivePlayback(false);
+    }
+  }, [history.length, status?.state]);
+  useEffect(() => {
+    if (!livePlayback || history.length < 2) return;
+    const parsedDurationS = Number.parseFloat(gifFrameDurationS);
+    const safeDurationS = Number.isFinite(parsedDurationS) ? parsedDurationS : 0.1;
+    const frameMs = Math.round(Math.max(0.05, Math.min(5, safeDurationS)) * 1000);
+    const intervalId = window.setInterval(() => {
+      setSelectedIteration((currentIteration) => {
+        const currentIndex = currentIteration === null
+          ? -1
+          : history.findIndex((item) => item.iteration === currentIteration);
+        const nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % history.length;
+        return history[nextIndex].iteration;
+      });
+    }, frameMs);
+    return () => window.clearInterval(intervalId);
+  }, [gifFrameDurationS, history, livePlayback]);
+  const toggleLivePlayback = () => {
+    if (livePlayback) {
+      setLivePlayback(false);
+      return;
+    }
+    if (history.length === 0) return;
+    setSelectedIteration(history[0].iteration);
+    setLivePlayback(true);
+  };
   const setFgConfig = (updater: React.SetStateAction<typeof defaultFunctionGeneratorConfig>) => {
     setExperimentSettings((current) => {
       const nextFgConfig = typeof updater === "function" ? updater(current.fgConfig) : updater;
@@ -1826,8 +1996,14 @@ function AutotuneWorkbench({
                 <button className="autotune-control-button gif-save-button" onClick={saveGif} disabled={status?.state === "running" || history.length < 2}>
                   Save GIF
                 </button>
-                <button className="autotune-control-button gif-save-button" onClick={openGif} disabled={status?.state === "running" || history.length < 2}>
-                  Open
+                <button
+                  className={`autotune-control-button gif-save-button live-playback-button${livePlayback ? " active" : ""}`}
+                  onClick={toggleLivePlayback}
+                  disabled={status?.state === "running" || history.length < 2}
+                  aria-pressed={livePlayback}
+                  title={livePlayback ? "Stop live iteration playback" : "Start live iteration playback"}
+                >
+                  Live
                 </button>
                 <label className="gif-duration-field">
                   <span>s / frame</span>
@@ -1983,7 +2159,7 @@ function AutotuneWorkbench({
           </div>
           <div className="autotune-result-grid">
             <Panel title="Penalty Trend" icon={<Pause size={17} />}>
-              <ReactECharts option={penaltyOption(history)} className="chart" />
+              <ReactECharts option={penaltyOption(history, selectedIteration)} className="chart" />
             </Panel>
           </div>
           <Panel title="Iteration History" icon={<RefreshCw size={17} />}>
@@ -4672,8 +4848,13 @@ function IterationTable({
   selectedIteration: number | null;
   onSelectIteration: (iteration: number | null) => void;
 }) {
+  const displayHistory = history.slice().reverse();
+
   return (
-    <div className="table-wrap">
+    <div
+      className="table-wrap"
+      aria-label="Iteration history"
+    >
       <table>
         <thead>
           <tr>
@@ -4698,9 +4879,10 @@ function IterationTable({
           </tr>
         </thead>
         <tbody>
-          {history.slice().reverse().map((item) => (
+          {displayHistory.map((item) => (
             <tr
               key={item.iteration}
+              data-iteration={item.iteration}
               className={`${item.metrics.passed ? "passed" : ""} ${selectedIteration === item.iteration ? "selected-row" : ""}`}
               onClick={() => onSelectIteration(selectedIteration === item.iteration ? null : item.iteration)}
               title="Show this iteration's transient and Bode result"
@@ -4747,15 +4929,56 @@ function waveformOption(record: IterationRecord | null, target: number) {
   };
 }
 
-function penaltyOption(history: IterationRecord[]) {
+function penaltyOption(history: IterationRecord[], selectedIteration: number | null = null) {
   const plotted = history.map((item) => displayPenaltyScore(item));
+  const selectedIndex = selectedIteration === null
+    ? -1
+    : history.findIndex((item) => item.iteration === selectedIteration);
+  const selectedPoint = selectedIndex >= 0
+    ? [[history[selectedIndex].iteration, plotted[selectedIndex]]]
+    : [];
+  const selectedMarkLine = selectedIndex >= 0
+    ? [{ xAxis: history[selectedIndex].iteration }]
+    : [];
   return {
     animation: false,
     tooltip: { trigger: "axis" },
     grid: { left: 48, right: 18, top: 20, bottom: 38 },
     xAxis: { type: "category", data: history.map((item) => item.iteration) },
     yAxis: { type: "value", name: "penalty" },
-    series: [{ name: "Penalty", type: "line", smooth: true, data: plotted, areaStyle: {}, lineStyle: { color: "#ea4335" } }]
+    series: [
+      {
+        name: "Penalty",
+        type: "line",
+        smooth: true,
+        data: plotted,
+        areaStyle: {},
+        lineStyle: { color: "#ea4335" },
+        markLine: {
+          silent: true,
+          symbol: "none",
+          data: selectedMarkLine,
+          label: { show: false },
+          lineStyle: { color: "#ea4335", width: 2.5, type: "solid", opacity: 0.95 },
+          z: 9
+        }
+      },
+      {
+        name: "Selected iteration",
+        type: "scatter",
+        data: selectedPoint,
+        symbolSize: 22,
+        itemStyle: {
+          color: "#ea4335",
+          borderColor: "#ffffff",
+          borderWidth: 3,
+          shadowBlur: 12,
+          shadowColor: "rgba(234, 67, 53, 0.55)"
+        },
+        z: 12,
+        tooltip: { show: false }
+      }
+    ]
   };
 }
 
@@ -5331,4 +5554,3 @@ createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>
 );
-
