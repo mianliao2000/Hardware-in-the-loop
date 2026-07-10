@@ -159,6 +159,7 @@ class AutotuneExperimentConfig:
     response_channel: str = "CH3"
     enable_bode_analysis: bool = True
     enable_transient_analysis: bool = True
+    optimization_algorithm: str = "heuristic"
     bode_config: dict[str, Any] = field(default_factory=dict)
     function_generator_config: dict[str, Any] = field(default_factory=dict)
     scope_config: dict[str, Any] = field(default_factory=dict)

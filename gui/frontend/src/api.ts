@@ -98,10 +98,10 @@ export function openTuningAnimationGif(run_id?: string, kind?: string, duration_
   });
 }
 
-export function sendLlmChat(messages: LlmChatMessage[], context?: Record<string, unknown>): Promise<LlmChatResponse> {
+export function sendLlmChat(messages: LlmChatMessage[], context?: Record<string, unknown>, modelChoice?: string): Promise<LlmChatResponse> {
   return requestJson<LlmChatResponse>("/api/llm/chat", {
     method: "POST",
-    body: JSON.stringify({ messages, context })
+    body: JSON.stringify({ messages, context, model_choice: modelChoice })
   });
 }
 

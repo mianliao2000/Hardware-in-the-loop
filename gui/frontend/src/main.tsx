@@ -43,6 +43,16 @@ const searchParameter = (center: number, min: number, max: number, points: numbe
 });
 
 const AI_COPILOT_HISTORY_KEY = "power-auto-tuner.ai-copilot.messages";
+const AI_COPILOT_MODEL_KEY = "power-auto-tuner.ai-copilot.model";
+const LLM_MODEL_OPTIONS = [
+  { value: "minimax-m3", label: "Minimax 3" },
+  { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash" }
+];
+
+const OPTIMIZATION_ALGORITHM_OPTIONS = [
+  { value: "heuristic", label: "Grid Search + Heuristic Algorithm" },
+  { value: "deep-reinforcement", label: "Deep Reinforcement Learning" }
+];
 
 const defaultConfig: TuningConfig = {
   plant: {
@@ -513,7 +523,8 @@ function buildAutotuneExperiment(
   voutRequest: { address: string; page: number; adapter: string; voltage: number },
   bodeSweepConfig: BodeSweepConfig,
   settings: ManualExperimentSettings,
-  analysisSelection: { bode: boolean; transient: boolean }
+  analysisSelection: { bode: boolean; transient: boolean },
+  optimizationAlgorithm: string
 ): AutotuneExperimentConfig {
   return {
     board_address: voutRequest.address,
@@ -522,6 +533,7 @@ function buildAutotuneExperiment(
     response_channel: "CH3",
     enable_bode_analysis: analysisSelection.bode,
     enable_transient_analysis: analysisSelection.transient,
+    optimization_algorithm: optimizationAlgorithm,
     bode_config: { ...bodeSweepConfig },
     function_generator_config: { ...settings.fgConfig },
     scope_config: {
@@ -560,6 +572,7 @@ function App() {
   const [bodeSweepRunning, setBodeSweepRunning] = useState(false);
   const [bodeSweepStatus, setBodeSweepStatus] = useState("Ready");
   const [autotuneAnalysisSelection, setAutotuneAnalysisSelection] = useState({ transient: true, bode: true });
+  const [optimizationAlgorithm, setOptimizationAlgorithm] = useState("heuristic");
   const [autotuneRuns, setAutotuneRuns] = useState<AutotuneRunsResponse | null>(null);
   const [selectedAutotuneRun, setSelectedAutotuneRun] = useState("");
   const [autotuneArchiveStatus, setAutotuneArchiveStatus] = useState("");
@@ -714,7 +727,13 @@ function App() {
         baseline.pidRequest,
         baseline.inductanceValues
       );
-      const experiment = buildAutotuneExperiment(voutRequest, bodeSweepConfig, manualExperimentSettings, autotuneAnalysisSelection);
+      const experiment = buildAutotuneExperiment(
+        voutRequest,
+        bodeSweepConfig,
+        manualExperimentSettings,
+        autotuneAnalysisSelection,
+        optimizationAlgorithm
+      );
       const next =
         action === "start" ? await startTuning(runConfig, experiment) : await stepTuning(runConfig, experiment);
       setStatus(next);
@@ -1292,6 +1311,8 @@ function App() {
         setBodeSweepConfig={setBodeSweepConfig}
         analysisSelection={autotuneAnalysisSelection}
         setAnalysisSelection={setAutotuneAnalysisSelection}
+        optimizationAlgorithm={optimizationAlgorithm}
+        setOptimizationAlgorithm={setOptimizationAlgorithm}
         experimentSettings={manualExperimentSettings}
         setExperimentSettings={setManualExperimentSettings}
         runAction={runAction}
@@ -1410,10 +1431,19 @@ function LlmAssistantWidget({
   const [open, setOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [input, setInput] = useState("");
-  const [panelSize, setPanelSize] = useState({ width: 390, height: 540 });
+  const [panelSize, setPanelSize] = useState({ width: 460, height: 540 });
   const [panelCursor, setPanelCursor] = useState<string | undefined>();
   const [sending, setSending] = useState(false);
   const [messages, setMessages] = useState<LlmChatMessage[]>(initialMessages);
+  const [modelChoice, setModelChoice] = useState(() => {
+    try {
+      const stored = localStorage.getItem(AI_COPILOT_MODEL_KEY);
+      if (stored && LLM_MODEL_OPTIONS.some((option) => option.value === stored)) return stored;
+    } catch {
+      // Ignore storage failures; the default model still works.
+    }
+    return "gemini-3.5-flash";
+  });
   const messagesRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -1428,6 +1458,14 @@ function LlmAssistantWidget({
       // Ignore storage quota/private-mode failures; chat still works for this session.
     }
   }, [messages]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(AI_COPILOT_MODEL_KEY, modelChoice);
+    } catch {
+      // Ignore storage failures; the selected model still works for this session.
+    }
+  }, [modelChoice]);
 
   const clearHistory = () => {
     const resetMessages = [{ role: "assistant", content: greeting }] as LlmChatMessage[];
@@ -1448,6 +1486,7 @@ function LlmAssistantWidget({
       best_penalty: status?.best?.metrics?.score ?? null,
       max_coarse_iterations: config.search.max_coarse_iterations,
       max_refined_iterations: config.search.max_refined_iterations,
+      optimization_algorithm: optimizationAlgorithm,
       targets: {
         overshoot_pct: config.targets.overshoot_pct,
         undershoot_pct: config.targets.undershoot_pct,
@@ -1460,7 +1499,7 @@ function LlmAssistantWidget({
     setMessages(nextMessages);
     setSending(true);
     try {
-      const response = await sendLlmChat(nextMessages, context);
+      const response = await sendLlmChat(nextMessages, context, modelChoice);
       setMessages([...nextMessages, { role: "assistant", content: response.reply ?? "No reply." }]);
     } catch (exc) {
       setMessages([...nextMessages, { role: "assistant", content: `LLM API error: ${String(exc)}` }]);
@@ -1557,6 +1596,19 @@ function LlmAssistantWidget({
               <h2>AI Copilot</h2>
             </div>
             <div className="llm-chat-header-actions">
+              <select
+                className="llm-model-select"
+                value={modelChoice}
+                onChange={(event) => setModelChoice(event.target.value)}
+                aria-label="AI Copilot model"
+                disabled={sending}
+              >
+                {LLM_MODEL_OPTIONS.map((option) => (
+                  <option value={option.value} key={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
               <button
                 className="llm-chat-icon-button llm-clear-button"
                 onClick={clearHistory}
@@ -1824,6 +1876,8 @@ function AutotuneWorkbench({
   setBodeSweepConfig,
   analysisSelection,
   setAnalysisSelection,
+  optimizationAlgorithm,
+  setOptimizationAlgorithm,
   experimentSettings,
   setExperimentSettings,
   runAction,
@@ -1862,6 +1916,8 @@ function AutotuneWorkbench({
   setBodeSweepConfig: React.Dispatch<React.SetStateAction<BodeSweepConfig>>;
   analysisSelection: { transient: boolean; bode: boolean };
   setAnalysisSelection: React.Dispatch<React.SetStateAction<{ transient: boolean; bode: boolean }>>;
+  optimizationAlgorithm: string;
+  setOptimizationAlgorithm: React.Dispatch<React.SetStateAction<string>>;
   experimentSettings: ManualExperimentSettings;
   setExperimentSettings: React.Dispatch<React.SetStateAction<ManualExperimentSettings>>;
   runAction: (action: "start" | "pause" | "resume" | "stop" | "step") => Promise<void>;
@@ -1974,6 +2030,22 @@ function AutotuneWorkbench({
                   />
                   <span>Bode Analysis</span>
                 </label>
+              </div>
+              <div className="autotune-algorithm-field">
+                <select
+                  className="autotune-algorithm-select"
+                  aria-label="Optimization algorithm"
+                  title="Optimization algorithm"
+                  value={optimizationAlgorithm}
+                  onChange={(event) => setOptimizationAlgorithm(event.target.value)}
+                  disabled={status?.state === "running" || status?.state === "paused"}
+                >
+                  {OPTIMIZATION_ALGORITHM_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
               </div>
               <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || status?.state === "paused" || !canRunAnalysis}>
                 Start Auto-Tune
@@ -4118,24 +4190,6 @@ function ResultLibraryPanel({
   return (
     <Panel title="Result Library" icon={<RefreshCw size={17} />}>
       <div className="result-library">
-        <dl className="kv compact-kv">
-          <dt>Current run</dt>
-          <dd>
-            {currentRun?.run_id
-              ? formatRunLabel(
-                  { run_id: currentRun.run_id, kind: currentRun.kind, display_name: currentRun.display_name },
-                  currentRun.kind === "saved" ? savedLabelCounts : recentLabelCounts,
-                  0,
-                  false
-                )
-              : "--"}
-          </dd>
-          <dt>Recent limit</dt>
-          <dd>{currentRun?.recent_limit ?? 5}</dd>
-        </dl>
-        <button className="autotune-control-button" onClick={archiveRun} disabled={disabled || !currentRun}>
-          Save Current Permanently
-        </button>
         <div className="result-load-row">
           <select
             value={activeSelection}
@@ -4159,8 +4213,8 @@ function ResultLibraryPanel({
           <button onClick={() => loadRun(activeSelection)} disabled={disabled || !activeSelection}>
             Load
           </button>
-          <button onClick={refreshRuns} disabled={disabled}>
-            Refresh
+          <button onClick={archiveRun} disabled={disabled || !currentRun}>
+            Save
           </button>
           <button className="result-delete-button" onClick={() => deleteRun(activeSelection)} disabled={disabled || !activeSelection}>
             Delete

@@ -111,6 +111,7 @@ export type AutotuneExperimentConfig = {
   response_channel: string;
   enable_bode_analysis: boolean;
   enable_transient_analysis: boolean;
+  optimization_algorithm?: string;
   bode_config: BodeSweepConfig;
   function_generator_config: Record<string, unknown>;
   scope_config: Record<string, unknown>;

@@ -759,6 +759,7 @@ def _experiment_from_payload(payload: Any) -> AutotuneExperimentConfig:
         response_channel=str(payload.get("response_channel", "CH3")),
         enable_bode_analysis=bool(payload.get("enable_bode_analysis", True)),
         enable_transient_analysis=bool(payload.get("enable_transient_analysis", True)),
+        optimization_algorithm=str(payload.get("optimization_algorithm", "heuristic")),
         bode_config=_dict_payload(payload.get("bode_config")),
         function_generator_config=_dict_payload(payload.get("function_generator_config")),
         scope_config=_dict_payload(payload.get("scope_config")),

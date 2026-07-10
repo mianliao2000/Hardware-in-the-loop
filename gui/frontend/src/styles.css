@@ -335,7 +335,7 @@ h1 {
   position: absolute;
   right: 0;
   bottom: 58px;
-  width: min(390px, calc(100vw - 32px));
+  width: min(460px, calc(100vw - 32px));
   height: min(540px, calc(100vh - 120px));
   min-width: 320px;
   min-height: 360px;
@@ -602,6 +602,20 @@ h1 {
   border-top: 1px solid #e5e7eb;
 }
 
+.llm-model-select {
+  width: 150px;
+  height: 32px;
+  padding: 0 28px 0 11px;
+  color: #3c4043;
+  background: #f8fafc;
+  border: 1px solid #d9dee7;
+  border-radius: 999px;
+  font-family: Inter, "Segoe UI", "Google Sans", Arial, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
 .llm-chat-input-row textarea {
   width: 100%;
   height: 50px;
@@ -684,6 +698,12 @@ body.theme-dark .llm-chat-input-row textarea {
   border-color: #454545;
 }
 
+body.theme-dark .llm-model-select {
+  color: #e8eaed;
+  background: #202124;
+  border-color: #3c4043;
+}
+
 body.theme-dark .llm-clear-button {
   color: #cbd5e1;
   background: #202020;
@@ -708,6 +728,11 @@ body.theme-dark .llm-chat-launcher {
     right: 8px;
     bottom: 8px;
     border-radius: 12px;
+  }
+
+  .llm-model-select {
+    width: 132px;
+    font-size: 12px;
   }
 }
 
@@ -1588,6 +1613,41 @@ body.theme-dark .instrument-card.failed {
   accent-color: #1a73e8;
 }
 
+.autotune-algorithm-field {
+  margin-bottom: 2px;
+}
+
+.autotune-algorithm-select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 0 34px 0 13px;
+  font-family: "Google Sans", "Inter", "Segoe UI Variable", "Segoe UI", Arial, sans-serif;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: #202124;
+  border: 1px solid #b8c1ce;
+  border-radius: 6px;
+  background:
+    linear-gradient(45deg, transparent 50%, #5f6368 50%) calc(100% - 17px) 50% / 5px 5px no-repeat,
+    linear-gradient(135deg, #5f6368 50%, transparent 50%) calc(100% - 12px) 50% / 5px 5px no-repeat,
+    #ffffff;
+  appearance: none;
+  cursor: pointer;
+}
+
+.autotune-algorithm-select:focus {
+  outline: none;
+  border-color: #1a73e8;
+  box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.14);
+}
+
+.autotune-algorithm-select:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
 .autotune-run-settings {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1662,8 +1722,38 @@ body.theme-dark .instrument-card.failed {
 
 .autotune-control-button.live-playback-button.active {
   color: #ffffff;
-  border-color: #0f9d58;
-  background: #0f9d58;
+  border-color: #1e8e3e;
+  background: #1e8e3e;
+  box-shadow: 0 0 0 0 rgba(30, 142, 62, 0.42);
+  animation: livePulse 1.45s ease-in-out infinite;
+}
+
+body.theme-dark .autotune-control-button.live-playback-button.active {
+  color: #ffffff;
+  border-color: #34a853;
+  background: #188038;
+  box-shadow: 0 0 0 0 rgba(52, 168, 83, 0.45);
+}
+
+@keyframes livePulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(30, 142, 62, 0.38);
+    filter: brightness(1);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(30, 142, 62, 0);
+    filter: brightness(1.12);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(30, 142, 62, 0);
+    filter: brightness(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .autotune-control-button.live-playback-button.active {
+    animation: none;
+  }
 }
 
 .gif-duration-field {
@@ -3048,8 +3138,9 @@ th:nth-child(2) {
   text-align: left;
 }
 
-tr.passed td {
-  background: #e6f4ea;
+.table-wrap tbody tr.passed td {
+  background: #dcfce7;
+  color: #14532d;
 }
 
 .table-wrap tbody tr {
@@ -3060,18 +3151,41 @@ tr.passed td {
   background: #eef4ff;
 }
 
+.table-wrap tbody tr.passed:hover td {
+  background: #bbf7d0;
+}
+
 .table-wrap tbody tr.selected-row td {
   background: #dbeafe;
   box-shadow: inset 0 1px 0 #8ab4f8, inset 0 -1px 0 #8ab4f8;
+}
+
+.table-wrap tbody tr.passed.selected-row td {
+  background: #bbf7d0;
+  box-shadow: inset 0 1px 0 #22c55e, inset 0 -1px 0 #22c55e;
 }
 
 body.theme-dark .table-wrap tbody tr:hover td {
   background: #1f2937;
 }
 
+body.theme-dark .table-wrap tbody tr.passed td {
+  background: #12351f;
+  color: #bbf7d0;
+}
+
+body.theme-dark .table-wrap tbody tr.passed:hover td {
+  background: #16452a;
+}
+
 body.theme-dark .table-wrap tbody tr.selected-row td {
   background: #172554;
   box-shadow: inset 0 1px 0 #3b82f6, inset 0 -1px 0 #3b82f6;
+}
+
+body.theme-dark .table-wrap tbody tr.passed.selected-row td {
+  background: #14532d;
+  box-shadow: inset 0 1px 0 #22c55e, inset 0 -1px 0 #22c55e;
 }
 
 .selftest-page {

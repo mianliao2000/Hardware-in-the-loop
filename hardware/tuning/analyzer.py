@@ -914,14 +914,19 @@ def _passed_reward(
     enable_transient: bool,
     enable_bode: bool,
 ) -> float:
-    """Small tie-break reward applied only after every enabled target passes."""
+    """Tie-break reward applied only after every enabled target passes.
+
+    OS/US amplitude headroom stays a small tie-breaker. Settling-time
+    headroom mirrors the transient penalty units and coefficients: microseconds
+    with the same 3x coefficient used for excess settling time.
+    """
 
     reward = 0.0
     if enable_transient and transient is not None:
         reward += 0.15 * _headroom(targets.overshoot_pct, transient.overshoot_pct)
         reward += 0.15 * _headroom(targets.undershoot_pct, transient.undershoot_pct)
-        reward += 0.125 * _headroom(targets.settling_time_s, transient.overshoot_settling_time_s)
-        reward += 0.125 * _headroom(targets.settling_time_s, transient.undershoot_settling_time_s)
+        reward += 3.0 * max(0.0, (targets.settling_time_s - transient.overshoot_settling_time_s) * 1e6)
+        reward += 3.0 * max(0.0, (targets.settling_time_s - transient.undershoot_settling_time_s) * 1e6)
 
     if enable_bode:
         if phase_error is not None:
@@ -929,7 +934,7 @@ def _passed_reward(
         if crossover_error_pct is not None and crossover_error_pct <= 0.0 and crossover_headroom_pct is not None:
             reward += min(crossover_headroom_pct, 100.0) / 100.0 * 0.25
 
-    return min(reward, 1.5)
+    return reward
 
 
 def _headroom(limit: float, value: float) -> float:

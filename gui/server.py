@@ -1613,14 +1613,53 @@ def _coerce_llm_messages(messages: object) -> list[dict[str, str]]:
     return clean
 
 
-def _llm_chat_endpoint(base_url: str) -> str:
-    explicit = (os.environ.get("LLM_API_ENDPOINT") or os.environ.get("MINIMAX_CHAT_ENDPOINT") or "").strip()
+def _llm_chat_endpoint(base_url: str, explicit_endpoint: str = "") -> str:
+    explicit = explicit_endpoint.strip()
     if explicit:
         return explicit
     endpoint = base_url.rstrip("/")
     if endpoint.endswith("/chat/completions"):
         return endpoint
     return f"{endpoint}/chat/completions"
+
+
+LLM_MODEL_CHOICES = {
+    "gemini-3.5-flash": {
+        "label": "Gemini 3.5 Flash",
+        "api_key_env": ("OPENROUTER_API_KEY",),
+        "base_url_env": ("OPENROUTER_BASE_URL",),
+        "model_env": ("OPENROUTER_MODEL",),
+        "endpoint_env": ("OPENROUTER_CHAT_ENDPOINT",),
+        "default_base_url": "https://openrouter.ai/api/v1",
+        "default_model": "google/gemini-3.5-flash",
+    },
+    "minimax-m3": {
+        "label": "Minimax 3",
+        "api_key_env": ("MINIMAX_API_KEY",),
+        "base_url_env": ("MINIMAX_BASE_URL",),
+        "model_env": ("MINIMAX_MODEL",),
+        "endpoint_env": ("MINIMAX_CHAT_ENDPOINT",),
+        "default_base_url": "https://api.minimax.io/v1",
+        "default_model": "MiniMax-M3",
+    },
+}
+
+
+def _first_env(names: tuple[str, ...]) -> str:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _resolve_llm_choice(model_choice: object) -> dict[str, object]:
+    choice_key = str(model_choice or "gemini-3.5-flash").strip().lower()
+    if choice_key in {"minimax", "minimax-3", "minimax3", "minimax-m3"}:
+        choice_key = "minimax-m3"
+    if choice_key in {"gemini", "gemini-3.5", "gemini-3.5-flash", "openrouter-gemini"}:
+        choice_key = "gemini-3.5-flash"
+    return dict(LLM_MODEL_CHOICES.get(choice_key, LLM_MODEL_CHOICES["gemini-3.5-flash"]))
 
 
 def _sanitize_llm_reply(reply: str) -> str:
@@ -1778,13 +1817,16 @@ def _web_search_context(query: str) -> str:
     return "\n".join(lines)[:3500]
 
 
-def _call_llm_chat(messages: object, context: object) -> tuple[str, str]:
-    api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("MINIMAX_API_KEY") or "").strip()
+def _call_llm_chat(messages: object, context: object, model_choice: object = None) -> tuple[str, str]:
+    choice = _resolve_llm_choice(model_choice)
+    api_key = _first_env(choice["api_key_env"])  # type: ignore[arg-type]
     if not api_key:
-        raise RuntimeError("LLM_API_KEY or MINIMAX_API_KEY is not set. Add it to .env and restart the GUI server.")
+        env_names = ", ".join(choice["api_key_env"])  # type: ignore[arg-type]
+        raise RuntimeError(f"{env_names} is not set for {choice['label']}. Add it to .env and restart the GUI server.")
 
-    base_url = (os.environ.get("LLM_API_BASE_URL") or os.environ.get("MINIMAX_BASE_URL") or "https://api.openai.com/v1").strip()
-    model = (os.environ.get("LLM_MODEL") or os.environ.get("MINIMAX_MODEL") or "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    base_url = _first_env(choice["base_url_env"]) or str(choice["default_base_url"])  # type: ignore[arg-type]
+    model = _first_env(choice["model_env"]) or str(choice["default_model"])  # type: ignore[arg-type]
+    explicit_endpoint = _first_env(choice["endpoint_env"])  # type: ignore[arg-type]
     timeout_s = float(os.environ.get("LLM_TIMEOUT_S", "30") or "30")
     temperature = float(os.environ.get("LLM_TEMPERATURE", "0.2") or "0.2")
     max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "700") or "700")
@@ -1814,7 +1856,7 @@ def _call_llm_chat(messages: object, context: object) -> tuple[str, str]:
         }
     ).encode("utf-8")
     request = urllib_request.Request(
-        _llm_chat_endpoint(base_url),
+        _llm_chat_endpoint(base_url, explicit_endpoint),
         data=body,
         method="POST",
         headers={
@@ -2402,7 +2444,8 @@ class GuiHandler(BaseHTTPRequestHandler):
             payload = self._read_json_body()
             messages = payload.get("messages", [])
             context = payload.get("context", {})
-            reply, model = _call_llm_chat(messages, context)
+            model_choice = payload.get("model_choice") or payload.get("model")
+            reply, model = _call_llm_chat(messages, context, model_choice)
             self._send_json({"ok": True, "reply": reply, "model": model})
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -3920,10 +3963,93 @@ def _plot_full_bode_sweep_png(
     margins = margins or {}
     phase_crossover = margins.get("phase_crossover_hz")
     gain_crossover = margins.get("gain_crossover_hz")
+    phase_margin = margins.get("phase_margin_deg")
+    gain_margin = margins.get("gain_margin_db")
+
+    def _fmt_freq(value: object) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "--"
+        if not math.isfinite(number) or number <= 0:
+            return "--"
+        if number >= 1e6:
+            return f"{number / 1e6:.3g} MHz"
+        if number >= 1e3:
+            return f"{number / 1e3:.3g} kHz"
+        return f"{number:.3g} Hz"
+
+    def _fmt_metric(value: object, unit: str) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return f"-- {unit}".strip()
+        if not math.isfinite(number):
+            return f"-- {unit}".strip()
+        return f"{number:.2f} {unit}".strip()
+
+    def _interp_at_frequency(x_value: object, values: np.ndarray) -> float | None:
+        try:
+            freq = float(x_value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(freq) or freq <= 0:
+            return None
+        if freq < float(np.min(frequency)) or freq > float(np.max(frequency)):
+            return None
+        return float(np.interp(np.log10(freq), np.log10(frequency), values))
+
     if phase_crossover:
-        gain_ax.axvline(float(phase_crossover), color="#1a73e8", linestyle="--", linewidth=1.2, alpha=0.7)
+        crossover_hz = float(phase_crossover)
+        phase_at_cross = _interp_at_frequency(crossover_hz, phase)
+        gain_ax.axvline(crossover_hz, color="#ea4335", linestyle="--", linewidth=1.5, alpha=0.85)
+        gain_ax.scatter([crossover_hz], [0.0], color="#ea4335", s=46, zorder=5)
+        if phase_at_cross is not None:
+            phase_ax.scatter([crossover_hz], [phase_at_cross], color="#1a73e8", s=46, zorder=5)
+        gain_ax.annotate(
+            f"fc = {_fmt_freq(crossover_hz)}\nPM = {_fmt_metric(phase_margin, 'deg')}",
+            xy=(crossover_hz, 0.0),
+            xytext=(10, 34),
+            textcoords="offset points",
+            color="#202124",
+            fontsize=12,
+            bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "#ea4335", "alpha": 0.92},
+            arrowprops={"arrowstyle": "->", "color": "#ea4335", "lw": 1.1},
+        )
     if gain_crossover:
-        gain_ax.axvline(float(gain_crossover), color="#ea4335", linestyle="--", linewidth=1.2, alpha=0.7)
+        phase_cross_hz = float(gain_crossover)
+        gain_at_phase_cross = _interp_at_frequency(phase_cross_hz, magnitude)
+        gain_ax.axvline(phase_cross_hz, color="#1a73e8", linestyle="--", linewidth=1.5, alpha=0.85)
+        phase_ax.scatter([phase_cross_hz], [0.0], color="#1a73e8", s=46, zorder=5)
+        if gain_at_phase_cross is not None:
+            gain_ax.scatter([phase_cross_hz], [gain_at_phase_cross], color="#ea4335", s=46, zorder=5)
+        gain_ax.annotate(
+            f"phase = 0 deg\nGM = {_fmt_metric(gain_margin, 'dB')}",
+            xy=(phase_cross_hz, gain_at_phase_cross if gain_at_phase_cross is not None else 0.0),
+            xytext=(-118, -48),
+            textcoords="offset points",
+            color="#202124",
+            fontsize=12,
+            bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "#1a73e8", "alpha": 0.92},
+            arrowprops={"arrowstyle": "->", "color": "#1a73e8", "lw": 1.1},
+        )
+    else:
+        endpoint_hz = float(frequency[-1])
+        endpoint_gain = float(magnitude[-1])
+        endpoint_phase = float(phase[-1])
+        gain_ax.axvline(endpoint_hz, color="#1a73e8", linestyle="--", linewidth=1.5, alpha=0.85)
+        gain_ax.scatter([endpoint_hz], [endpoint_gain], color="#ea4335", s=46, zorder=5)
+        phase_ax.scatter([endpoint_hz], [endpoint_phase], color="#1a73e8", s=46, zorder=5)
+        gain_ax.annotate(
+            f"{_fmt_freq(endpoint_hz)} phase = {endpoint_phase:.2f} deg\nGM < {endpoint_gain:.2f} dB",
+            xy=(endpoint_hz, endpoint_gain),
+            xytext=(-168, -48),
+            textcoords="offset points",
+            color="#202124",
+            fontsize=12,
+            bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "#1a73e8", "alpha": 0.92},
+            arrowprops={"arrowstyle": "->", "color": "#1a73e8", "lw": 1.1},
+        )
 
     gain_ax.set_xlim(float(np.min(frequency)), float(np.max(frequency)))
     gain_ax.set_ylim(-100, 100)
@@ -4884,6 +5010,7 @@ def _experiment_from_payload(payload: dict | None) -> AutotuneExperimentConfig:
         response_channel=str(payload.get("response_channel", "CH3")).strip().upper() or "CH3",
         enable_bode_analysis=bool(payload.get("enable_bode_analysis", True)),
         enable_transient_analysis=bool(payload.get("enable_transient_analysis", True)),
+        optimization_algorithm=str(payload.get("optimization_algorithm", "heuristic")),
         bode_config=dict(payload.get("bode_config", {}) or {}),
         function_generator_config=dict(payload.get("function_generator_config", {}) or {}),
         scope_config=dict(payload.get("scope_config", {}) or {}),
