@@ -2,7 +2,7 @@
 
 This repository contains a local hardware-in-the-loop workbench for tuning a
 TPU power-board multiphase buck regulator. The main application is a localhost
-web GUI named **Google Power Auto-Tuner (V1.0)**. It can manually control the
+web GUI named **Google Cloud Power Auto Tuner (V1.0)**. It can manually control the
 lab instruments, run repeatable data acquisition, and perform real hardware PID
 auto-tuning against Bode and transient-response targets.
 
@@ -82,6 +82,7 @@ hardware/tuning/
   analyzer.py               Transient, Bode, and penalty calculations.
   runner.py                 Real hardware tuning session orchestration.
   pid_programmer.py         PID programming interface.
+  drl/                      Fixed-condition surrogate and Safe SAC workflow.
 
 scripts/
   compact_scope_npz.py      Repack old scope captures into compact NPZ files.
@@ -106,6 +107,13 @@ Python 3.11+ is recommended.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+```
+
+Safe SAC is optional and uses a separate CPU-only dependency group. The normal
+heuristic server does not require PyTorch:
+
+```powershell
+pip install -r requirements-ml.txt
 ```
 
 Install frontend dependencies:
@@ -165,7 +173,7 @@ port.
 Runs the real hardware tuning flow. The tab includes:
 
 - Run control: start, single iteration, pause, resume, stop, reset, GIF save,
-  and GIF open.
+  and live iteration playback.
 - Transient and Bode enable checkboxes. At least one analysis must be enabled.
 - Function generator settings used by the tuning transient step.
 - Bode analysis settings used by the tuning Bode sweep.
@@ -174,6 +182,8 @@ Runs the real hardware tuning flow. The tab includes:
 - Result library for recent and permanent runs.
 - Transient, Bode, penalty trend, iteration history, current result, and best
   result panels.
+- Deep Reinforcement Learning control for the guarded 240-point collection,
+  CPU model training, and four-episode (up to 60 point) hardware validation.
 
 ### Manual Tuning
 
@@ -194,7 +204,7 @@ Runs reversible connection checks. These checks avoid turning outputs on or off
 for safety. For devices where a setting check is needed, the test changes a
 small reversible setting and restores it.
 
-### AI Help
+### AI Copilot
 
 The assistant panel explains GUI concepts and workflows using the configured
 LLM API. It is a helper only; it does not directly operate the hardware.
@@ -205,18 +215,41 @@ Each real tuning iteration uses the same backend path as Manual Tuning:
 
 1. Write the target `VOUT_COMMAND`.
 2. Write candidate PID/current-emulation parameters to the XDPE controller.
-3. Run the Bode 100 sweep if Bode analysis is enabled.
-4. Apply the current function-generator settings.
-5. Enable the function-generator output.
-6. Capture the scope using single acquisition if transient analysis is enabled.
-7. Disable the function-generator output in a `finally` block.
+3. Apply the current function-generator settings.
+4. Enable the function-generator output.
+5. Capture the scope using single acquisition if transient analysis is enabled.
+6. Disable the function-generator output in a `finally` block.
+7. Only after the transient safety check passes, run the Bode 100 sweep if
+   Bode analysis is enabled.
 8. Compute metrics, update the penalty, store plots/data, and update best
    candidate.
 
 If a transient trips protection or a candidate is invalid, the point is marked
 invalid and bypassed. Invalid/tripped points use a bounded penalty instead of
-stopping the whole run. The output-control recovery path can disable and
-re-enable the PMBus/XDP output control before continuing.
+stopping the whole run. The output-control recovery path disables both outputs,
+restores the configured safe baseline, and re-enables the outputs. A DRL
+workflow pauses after recovery and requires an explicit operator resume; it
+never advances automatically.
+
+## Fixed-Condition Safe SAC
+
+The first DRL workflow is intentionally restricted to the current board,
+approximately 0.93 V Vout, the 10 kHz / 0-1 V load step, and the current
+1 kHz-1 MHz Bode setup. In the GUI, select **Deep Reinforcement Learning** and
+use the controls in this order:
+
+1. **Collect** creates and runs 60 repeats, 120 local Sobol candidates, and 60
+   uncertainty candidates. Every candidate runs transient first.
+2. **Train** fits five bootstrap surrogate MLPs and a 1,000,000-step SAC policy
+   on CPU. Training runs in a background thread.
+3. **Validate** freezes the model and policy, then runs four hardware episodes
+   with at most 15 measurements each. A final candidate must pass three times
+   consecutively.
+
+Artifacts and resumable workflow state are stored under
+`results/autotune_ml/`. A model is unavailable to normal **Start Auto-Tune**
+until at least three of the four hardware episodes succeed. Configuration or
+artifact hash mismatches fail closed.
 
 ## Search Strategy
 
@@ -265,7 +298,7 @@ Current default transient targets:
 
 - Overshoot max: 3 percent.
 - Undershoot max: 3 percent.
-- Settling target: 1 us.
+- Settling target: 2 us.
 
 Bode metrics are computed from the Bode 100 sweep:
 
@@ -286,6 +319,7 @@ Runtime results are stored under:
 ```text
 results/autotune_runs/recent/
 results/autotune_runs/saved/
+results/autotune_ml/
 ```
 
 Recent runs are temporary. Saving a run permanently moves it out of recent and

@@ -41,7 +41,7 @@ class TuningTargets:
     vout_target_v: float = 0.9296875
     overshoot_pct: float = 3.0
     undershoot_pct: float = 3.0
-    settling_time_s: float = 1e-6
+    settling_time_s: float = 2e-6
     oscillations: int = 0
     phase_margin_deg: float = 45.0
     crossover_frequency_hz: float = 200_000.0
@@ -167,6 +167,11 @@ class AutotuneExperimentConfig:
     response_abs_limit_v: float = 0.25
     async_artifacts: bool = False
     ignore_pass_until_max_iterations: bool = True
+    drl_workflow_mode: str = ""
+    drl_model_id: str = ""
+    drl_collection_plan_id: str = ""
+    drl_episode_budget: int = 15
+    drl_confirmation_count: int = 3
 
 
 @dataclass(frozen=True)
@@ -184,6 +189,7 @@ class IterationRecord:
     bode_result: dict[str, Any] = field(default_factory=dict)
     scope_result: dict[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
+    optimizer_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -196,7 +202,7 @@ class ExperimentResult:
     duration_s: float = 0.0
 
 
-RunState = Literal["idle", "running", "stopped", "complete", "error"]
+RunState = Literal["idle", "running", "paused", "stopped", "complete", "error"]
 
 
 @dataclass

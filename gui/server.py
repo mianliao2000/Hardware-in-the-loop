@@ -82,6 +82,7 @@ from hardware.tuning import (
     TuningTargets,
     Waveform,
 )
+from hardware.tuning.drl import DrlWorkflowManager
 
 
 DEVICE_LOCK = threading.Lock()
@@ -124,7 +125,13 @@ DEFAULT_SCOPE_AXIS_SETTINGS = {
 class ServerHardwareExperimentRunner:
     """Run one real hardware tuning candidate through the existing bench APIs."""
 
-    def recover_after_transient_protection(self, experiment: AutotuneExperimentConfig) -> dict:
+    supports_split_analysis = True
+
+    def recover_after_transient_protection(
+        self,
+        experiment: AutotuneExperimentConfig,
+        config: TuningConfig | None = None,
+    ) -> dict:
         started = time.perf_counter()
         steps: list[dict] = []
 
@@ -159,7 +166,55 @@ class ServerHardwareExperimentRunner:
                     action="disable",
                 ),
             )
+            disable_failures = [step for step in steps[-2:] if not step.get("ok")]
+            if disable_failures:
+                return {
+                    "ok": False,
+                    "error": "Could not confirm both outputs disabled; recovery stopped fail-closed.",
+                    "steps": steps,
+                    "duration_s": round(time.perf_counter() - started, 3),
+                }
             time.sleep(0.25)
+            if config is not None:
+                search = config.search
+                baseline = HardwarePidCandidate(
+                    mod0_kp=int(round(search.mod0_kp.center)),
+                    mod0_ki=int(round(search.mod0_ki.center)),
+                    mod0_kd=int(round(search.mod0_kd.center)),
+                    mod0_kpole1=3 if abs(search.mod0_kpole1.center - 3) <= abs(search.mod0_kpole1.center - 6) else 6,
+                    mod0_kpole2=3 if abs(search.mod0_kpole2.center - 3) <= abs(search.mod0_kpole2.center - 6) else 6,
+                    mod0_cm_gain=2,
+                    output_inductance_nh=float(search.output_inductance_nh.center),
+                    effective_lc_inductance_nh=float(search.effective_lc_inductance_nh.center),
+                    phase="safe_recovery_baseline",
+                )
+                run_step(
+                    "restore_safe_pid_baseline",
+                    lambda: _set_xdp_pid(
+                        address=experiment.board_address,
+                        page=experiment.board_page,
+                        adapter_kind=experiment.board_adapter,
+                        values={**baseline.pid_values(), **baseline.current_mode_values()},
+                    ),
+                )
+                run_step(
+                    "restore_safe_inductance_baseline",
+                    lambda: _set_inductance(
+                        address=experiment.board_address,
+                        page=experiment.board_page,
+                        adapter_kind=experiment.board_adapter,
+                        output_inductance_nh=baseline.output_inductance_nh,
+                        effective_lc_inductance_nh=baseline.effective_lc_inductance_nh,
+                    ),
+                )
+                baseline_failures = [step for step in steps[-2:] if not step.get("ok")]
+                if baseline_failures:
+                    return {
+                        "ok": False,
+                        "error": "Safe baseline restore failed; outputs remain disabled.",
+                        "steps": steps,
+                        "duration_s": round(time.perf_counter() - started, 3),
+                    }
             run_step(
                 "pmbus_output_enable",
                 lambda: _set_pmbus_output(
@@ -352,10 +407,6 @@ class ServerHardwareExperimentRunner:
                 write_results["function_generator_off"] = off_result
                 stage_durations["function_generator_disable"] = round(time.perf_counter() - off_started, 3)
             write_results["stage_durations_s"] = dict(stage_durations)
-
-
-TUNING_SESSION = PidAutotuneSession(experiment_runner=ServerHardwareExperimentRunner())
-
 
 class AutotuneRunStore:
     """Keep a rolling local history of hardware auto-tune runs."""
@@ -1576,7 +1627,30 @@ class AutotuneRunStore:
             return None
 
 
+DRL_WORKFLOW = DrlWorkflowManager(
+    RESULTS_DIR / "autotune_ml",
+    [AUTOTUNE_SAVED_DIR, AUTOTUNE_RECENT_DIR],
+)
+TUNING_SESSION = PidAutotuneSession(
+    experiment_runner=ServerHardwareExperimentRunner(),
+    tuner_factory=DRL_WORKFLOW.candidate_tuner_factory,
+)
 AUTOTUNE_RUN_STORE = AutotuneRunStore(AUTOTUNE_RECENT_DIR, AUTOTUNE_SAVED_DIR, AUTOTUNE_RECENT_LIMIT)
+
+
+def _start_drl_hardware(config: TuningConfig, experiment: AutotuneExperimentConfig) -> dict:
+    configured = TUNING_SESSION.configure(config, experiment)
+    AUTOTUNE_RUN_STORE.start_new(configured)
+    return AUTOTUNE_RUN_STORE.persist_status(TUNING_SESSION.start())
+
+
+DRL_WORKFLOW.bind_session(
+    status=TUNING_SESSION.status,
+    stop=TUNING_SESSION.stop,
+    start_hardware=_start_drl_hardware,
+    resume_hardware=AUTOTUNE_RUN_STORE.resume_run,
+    persist_hardware=AUTOTUNE_RUN_STORE.persist_status,
+)
 
 
 def main() -> int:
@@ -1940,6 +2014,9 @@ class GuiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tuning/config":
             self._send_json({"ok": True, "config": TUNING_SESSION.status()["config"]})
             return
+        if parsed.path == "/api/tuning/drl/status":
+            self._send_json(DRL_WORKFLOW.status())
+            return
         if parsed.path == "/api/tuning/runs":
             self._send_json(AUTOTUNE_RUN_STORE.list_runs())
             return
@@ -1991,6 +2068,18 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tuning/start":
             self._handle_tuning_start()
+            return
+        if parsed.path == "/api/tuning/drl/collect":
+            self._handle_drl_action("collect")
+            return
+        if parsed.path == "/api/tuning/drl/train":
+            self._handle_drl_action("train")
+            return
+        if parsed.path == "/api/tuning/drl/validate":
+            self._handle_drl_action("validate")
+            return
+        if parsed.path == "/api/tuning/drl/stop":
+            self._handle_drl_action("stop")
             return
         if parsed.path == "/api/tuning/pause":
             status = TUNING_SESSION.pause()
@@ -2183,17 +2272,40 @@ class GuiHandler(BaseHTTPRequestHandler):
 
     def _handle_tuning_start(self) -> None:
         try:
+            DRL_WORKFLOW.assert_tuning_available()
             payload = self._read_json_body()
             config = _config_from_payload(payload.get("config", payload))
             experiment = _experiment_from_payload(payload.get("experiment", {}))
-            status = TUNING_SESSION.start(config, experiment)
-            status = AUTOTUNE_RUN_STORE.start_new(status)
+            configured = TUNING_SESSION.configure(config, experiment)
+            AUTOTUNE_RUN_STORE.start_new(configured)
+            status = AUTOTUNE_RUN_STORE.persist_status(TUNING_SESSION.start())
             self._send_json({"ok": True, **status})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+    def _handle_drl_action(self, action: str) -> None:
+        try:
+            payload = self._read_json_body()
+            if action == "stop":
+                result = DRL_WORKFLOW.stop()
+            else:
+                config = _config_from_payload(payload.get("config", payload))
+                experiment = _experiment_from_payload(payload.get("experiment", {}))
+                if action == "collect":
+                    result = DRL_WORKFLOW.start_collection(config, experiment)
+                elif action == "train":
+                    result = DRL_WORKFLOW.start_training(config, experiment)
+                elif action == "validate":
+                    result = DRL_WORKFLOW.start_validation(config, experiment)
+                else:
+                    raise RuntimeError(f"Unsupported DRL action: {action}")
+            self._send_json(result)
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=400)
 
     def _handle_tuning_step(self) -> None:
         try:
+            DRL_WORKFLOW.assert_tuning_available()
             payload = self._read_json_body()
             config_payload = payload.get("config")
             config = _config_from_payload(config_payload) if config_payload else None
@@ -2208,6 +2320,11 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, status=400)
 
     def _handle_tuning_reset(self) -> None:
+        try:
+            DRL_WORKFLOW.assert_tuning_available()
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+            return
         try:
             payload = self._read_json_body()
         except Exception:
@@ -4963,7 +5080,7 @@ def _config_from_payload(payload: dict | None) -> TuningConfig:
             vout_target_v=_float_field(targets_payload, "vout_target_v", 0.9296875),
             overshoot_pct=_float_field(targets_payload, "overshoot_pct", 3.0),
             undershoot_pct=_float_field(targets_payload, "undershoot_pct", 3.0),
-            settling_time_s=_float_field(targets_payload, "settling_time_s", 1e-6),
+            settling_time_s=_float_field(targets_payload, "settling_time_s", 2e-6),
             oscillations=_int_field(targets_payload, "oscillations", 0),
             phase_margin_deg=_float_field(targets_payload, "phase_margin_deg", 45.0),
             crossover_frequency_hz=_float_field(targets_payload, "crossover_frequency_hz", 200_000.0),
@@ -5017,6 +5134,11 @@ def _experiment_from_payload(payload: dict | None) -> AutotuneExperimentConfig:
         vout_tolerance_v=_float_field(payload, "vout_tolerance_v", 0.15),
         response_abs_limit_v=_float_field(payload, "response_abs_limit_v", 0.25),
         ignore_pass_until_max_iterations=bool(payload.get("ignore_pass_until_max_iterations", True)),
+        drl_workflow_mode=str(payload.get("drl_workflow_mode", "")),
+        drl_model_id=str(payload.get("drl_model_id", "")),
+        drl_collection_plan_id=str(payload.get("drl_collection_plan_id", "")),
+        drl_episode_budget=max(1, _int_field(payload, "drl_episode_budget", 15)),
+        drl_confirmation_count=max(1, _int_field(payload, "drl_confirmation_count", 3)),
     )
 
 

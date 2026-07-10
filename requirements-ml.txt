@@ -1,0 +1,5 @@
+# Optional fixed-condition Safe SAC environment. The heuristic server does not import these eagerly.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
+gymnasium==1.3.0
+stable-baselines3==2.9.0

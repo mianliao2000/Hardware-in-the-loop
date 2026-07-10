@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
+import inspect
 import threading
 import time
 from dataclasses import replace
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .analyzer import ResponseAnalyzer
 from .models import (
@@ -43,6 +44,35 @@ class AutotuneExperimentRunner(Protocol):
         experiment: AutotuneExperimentConfig,
     ) -> ExperimentResult:
         ...
+
+
+class CandidateTuner(Protocol):
+    def next_candidate(
+        self,
+        history: list[IterationRecord],
+        best: IterationRecord | None,
+    ) -> HardwarePidCandidate | None:
+        ...
+
+
+CandidateTunerFactory = Callable[
+    [TuningConfig, AutotuneExperimentConfig, list[IterationRecord]],
+    CandidateTuner,
+]
+
+
+def default_candidate_tuner_factory(
+    config: TuningConfig,
+    experiment: AutotuneExperimentConfig,
+    history: list[IterationRecord],
+) -> CandidateTuner:
+    _ = history
+    algorithm = str(experiment.optimization_algorithm or "heuristic").strip().lower()
+    if algorithm in {"", "heuristic"}:
+        return HardwareGridHeuristicTuner(config.search)
+    raise RuntimeError(
+        "Deep Reinforcement Learning is unavailable because no DRL tuner provider is configured."
+    )
 
 
 class PlaceholderExperimentRunner:
@@ -112,12 +142,18 @@ class PidAutotuneSession:
         config: TuningConfig | None = None,
         pid_programmer: PidProgrammer | None = None,
         experiment_runner: AutotuneExperimentRunner | None = None,
+        tuner_factory: CandidateTunerFactory | None = None,
     ):
         self._lock = threading.RLock()
         self._snapshot = TuningRunSnapshot(config=config or TuningConfig())
         self._pid_programmer = pid_programmer or StubPidProgrammer()
         self._experiment_runner = experiment_runner or PlaceholderExperimentRunner()
-        self._tuner = HardwareGridHeuristicTuner(self._snapshot.config.search)
+        self._tuner_factory = tuner_factory or default_candidate_tuner_factory
+        self._tuner = self._tuner_factory(
+            self._snapshot.config,
+            self._snapshot.experiment,
+            self._snapshot.history,
+        )
         self._stop_requested = False
         self._worker: threading.Thread | None = None
         self._local_refine_no_improvement_count = 0
@@ -126,13 +162,15 @@ class PidAutotuneSession:
         with self._lock:
             if self._snapshot.state == "running":
                 raise RuntimeError("Cannot reconfigure while tuning is running.")
+            next_experiment = experiment or self._snapshot.experiment
+            next_tuner = self._tuner_factory(config, next_experiment, [])
             self._snapshot = TuningRunSnapshot(
                 state="idle",
                 message="Configured",
                 config=config,
-                experiment=experiment or self._snapshot.experiment,
+                experiment=next_experiment,
             )
-            self._tuner = HardwareGridHeuristicTuner(config.search)
+            self._tuner = next_tuner
             self._local_refine_no_improvement_count = 0
             return self.status()
 
@@ -144,16 +182,20 @@ class PidAutotuneSession:
         if self._snapshot.state == "running":
             raise RuntimeError("Cannot update tuning context while tuning is running.")
         current = self._snapshot
+        next_config = config or current.config
+        next_experiment = experiment or current.experiment
+        next_tuner = self._tuner_factory(next_config, next_experiment, current.history)
         self._snapshot = TuningRunSnapshot(
             state=current.state,
             message=current.message,
-            config=config or current.config,
-            experiment=experiment or current.experiment,
+            config=next_config,
+            experiment=next_experiment,
             current=current.current,
             best=current.best,
             history=current.history,
             pid_programming=current.pid_programming,
         )
+        self._tuner = next_tuner
 
     def start(self, config: TuningConfig | None = None, experiment: AutotuneExperimentConfig | None = None) -> dict:
         with self._lock:
@@ -201,8 +243,9 @@ class PidAutotuneSession:
                 raise RuntimeError("This auto-tune run is already complete.")
             snapshot.state = "stopped"
             snapshot.message = "Loaded saved result. Ready to resume from the next candidate."
+            next_tuner = self._tuner_factory(snapshot.config, snapshot.experiment, snapshot.history)
             self._snapshot = snapshot
-            self._tuner = HardwareGridHeuristicTuner(snapshot.config.search)
+            self._tuner = next_tuner
             self._stop_requested = False
             self._local_refine_no_improvement_count = 0
             return self.status()
@@ -262,11 +305,7 @@ class PidAutotuneSession:
             experiment = self._snapshot.experiment
             best = self._snapshot.best
             if experiment.enable_transient_analysis and experiment.enable_bode_analysis:
-                candidates = self._tuner.next_candidate_batch(
-                    self._snapshot.history,
-                    best,
-                    COORDINATE_BATCH_SIZE,
-                )
+                candidates = self._next_candidate_batch(best, COORDINATE_BATCH_SIZE)
             else:
                 candidate = self._tuner.next_candidate(self._snapshot.history, best)
                 candidates = [candidate] if candidate is not None else []
@@ -283,6 +322,25 @@ class PidAutotuneSession:
             return self._run_coordinate_batch(candidates, config, experiment)
 
         return self._run_candidate_serial(candidates[0], config, experiment)
+
+    def _next_candidate_batch(
+        self,
+        best: IterationRecord | None,
+        max_count: int,
+    ) -> list[HardwarePidCandidate]:
+        batch_method = getattr(self._tuner, "next_candidate_batch", None)
+        if callable(batch_method):
+            return list(batch_method(self._snapshot.history, best, max_count))
+        candidate = self._tuner.next_candidate(self._snapshot.history, best)
+        return [candidate] if candidate is not None else []
+
+    def _optimizer_metadata_for(self, candidate: HardwarePidCandidate) -> dict[str, Any]:
+        metadata_method = getattr(self._tuner, "metadata_for", None)
+        if callable(metadata_method):
+            metadata = metadata_method(candidate)
+            if isinstance(metadata, dict):
+                return dict(metadata)
+        return {"algorithm": str(self._snapshot.experiment.optimization_algorithm or "heuristic")}
 
     def _run_one_iteration(self) -> bool:
         with self._lock:
@@ -304,14 +362,42 @@ class PidAutotuneSession:
     ) -> bool:
         try:
             started = time.perf_counter()
-            result = self._experiment_runner.evaluate(candidate, config, experiment)
-            return self._append_iteration_result(candidate, result, started, config)
+            optimizer_metadata = self._optimizer_metadata_for(candidate)
+            supports_split = bool(getattr(self._experiment_runner, "supports_split_analysis", False))
+            if experiment.enable_transient_analysis and experiment.enable_bode_analysis and supports_split:
+                transient_experiment = replace(experiment, enable_transient_analysis=True, enable_bode_analysis=False)
+                bode_experiment = replace(experiment, enable_transient_analysis=False, enable_bode_analysis=True)
+                transient_result = self._experiment_runner.evaluate(candidate, config, transient_experiment)
+                bode_result = self._experiment_runner.evaluate(candidate, config, bode_experiment)
+                result = self._merge_split_experiment_results(transient_result, bode_result, config)
+            else:
+                result = self._experiment_runner.evaluate(candidate, config, experiment)
+            return self._append_iteration_result(
+                candidate,
+                result,
+                started,
+                config,
+                optimizer_metadata=optimizer_metadata,
+            )
         except Exception as exc:
             if experiment.enable_transient_analysis and _is_recoverable_transient_failure(exc):
                 try:
-                    recovery = self._recover_after_transient_protection(experiment)
+                    recovery = self._recover_after_transient_protection(experiment, config)
                     failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
-                    return self._append_iteration_result(candidate, failed_result, started, config)
+                    keep_running = self._append_iteration_result(
+                        candidate,
+                        failed_result,
+                        started,
+                        config,
+                        optimizer_metadata=self._optimizer_metadata_for(candidate),
+                    )
+                    if _is_drl_algorithm(experiment.optimization_algorithm):
+                        with self._lock:
+                            self._stop_requested = True
+                            self._snapshot.state = "paused"
+                            self._snapshot.message = "DRL paused after transient protection recovery."
+                        return False
+                    return keep_running
                 except Exception as recovery_exc:
                     exc = recovery_exc
             with self._lock:
@@ -327,7 +413,7 @@ class PidAutotuneSession:
     ) -> bool:
         transient_experiment = replace(experiment, enable_transient_analysis=True, enable_bode_analysis=False)
         bode_experiment = replace(experiment, enable_transient_analysis=False, enable_bode_analysis=True)
-        transient_results: list[tuple[HardwarePidCandidate, ExperimentResult, float]] = []
+        transient_results: list[tuple[HardwarePidCandidate, ExperimentResult, float, dict[str, Any]]] = []
         try:
             for index, candidate in enumerate(candidates, 1):
                 with self._lock:
@@ -337,19 +423,31 @@ class PidAutotuneSession:
                 )
                 started = time.perf_counter()
                 try:
+                    optimizer_metadata = self._optimizer_metadata_for(candidate)
                     transient_results.append(
-                        (candidate, self._experiment_runner.evaluate(candidate, config, transient_experiment), started)
+                        (
+                            candidate,
+                            self._experiment_runner.evaluate(candidate, config, transient_experiment),
+                            started,
+                            optimizer_metadata,
+                        )
                     )
                 except Exception as exc:
                     if not _is_recoverable_transient_failure(exc):
                         raise
-                    recovery = self._recover_after_transient_protection(experiment)
+                    recovery = self._recover_after_transient_protection(experiment, config)
                     failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
-                    keep_running = self._append_iteration_result(candidate, failed_result, started, config)
+                    keep_running = self._append_iteration_result(
+                        candidate,
+                        failed_result,
+                        started,
+                        config,
+                        optimizer_metadata=self._optimizer_metadata_for(candidate),
+                    )
                     if not keep_running:
                         return False
 
-            for index, (candidate, transient_result, started) in enumerate(transient_results, 1):
+            for index, (candidate, transient_result, started, optimizer_metadata) in enumerate(transient_results, 1):
                 with self._lock:
                     self._snapshot.message = (
                         f"Coordinate batch Bode {index}/{len(transient_results)} "
@@ -360,9 +458,15 @@ class PidAutotuneSession:
                 except Exception as exc:
                     if not _is_recoverable_transient_failure(exc):
                         raise
-                    recovery = self._recover_after_transient_protection(experiment)
+                    recovery = self._recover_after_transient_protection(experiment, config)
                     failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
-                    keep_running = self._append_iteration_result(candidate, failed_result, started, config)
+                    keep_running = self._append_iteration_result(
+                        candidate,
+                        failed_result,
+                        started,
+                        config,
+                        optimizer_metadata=optimizer_metadata,
+                    )
                     if not keep_running:
                         return False
                     continue
@@ -371,7 +475,13 @@ class PidAutotuneSession:
                     bode_result,
                     config,
                 )
-                keep_running = self._append_iteration_result(candidate, combined_result, started, config)
+                keep_running = self._append_iteration_result(
+                    candidate,
+                    combined_result,
+                    started,
+                    config,
+                    optimizer_metadata=optimizer_metadata,
+                )
                 if not keep_running:
                     return False
             return True
@@ -381,11 +491,19 @@ class PidAutotuneSession:
                 self._snapshot.message = str(exc)
             return False
 
-    def _recover_after_transient_protection(self, experiment: AutotuneExperimentConfig) -> dict[str, Any]:
+    def _recover_after_transient_protection(
+        self,
+        experiment: AutotuneExperimentConfig,
+        config: TuningConfig,
+    ) -> dict[str, Any]:
         recover = getattr(self._experiment_runner, "recover_after_transient_protection", None)
         if not callable(recover):
             return {"ok": False, "error": "Experiment runner does not support output recovery."}
-        result = recover(experiment)
+        parameters = list(inspect.signature(recover).parameters.values())
+        accepts_config = len(parameters) >= 2 or any(
+            parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters
+        )
+        result = recover(experiment, config) if accepts_config else recover(experiment)
         if not isinstance(result, dict):
             return {"ok": False, "error": "Experiment runner returned invalid output recovery result."}
         if not result.get("ok"):
@@ -405,7 +523,7 @@ class PidAutotuneSession:
             enable_bode=True,
         )
         write_results = {
-            "split_coordinate_batch": True,
+            "transient_first_split": True,
             "transient": transient_result.write_results,
             "bode": bode_result.write_results,
         }
@@ -426,6 +544,7 @@ class PidAutotuneSession:
         result: ExperimentResult,
         started: float,
         config: TuningConfig,
+        optimizer_metadata: dict[str, Any] | None = None,
     ) -> bool:
         pid = PidParameters(
             kp=float(candidate.mod0_kp),
@@ -448,6 +567,7 @@ class PidAutotuneSession:
                 bode_result=result.bode_result,
                 scope_result=result.scope_result,
                 duration_s=result.duration_s or (time.perf_counter() - started),
+                optimizer_metadata=dict(optimizer_metadata or {}),
             )
             self._snapshot.history.append(record)
             self._snapshot.current = record
@@ -502,6 +622,11 @@ def _is_recoverable_transient_failure(exc: Exception) -> bool:
         or "vout safety check failed: read 0.0000" in message
         or "vout write failed: vout safety check failed: read 0.0000" in message
     )
+
+
+def _is_drl_algorithm(value: object) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"deep-reinforcement", "drl-collection", "safe-sac"}
 
 
 def _skipped_protection_result(
@@ -573,6 +698,7 @@ def _compact_iteration_record(record: IterationRecord | None) -> dict[str, Any] 
         "bode_result": _compact_bode_result(to_jsonable(record.bode_result)),
         "scope_result": _compact_scope_result(to_jsonable(record.scope_result)),
         "duration_s": record.duration_s,
+        "optimizer_metadata": to_jsonable(record.optimizer_metadata),
     }
 
 
@@ -720,7 +846,7 @@ def _config_from_payload(payload: Any) -> TuningConfig:
             vout_target_v=_float_payload(targets, "vout_target_v", 0.9296875),
             overshoot_pct=_float_payload(targets, "overshoot_pct", 3.0),
             undershoot_pct=_float_payload(targets, "undershoot_pct", 3.0),
-            settling_time_s=_float_payload(targets, "settling_time_s", 1e-6),
+            settling_time_s=_float_payload(targets, "settling_time_s", 2e-6),
             oscillations=_int_payload(targets, "oscillations", 0),
             phase_margin_deg=_float_payload(targets, "phase_margin_deg", 45.0),
             crossover_frequency_hz=_float_payload(targets, "crossover_frequency_hz", 200_000.0),
@@ -767,6 +893,11 @@ def _experiment_from_payload(payload: Any) -> AutotuneExperimentConfig:
         response_abs_limit_v=_float_payload(payload, "response_abs_limit_v", 0.25),
         async_artifacts=bool(payload.get("async_artifacts", False)),
         ignore_pass_until_max_iterations=bool(payload.get("ignore_pass_until_max_iterations", True)),
+        drl_workflow_mode=str(payload.get("drl_workflow_mode", "")),
+        drl_model_id=str(payload.get("drl_model_id", "")),
+        drl_collection_plan_id=str(payload.get("drl_collection_plan_id", "")),
+        drl_episode_budget=_int_payload(payload, "drl_episode_budget", 15),
+        drl_confirmation_count=_int_payload(payload, "drl_confirmation_count", 3),
     )
 
 
@@ -786,6 +917,7 @@ def _record_from_payload(payload: Any) -> IterationRecord:
         bode_result=_dict_payload(payload.get("bode_result")),
         scope_result=_dict_payload(payload.get("scope_result")),
         duration_s=_float_payload(payload, "duration_s", 0.0),
+        optimizer_metadata=_dict_payload(payload.get("optimizer_metadata")),
     )
 
 

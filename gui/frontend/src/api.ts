@@ -1,4 +1,4 @@
-import type { AutotuneArchiveResponse, AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceReadback, InstrumentKey, LlmChatMessage, LlmChatResponse, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
+import type { AutotuneArchiveResponse, AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, DrlWorkflowStatus, FunctionGeneratorReadback, InductanceReadback, InstrumentKey, LlmChatMessage, LlmChatResponse, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -21,6 +21,25 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 export function getTuningStatus(): Promise<TuningStatus> {
   return requestJson<TuningStatus>("/api/tuning/status");
+}
+
+export function getDrlWorkflowStatus(): Promise<DrlWorkflowStatus> {
+  return requestJson<DrlWorkflowStatus>("/api/tuning/drl/status");
+}
+
+export function runDrlWorkflowAction(
+  action: "collect" | "train" | "validate",
+  config: TuningConfig,
+  experiment: AutotuneExperimentConfig
+): Promise<DrlWorkflowStatus> {
+  return requestJson<DrlWorkflowStatus>(`/api/tuning/drl/${action}`, {
+    method: "POST",
+    body: JSON.stringify({ config, experiment })
+  });
+}
+
+export function stopDrlWorkflow(): Promise<DrlWorkflowStatus> {
+  return requestJson<DrlWorkflowStatus>("/api/tuning/drl/stop", { method: "POST", body: "{}" });
 }
 
 export function startTuning(config: TuningConfig, experiment?: AutotuneExperimentConfig): Promise<TuningStatus> {

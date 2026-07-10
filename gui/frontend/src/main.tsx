@@ -6,7 +6,9 @@ import remarkGfm from "remark-gfm";
 import {
   Activity,
   AlertTriangle,
+  BrainCircuit,
   CheckCircle2,
+  Database,
   Gauge,
   HelpCircle,
   Pause,
@@ -24,14 +26,15 @@ import {
   MessageCircle,
   Minimize2,
   Send,
+  ShieldCheck,
   Trash2,
   XCircle,
   X,
   Sun,
   Zap
 } from "lucide-react";
-import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getTuningRuns, getTuningStatus, loadTuningRun, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runSelfTestDevice, saveTuningAnimationGif, sendLlmChat, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopTuning, warmScope } from "./api";
-import type { AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, FunctionGeneratorReadback, InductanceField, InductanceReadback, InstrumentKey, InstrumentTestResult, IterationRecord, LlmChatMessage, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SearchParameter, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
+import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getDrlWorkflowStatus, getTuningRuns, getTuningStatus, loadTuningRun, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runDrlWorkflowAction, runSelfTestDevice, saveTuningAnimationGif, sendLlmChat, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopDrlWorkflow, stopTuning, warmScope } from "./api";
+import type { AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, DrlWorkflowStatus, FunctionGeneratorReadback, InductanceField, InductanceReadback, InstrumentKey, InstrumentTestResult, IterationRecord, LlmChatMessage, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SearchParameter, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 import "./styles.css";
 
 const searchParameter = (center: number, min: number, max: number, points: number): SearchParameter => ({
@@ -66,7 +69,7 @@ const defaultConfig: TuningConfig = {
     vout_target_v: 0.9296875,
     overshoot_pct: 3,
     undershoot_pct: 3,
-    settling_time_s: 1e-6,
+    settling_time_s: 2e-6,
     oscillations: 0,
     phase_margin_deg: 45,
     crossover_frequency_hz: 200000,
@@ -119,11 +122,11 @@ const normalizeSearchParameter = (value: Partial<SearchParameter> | undefined, f
 const normalizeTuningConfig = (config?: Partial<TuningConfig> | null): TuningConfig => {
   const fallback = cloneDefaultConfig();
   const incoming = config ?? {};
-  const incomingSearch = incoming.search ?? {};
+  const incomingSearch: Partial<TuningConfig["search"]> = incoming.search ?? {};
   const normalizedSearch = {
     ...fallback.search,
     ...incomingSearch
-  };
+  } as TuningConfig["search"];
   for (const field of hardwareSearchFields) {
     normalizedSearch[field.key] = normalizeSearchParameter(
       incomingSearch[field.key] as Partial<SearchParameter> | undefined,
@@ -524,7 +527,8 @@ function buildAutotuneExperiment(
   bodeSweepConfig: BodeSweepConfig,
   settings: ManualExperimentSettings,
   analysisSelection: { bode: boolean; transient: boolean },
-  optimizationAlgorithm: string
+  optimizationAlgorithm: string,
+  drlModelId = ""
 ): AutotuneExperimentConfig {
   return {
     board_address: voutRequest.address,
@@ -546,7 +550,8 @@ function buildAutotuneExperiment(
     },
     vout_tolerance_v: 0.15,
     response_abs_limit_v: 0.25,
-    ignore_pass_until_max_iterations: true
+    ignore_pass_until_max_iterations: true,
+    drl_model_id: drlModelId
   };
 }
 
@@ -573,6 +578,7 @@ function App() {
   const [bodeSweepStatus, setBodeSweepStatus] = useState("Ready");
   const [autotuneAnalysisSelection, setAutotuneAnalysisSelection] = useState({ transient: true, bode: true });
   const [optimizationAlgorithm, setOptimizationAlgorithm] = useState("heuristic");
+  const [drlStatus, setDrlStatus] = useState<DrlWorkflowStatus | null>(null);
   const [autotuneRuns, setAutotuneRuns] = useState<AutotuneRunsResponse | null>(null);
   const [selectedAutotuneRun, setSelectedAutotuneRun] = useState("");
   const [autotuneArchiveStatus, setAutotuneArchiveStatus] = useState("");
@@ -606,6 +612,9 @@ function App() {
       const next = await getTuningStatus();
       if (viewingLoadedRun.current) return;
       setStatus(next);
+      if (["drl-collection", "deep-reinforcement", "safe-sac"].includes(next.experiment?.optimization_algorithm ?? "")) {
+        setConfig(normalizeTuningConfig(next.config));
+      }
       setError("");
     } catch (exc) {
       setError(String(exc));
@@ -627,12 +636,31 @@ function App() {
     }
   };
 
+  const refreshDrlStatus = async () => {
+    try {
+      setDrlStatus(await getDrlWorkflowStatus());
+    } catch (exc) {
+      setError(String(exc));
+    }
+  };
+
   useEffect(() => {
     refresh();
     refreshAutotuneRuns();
+    refreshDrlStatus();
     const timer = window.setInterval(refresh, 1000);
-    return () => window.clearInterval(timer);
+    const drlTimer = window.setInterval(refreshDrlStatus, 1000);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(drlTimer);
+    };
   }, []);
+
+  useEffect(() => {
+    if (["collecting", "collection_complete", "validating", "hardware_ready", "validation_failed"].includes(drlStatus?.state ?? "")) {
+      refreshAutotuneRuns();
+    }
+  }, [drlStatus?.state]);
 
   useEffect(() => {
     window.localStorage.setItem(tabStorageKey, activeTab);
@@ -732,7 +760,8 @@ function App() {
         bodeSweepConfig,
         manualExperimentSettings,
         autotuneAnalysisSelection,
-        optimizationAlgorithm
+        optimizationAlgorithm,
+        drlStatus?.model_id ?? ""
       );
       const next =
         action === "start" ? await startTuning(runConfig, experiment) : await stepTuning(runConfig, experiment);
@@ -740,6 +769,47 @@ function App() {
       setConfig(normalizeTuningConfig(next.config));
       refreshAutotuneRuns();
       setError("");
+    } catch (exc) {
+      setError(String(exc));
+    }
+  };
+
+  const runDrlAction = async (action: "collect" | "train" | "validate" | "stop") => {
+    try {
+      if (action === "stop") {
+        setDrlStatus(await stopDrlWorkflow());
+        await refresh();
+        await refreshAutotuneRuns();
+        setError("");
+        return;
+      }
+      if (!autotuneAnalysisSelection.transient || !autotuneAnalysisSelection.bode) {
+        throw new Error("Safe SAC collection and validation require both Transient Analysis and Bode Analysis.");
+      }
+      let runConfig = config;
+      if (action !== "train") {
+        viewingLoadedRun.current = false;
+        const baseline = await loadAutotuneHardwareBaseline();
+        const targetVout = snapVoutToRegister(config.targets.vout_target_v, voutExponentFromReadback(baseline.voutReadback));
+        runConfig = withManualSearchCenters(
+          { ...config, targets: { ...config.targets, vout_target_v: targetVout } },
+          baseline.pidRequest,
+          baseline.inductanceValues
+        );
+        setConfig(runConfig);
+      }
+      const experiment = buildAutotuneExperiment(
+        voutRequest,
+        bodeSweepConfig,
+        manualExperimentSettings,
+        { transient: true, bode: true },
+        "deep-reinforcement",
+        drlStatus?.model_id ?? ""
+      );
+      const next = await runDrlWorkflowAction(action, runConfig, experiment);
+      setDrlStatus(next);
+      setError("");
+      await refreshAutotuneRuns();
     } catch (exc) {
       setError(String(exc));
     }
@@ -1247,18 +1317,21 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <div className="brand-block">
-          <GoogleMark />
+          <img className="google-mark" src="/google-cloud-mark.png" alt="Google Cloud logo" />
           <div>
             <h1 className="google-title">
-              <span aria-label="Google">
-                <span className="google-blue">G</span>
-                <span className="google-red">o</span>
-                <span className="google-yellow">o</span>
-                <span className="google-blue">g</span>
-                <span className="google-green">l</span>
-                <span className="google-red">e</span>
+              <span className="google-cloud-wordmark" aria-label="Google Cloud">
+                <span className="google-wordmark" aria-hidden="true">
+                  <span className="google-blue">G</span>
+                  <span className="google-red">o</span>
+                  <span className="google-yellow">o</span>
+                  <span className="google-blue">g</span>
+                  <span className="google-green">l</span>
+                  <span className="google-red">e</span>
+                </span>
+                <span className="cloud-title" aria-hidden="true">Cloud</span>
               </span>{" "}
-              <span className="product-title">Power Auto-Tuner (V1.0)</span>
+              <span className="product-title">Power Auto Tuner (V1.0)</span>
             </h1>
             <p>{t.platform} ({t.copyright})</p>
             <p>{t.author}</p>
@@ -1313,6 +1386,8 @@ function App() {
         setAnalysisSelection={setAutotuneAnalysisSelection}
         optimizationAlgorithm={optimizationAlgorithm}
         setOptimizationAlgorithm={setOptimizationAlgorithm}
+        drlStatus={drlStatus}
+        runDrlAction={runDrlAction}
         experimentSettings={manualExperimentSettings}
         setExperimentSettings={setManualExperimentSettings}
         runAction={runAction}
@@ -1393,6 +1468,7 @@ function App() {
         status={status}
         config={config}
         language={language}
+        optimizationAlgorithm={optimizationAlgorithm}
       />
     </main>
   );
@@ -1402,12 +1478,14 @@ function LlmAssistantWidget({
   activeTab,
   status,
   config,
-  language
+  language,
+  optimizationAlgorithm
 }: {
   activeTab: AppTab;
   status: TuningStatus | null;
   config: TuningConfig;
   language: Language;
+  optimizationAlgorithm: string;
 }) {
   const greeting = language === "zh"
     ? "你好，我可以帮你理解这个 GUI、Auto-Tune 流程、Manual Tuning、Self Testing，以及 Bode 100 / Scope / Function Generator / PMBus 这些模块。"
@@ -1810,7 +1888,7 @@ function PenaltyExplanationDialog({ onClose }: { onClose: () => void }) {
           />
           <DefinitionCard
             title="OS / US Settling"
-            text="Each load step has its own settling time in microseconds. The code finds the final steady voltage for that segment, then reports the last time CH3 is outside the +/-2% band. The default target is below 1 us for both OS settling and US settling."
+            text="Each load step has its own settling time in microseconds. The analyzer uses the filtered CH3 response, a bounded settling band, and a stable dwell check. The default target is 2 us for both OS settling and US settling."
           />
           <DefinitionCard
             title="Phase Margin"
@@ -1835,26 +1913,78 @@ function DefinitionCard({ title, text }: { title: string; text: string }) {
   );
 }
 
-function GoogleMark() {
+function DrlControl({
+  status,
+  tuningState,
+  onAction
+}: {
+  status: DrlWorkflowStatus | null;
+  tuningState?: TuningStatus["state"];
+  onAction: (action: "collect" | "train" | "validate" | "stop") => Promise<void>;
+}) {
+  const busy = Boolean(status?.busy) || tuningState === "running";
+  const collectionReady = Boolean(
+    status
+    && status.collection_finished
+    && status.collection_total > 0
+    && status.collection_completed >= status.collection_total
+    && !status.resume_available
+    && !["preparing_collection", "collecting", "paused"].includes(status.state)
+  );
+  const validationReady = status?.model_status === "ready_for_validation" || status?.model_status === "hardware_ready";
+  const progress = Math.round(Math.max(0, Math.min(1, status?.progress ?? 0)) * 100);
+  const dependencyReady = Boolean(status?.dependency?.ok);
   return (
-    <svg className="google-mark" viewBox="0 0 48 48" aria-label="Google logo" role="img">
-      <path
-        fill="#FFC107"
-        d="M43.611 20.083H42V20H24v8h11.303c-1.649 4.657-6.08 8-11.303 8-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z"
-      />
-      <path
-        fill="#FF3D00"
-        d="M6.306 14.691l6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z"
-      />
-      <path
-        fill="#4CAF50"
-        d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238C29.211 35.091 26.715 36 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z"
-      />
-      <path
-        fill="#1976D2"
-        d="M43.611 20.083H42V20H24v8h11.303c-.792 2.237-2.231 4.166-4.087 5.571l.003-.002 6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z"
-      />
-    </svg>
+    <div className="drl-control" aria-live="polite">
+      <div className="drl-control-heading">
+        <BrainCircuit size={16} />
+        <span>DRL Control</span>
+        <span className={`drl-state ${status?.state ?? "idle"}`}>{status?.state?.replaceAll("_", " ") ?? "loading"}</span>
+      </div>
+      <div className="drl-facts">
+        <span>Dataset</span>
+        <strong title="Source records / usable six-action samples">
+          {status?.dataset_source_count ?? status?.dataset_count ?? 0} / {status?.dataset_count ?? 0}
+        </strong>
+        <span>Collect</span>
+        <strong>{status?.collection_completed ?? 0} / {status?.collection_total ?? 240}</strong>
+        <span>Model</span>
+        <strong title={status?.model_id ?? "No model"}>{status?.model_id ? status.model_id.replace("safe_sac_", "") : "Missing"}</strong>
+        <span>Compatible</span>
+        <strong>{status?.model_id ? (status.model_compatible ? "Yes" : "No") : "-"}</strong>
+        <span>Validate</span>
+        <strong>{status?.validation_completed ?? 0} / {status?.validation_total ?? 60}</strong>
+      </div>
+      <div className="drl-progress" aria-label={`DRL workflow progress ${progress}%`}>
+        <span style={{ width: `${progress}%` }} />
+      </div>
+      <div className="drl-actions">
+        <button type="button" onClick={() => onAction("collect")} disabled={busy || !dependencyReady} title="Collect the guarded 240-point hardware dataset">
+          <Database size={14} /> Collect
+        </button>
+        <button type="button" onClick={() => onAction("train")} disabled={busy || !collectionReady || !dependencyReady} title="Train the surrogate ensemble and Safe SAC policy">
+          <BrainCircuit size={14} /> Train
+        </button>
+        <button type="button" onClick={() => onAction("validate")} disabled={busy || !validationReady || !status?.model_compatible} title="Run four guarded hardware validation episodes">
+          <ShieldCheck size={14} /> Validate
+        </button>
+        <button type="button" onClick={() => onAction("stop")} disabled={!status?.busy && !status?.resume_available} title="Stop the DRL workflow">
+          <StopCircle size={14} /> Stop
+        </button>
+      </div>
+      <p className={`drl-message${status?.error ? " error" : ""}`}>
+        {!dependencyReady
+          ? status?.dependency?.error || "The optional CPU ML environment is not ready."
+          : !status?.model_id && status?.state === "idle"
+            ? "No usable model. Complete Collect and Train before Start Auto-Tune can use Safe SAC."
+            : status?.message || "DRL workflow is idle."}
+      </p>
+      {status?.validation_result && (
+        <p className={status.validation_result.accepted ? "drl-result accepted" : "drl-result rejected"}>
+          Hardware episodes: {status.validation_result.episodes_succeeded}/{status.validation_result.episodes_completed} successful
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -1878,6 +2008,8 @@ function AutotuneWorkbench({
   setAnalysisSelection,
   optimizationAlgorithm,
   setOptimizationAlgorithm,
+  drlStatus,
+  runDrlAction,
   experimentSettings,
   setExperimentSettings,
   runAction,
@@ -1918,6 +2050,8 @@ function AutotuneWorkbench({
   setAnalysisSelection: React.Dispatch<React.SetStateAction<{ transient: boolean; bode: boolean }>>;
   optimizationAlgorithm: string;
   setOptimizationAlgorithm: React.Dispatch<React.SetStateAction<string>>;
+  drlStatus: DrlWorkflowStatus | null;
+  runDrlAction: (action: "collect" | "train" | "validate" | "stop") => Promise<void>;
   experimentSettings: ManualExperimentSettings;
   setExperimentSettings: React.Dispatch<React.SetStateAction<ManualExperimentSettings>>;
   runAction: (action: "start" | "pause" | "resume" | "stop" | "step") => Promise<void>;
@@ -1943,6 +2077,8 @@ function AutotuneWorkbench({
   const voutRegisterStep = voutRegisterStepFromExponent(voutExponent);
   const fgConfig = experimentSettings.fgConfig;
   const canRunAnalysis = analysisSelection.transient || analysisSelection.bode;
+  const drlHardwareReady = Boolean(drlStatus?.model_status === "hardware_ready" && drlStatus.model_compatible);
+  const drlStartBlocked = optimizationAlgorithm === "deep-reinforcement" && !drlHardwareReady;
   const [selectedIteration, setSelectedIteration] = useState<number | null>(null);
   const [livePlayback, setLivePlayback] = useState(false);
   const selectedRecord = selectedIteration === null ? null : history.find((item) => item.iteration === selectedIteration) ?? null;
@@ -2047,10 +2183,13 @@ function AutotuneWorkbench({
                   ))}
                 </select>
               </div>
-              <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || status?.state === "paused" || !canRunAnalysis}>
+              {optimizationAlgorithm === "deep-reinforcement" && (
+                <DrlControl status={drlStatus} tuningState={status?.state} onAction={runDrlAction} />
+              )}
+              <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || status?.state === "paused" || !canRunAnalysis || drlStartBlocked}>
                 Start Auto-Tune
               </button>
-              <button className="autotune-control-button iterate" onClick={() => runAction("step")} disabled={status?.state === "running" || !canRunAnalysis}>
+              <button className="autotune-control-button iterate" onClick={() => runAction("step")} disabled={status?.state === "running" || !canRunAnalysis || drlStartBlocked}>
                 Run Single Iteration
               </button>
               <div className="autotune-control-grid">
@@ -2344,7 +2483,7 @@ function ManualTuningView({
   liveRateHz: number;
   setLiveRateHz: React.Dispatch<React.SetStateAction<number>>;
   realTimeWriting: boolean;
-  setRealTimeWriting: React.Dispatch<React.SetStateAction<boolean>>;
+  setRealTimeWriting: (enabled: boolean) => void;
   queueRealTimeWrite: (overrides: Partial<ManualWriteSnapshot>) => void;
   writeSelection: { vout: boolean; output_inductance: boolean; effective_lc_inductance: boolean; xdp_pid: boolean };
   setWriteSelection: React.Dispatch<React.SetStateAction<{ vout: boolean; output_inductance: boolean; effective_lc_inductance: boolean; xdp_pid: boolean }>>;
@@ -3042,7 +3181,7 @@ function ManualTuningView({
               <LiveRefreshButton enabled={powerSupplyLive} label="Read Only" onChange={setPowerSupplyLive} />
               <NumberField label="Voltage (V)" value={powerSupplyRequest.voltage_v} onChange={(value) => setPowerSupplyRequest((current) => ({ ...current, voltage_v: value }))} />
               <NumberField label="Current limit (A)" value={powerSupplyRequest.current_limit_a} onChange={(value) => setPowerSupplyRequest((current) => ({ ...current, current_limit_a: value }))} />
-              <button type="button" onClick={readSupply} disabled={powerSupplyRunning}><RefreshCw size={14} /> Read</button>
+              <button type="button" onClick={() => readSupply()} disabled={powerSupplyRunning}><RefreshCw size={14} /> Read</button>
               <button className="primary" type="button" onClick={writeSupply} disabled={powerSupplyRunning}>
                 {powerSupplyRunning ? <LoaderCircle className="spin" size={14} /> : <Zap size={14} />}
                 Write
@@ -5370,8 +5509,9 @@ function telemetryOption(history: VoutReadback[], axis: TelemetryAxisSettings = 
   const voutColor = "#1a73e8";
   const ioutColor = "#ea4335";
   const commandColor = "#34a853";
-  const latestMs = history.length > 0 && history[history.length - 1].timestamp
-    ? history[history.length - 1].timestamp * 1000
+  const latestSample = history[history.length - 1];
+  const latestMs = latestSample?.timestamp
+    ? latestSample.timestamp * 1000
     : Date.now();
   const durationMs = clampTelemetryDuration(axis.durationSeconds) * 1000;
   const axisMaxMs = latestMs;

@@ -53,6 +53,7 @@ export type IterationRecord = {
   bode_result?: Record<string, unknown>;
   scope_result?: Record<string, unknown>;
   duration_s?: number;
+  optimizer_metadata?: Record<string, unknown>;
 };
 
 export type SearchParameter = {
@@ -119,6 +120,49 @@ export type AutotuneExperimentConfig = {
   response_abs_limit_v: number;
   async_artifacts?: boolean;
   ignore_pass_until_max_iterations?: boolean;
+  drl_workflow_mode?: string;
+  drl_model_id?: string;
+  drl_collection_plan_id?: string;
+  drl_episode_budget?: number;
+  drl_confirmation_count?: number;
+};
+
+export type DrlWorkflowStatus = {
+  ok: boolean;
+  state: string;
+  workflow?: "collection" | "training" | "validation" | null;
+  busy: boolean;
+  message: string;
+  error?: string | null;
+  progress: number;
+  dataset_count: number;
+  dataset_source_count?: number;
+  dataset_id?: string | null;
+  collection_completed: number;
+  collection_total: number;
+  collection_finished?: boolean;
+  validation_completed: number;
+  validation_total: number;
+  model_id?: string | null;
+  model_status: string;
+  model_compatible: boolean;
+  validation_result?: {
+    episodes_completed: number;
+    episodes_succeeded: number;
+    required_successes: number;
+    confirmation_count: number;
+    hardware_points: number;
+    accepted: boolean;
+  } | null;
+  resume_available: boolean;
+  dependency?: {
+    ok: boolean;
+    torch?: string | null;
+    gymnasium?: string | null;
+    stable_baselines3?: string | null;
+    device?: "cpu" | string;
+    error?: string | null;
+  };
 };
 
 export type TuningStatus = {
