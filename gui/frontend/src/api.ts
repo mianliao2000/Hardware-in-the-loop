@@ -49,10 +49,6 @@ export function startTuning(config: TuningConfig, experiment?: AutotuneExperimen
   });
 }
 
-export function stopTuning(): Promise<TuningStatus> {
-  return requestJson<TuningStatus>("/api/tuning/stop", { method: "POST", body: "{}" });
-}
-
 export function pauseTuning(): Promise<TuningStatus> {
   return requestJson<TuningStatus>("/api/tuning/pause", { method: "POST", body: "{}" });
 }

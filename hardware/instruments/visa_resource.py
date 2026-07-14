@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
+import threading
 from typing import Iterable, Optional
+
+
+_RESOURCE_MANAGER_LOCK = threading.RLock()
+_RESOURCE_MANAGERS: dict[str, object] = {}
 
 
 class VisaConnectionError(RuntimeError):
@@ -27,12 +33,9 @@ def list_visa_resources() -> tuple[str, ...]:
     last_exc: Exception | None = None
     for rm in _resource_managers(pyvisa):
         try:
-            resources = tuple(rm.list_resources())
-            _safe_close(rm)
-            return resources
+            return tuple(rm.list_resources())
         except Exception as exc:
             last_exc = exc
-            _safe_close(rm)
     raise VisaConnectionError(
         "Could not list VISA resources. Check that NI-VISA, Keysight IO "
         "Libraries, or another VISA backend is installed."
@@ -40,16 +43,53 @@ def list_visa_resources() -> tuple[str, ...]:
 
 
 def _resource_managers(pyvisa):
-    """Yield native VISA first, then pyvisa-py as a fallback."""
+    """Yield shared native VISA first, then pyvisa-py as a fallback."""
 
+    for backend in (None, "@py"):
+        try:
+            yield _shared_resource_manager(pyvisa, backend)
+        except Exception:
+            continue
+
+
+def _shared_resource_manager(pyvisa, backend: str | None):
+    """Return one process-wide manager per VISA backend.
+
+    NI-VISA ResourceManager objects can share the same underlying default
+    session. Closing a short-lived manager may therefore invalidate unrelated
+    cached instrument handles. Keep the managers alive for the process and
+    close only individual instrument resources during normal operation.
+    """
+
+    key = backend or "native"
+    with _RESOURCE_MANAGER_LOCK:
+        manager = _RESOURCE_MANAGERS.get(key)
+        if manager is not None and _resource_manager_is_open(manager):
+            return manager
+
+        manager = pyvisa.ResourceManager() if backend is None else pyvisa.ResourceManager(backend)
+        _RESOURCE_MANAGERS[key] = manager
+        return manager
+
+
+def _resource_manager_is_open(manager) -> bool:
     try:
-        yield pyvisa.ResourceManager()
+        return manager.session is not None
     except Exception:
-        pass
-    try:
-        yield pyvisa.ResourceManager("@py")
-    except Exception:
-        pass
+        return False
+
+
+def close_shared_resource_managers() -> None:
+    """Close process-wide VISA managers during interpreter shutdown."""
+
+    with _RESOURCE_MANAGER_LOCK:
+        managers = tuple(_RESOURCE_MANAGERS.values())
+        _RESOURCE_MANAGERS.clear()
+    for manager in managers:
+        _safe_close(manager)
+
+
+atexit.register(close_shared_resource_managers)
 
 
 def _safe_close(resource) -> None:
@@ -100,7 +140,6 @@ class VisaInstrument:
                     return self
                 except Exception as exc:
                     last_exc = exc
-                    _safe_close(rm)
             raise VisaConnectionError(f"Could not open VISA resource {self.resource_name!r}") from last_exc
         except Exception as exc:
             raise VisaConnectionError(f"Could not open VISA resource {self.resource_name!r}") from exc
@@ -113,9 +152,9 @@ class VisaInstrument:
             except Exception:
                 pass
             self._inst = None
-        if self._rm is not None:
-            _safe_close(self._rm)
-            self._rm = None
+        # The ResourceManager is process-wide. Closing it here can invalidate
+        # cached Bode/Scope sessions when a short-lived AFG object is released.
+        self._rm = None
 
     def write(self, command: str) -> None:
         if self._inst is None:

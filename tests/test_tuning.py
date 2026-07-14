@@ -20,9 +20,29 @@ from hardware.tuning import (
     TuningTargets,
     Waveform,
 )
+from hardware.tuning.search import hardware_candidate_key
+from hardware.tuning.analyzer import _passed_reward, score_metrics
 
 
 class TuningFrameworkTest(unittest.TestCase):
+    def test_settling_penalty_and_reward_use_ten_per_microsecond(self) -> None:
+        targets = TuningTargets(settling_time_s=2e-6)
+        penalty = score_metrics(3.0, 3.0, 0, 3e-6, 4e-6, targets)
+        self.assertAlmostEqual(penalty, 30.0)
+
+        transient = ResponseMetrics(
+            overshoot_pct=3.0,
+            undershoot_pct=3.0,
+            settling_time_s=1.95e-6,
+            oscillations=0,
+            score=0.0,
+            passed=True,
+            overshoot_settling_time_s=1.95e-6,
+            undershoot_settling_time_s=1.95e-6,
+        )
+        reward = _passed_reward(targets, transient, None, None, None, True, False)
+        self.assertAlmostEqual(reward, 1.0)
+
     def test_compensator_generates_positive_pid_terms(self) -> None:
         pid = CompensatorDesign(PlantParams()).compute(157_080.0, 60.0)
 
@@ -126,7 +146,7 @@ class TuningFrameworkTest(unittest.TestCase):
 
         self.assertIsNone(tuner.next_candidate(history, best))
 
-    def test_hardware_search_splits_coarse_between_coordinate_and_pairwise(self) -> None:
+    def test_hardware_search_uses_full_coarse_budget_for_global_sampling(self) -> None:
         search = SearchSpace(max_coarse_iterations=11, max_refined_iterations=4)
         tuner = HardwareGridHeuristicTuner(search)
         history: list[IterationRecord] = []
@@ -163,10 +183,50 @@ class TuningFrameworkTest(unittest.TestCase):
             best = record if best is None or record.metrics.score < best.metrics.score else best
 
         self.assertEqual(sum(1 for record in history if record.phase == "baseline"), 1)
-        self.assertEqual(sum(1 for record in history if record.phase == "coordinate"), 6)
-        self.assertEqual(sum(1 for record in history if record.phase == "pairwise_coarse"), 4)
+        self.assertEqual(sum(1 for record in history if record.phase == "coordinate"), 10)
+        self.assertEqual(sum(1 for record in history if record.phase == "pairwise_coarse"), 0)
         self.assertEqual(sum(1 for record in history if record.phase == "local_refine"), 4)
         self.assertIsNone(tuner.next_candidate(history, best))
+
+    def test_coarse_global_sampling_covers_pid_endpoints(self) -> None:
+        search = SearchSpace(max_coarse_iterations=90, max_refined_iterations=0)
+        tuner = HardwareGridHeuristicTuner(search)
+        history: list[IterationRecord] = []
+        best: IterationRecord | None = None
+
+        for iteration in range(1, search.total_iteration_budget() + 1):
+            candidate = tuner.next_candidate(history, best)
+            self.assertIsNotNone(candidate)
+            metrics = ResponseMetrics(
+                overshoot_pct=0.0,
+                undershoot_pct=0.0,
+                settling_time_s=1e-6,
+                oscillations=0,
+                score=float(iteration),
+                passed=False,
+            )
+            record = IterationRecord(
+                iteration=iteration,
+                phase=candidate.phase,
+                wc_rad_s=0.0,
+                phi_deg=0.0,
+                pid=PidParameters(kp=0.0, ki=0.0, kd=0.0, kf=0.0),
+                metrics=metrics,
+                waveform=Waveform(time_s=[], vout_v=[]),
+                timestamp=float(iteration),
+                candidate=candidate,
+            )
+            history.append(record)
+            best = best or record
+
+        coordinates = [record.candidate for record in history if record.phase == "coordinate"]
+        self.assertEqual(len(coordinates), 89)
+        self.assertEqual({candidate.mod0_kp for candidate in coordinates} & {100, 255}, {100, 255})
+        self.assertEqual({candidate.mod0_ki for candidate in coordinates} & {150, 255}, {150, 255})
+        self.assertEqual({candidate.mod0_kd for candidate in coordinates} & {100, 200}, {100, 200})
+        self.assertEqual({candidate.mod0_kpole1 for candidate in coordinates}, {3, 6})
+        self.assertTrue(all(candidate.mod0_kpole1 == candidate.mod0_kpole2 for candidate in coordinates))
+        self.assertEqual(len({hardware_candidate_key(candidate) for candidate in coordinates}), len(coordinates))
 
     def test_session_stops_when_local_refine_penalty_saturates(self) -> None:
         class FlatRunner:
@@ -505,17 +565,22 @@ class TuningFrameworkTest(unittest.TestCase):
         self.assertEqual(len(runner.candidates), 1)
         self.assertEqual(status["history"][0]["candidate"]["mod0_kp"], runner.candidates[0].mod0_kp)
 
-    def test_coordinate_batch_skips_recoverable_transient_protection_points(self) -> None:
+    def test_serial_split_skips_recoverable_transient_protection_points(self) -> None:
         class Runner:
+            supports_split_analysis = True
+
             def __init__(self) -> None:
                 self.transient_calls = 0
+                self.coordinate_transient_calls = 0
                 self.recoveries = 0
 
             def evaluate(self, candidate, config, experiment):
                 if experiment.enable_transient_analysis and not experiment.enable_bode_analysis:
                     self.transient_calls += 1
-                    if candidate.phase == "coordinate" and self.transient_calls <= 2:
-                        raise RuntimeError("Scope safety check failed: response range tripped protection.")
+                    if candidate.phase == "coordinate":
+                        self.coordinate_transient_calls += 1
+                        if self.coordinate_transient_calls <= 2:
+                            raise RuntimeError("Scope safety check failed: response range tripped protection.")
                 metrics = ResponseMetrics(
                     overshoot_pct=1.0,
                     undershoot_pct=1.0,
@@ -538,7 +603,7 @@ class TuningFrameworkTest(unittest.TestCase):
 
         runner = Runner()
         session = PidAutotuneSession(
-            config=TuningConfig(search=SearchSpace(max_iterations=4)),
+            config=TuningConfig(search=SearchSpace(max_coarse_iterations=4, max_refined_iterations=0)),
             experiment_runner=runner,
         )
 
@@ -555,14 +620,81 @@ class TuningFrameworkTest(unittest.TestCase):
         self.assertEqual(len(skipped), 2)
         self.assertTrue(all("transient protection skipped" in record["metrics"]["pass_reasons"][0] for record in skipped))
 
-    def test_refine_candidate_skips_recoverable_transient_protection_point(self) -> None:
+    def test_stop_pauses_after_current_serial_candidate(self) -> None:
+        class Runner:
+            supports_split_analysis = True
+
+            def __init__(self) -> None:
+                self.session = None
+                self.transient_calls = 0
+                self.bode_calls = 0
+                self.stop_requested = False
+
+            def evaluate(self, candidate, config, experiment):
+                if experiment.enable_transient_analysis:
+                    self.transient_calls += 1
+                    # The first call is the baseline. Stop during the first
+                    # coordinate transient, before its Bode action begins.
+                    if candidate.phase == "coordinate" and not self.stop_requested:
+                        self.stop_requested = True
+                        self.session.stop()
+                if experiment.enable_bode_analysis:
+                    self.bode_calls += 1
+                metrics = ResponseMetrics(
+                    overshoot_pct=1.0,
+                    undershoot_pct=1.0,
+                    settling_time_s=1e-6,
+                    oscillations=0,
+                    score=20.0,
+                    passed=False,
+                )
+                return ExperimentResult(
+                    waveform=Waveform(time_s=[0.0, 1e-6], vout_v=[0.9, 0.9]),
+                    metrics=metrics,
+                    bode_result={"margins": {"phase_margin_deg": 50.0, "phase_crossover_hz": 120_000.0}},
+                    scope_result={"ok": True},
+                    duration_s=0.01,
+                )
+
+        runner = Runner()
+        session = PidAutotuneSession(
+            config=TuningConfig(search=SearchSpace(max_coarse_iterations=4, max_refined_iterations=0)),
+            experiment_runner=runner,
+        )
+        runner.session = session
+
+        # Complete the baseline first. The fake runner requests Stop during the
+        # next transient; that candidate still completes its Bode measurement
+        # before the session pauses between candidates.
+        session.step()
+        session.start()
+        deadline = time.time() + 5.0
+        status = session.status()
+        while status["state"] == "running" and time.time() < deadline:
+            time.sleep(0.02)
+            status = session.status()
+
+        self.assertEqual(status["state"], "paused")
+        self.assertEqual(len(status["history"]), 2)
+        self.assertEqual(runner.transient_calls, 2)
+        self.assertEqual(runner.bode_calls, 2)
+
+        # Resume continues with the following candidate.
+        resumed = session.resume()
+        deadline = time.time() + 5.0
+        while resumed["state"] == "running" and time.time() < deadline:
+            time.sleep(0.02)
+            resumed = session.status()
+        self.assertGreaterEqual(len(resumed["history"]), 2)
+
+    def test_serial_coarse_candidate_skips_recoverable_transient_protection_point(self) -> None:
         class Runner:
             def __init__(self) -> None:
                 self.recoveries = 0
                 self.did_raise = False
 
             def evaluate(self, candidate, config, experiment):
-                if candidate.phase == "pairwise_coarse" and not self.did_raise:
+                if candidate.phase == "coordinate" and not self.did_raise:
                     self.did_raise = True
                     raise RuntimeError(
                         "Scope safety check failed: response range 0.6560 V to 0.6560 V exceeds 0.6797 V to 1.1797 V."
@@ -598,7 +730,7 @@ class TuningFrameworkTest(unittest.TestCase):
         self.assertEqual(runner.recoveries, 1)
         skipped = [record for record in status["history"] if record["write_results"].get("skipped")]
         self.assertEqual(len(skipped), 1)
-        self.assertEqual(skipped[0]["phase"], "pairwise_coarse")
+        self.assertEqual(skipped[0]["phase"], "coordinate")
 
 
 if __name__ == "__main__":

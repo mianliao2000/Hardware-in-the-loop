@@ -71,8 +71,6 @@ class GridRefinePidTuner:
 class HardwareGridHeuristicTuner:
     """Generate raw hardware candidates with local grid + heuristic refinement."""
 
-    COORDINATE_COARSE_FRACTION = 0.60
-
     def __init__(self, search: SearchSpace):
         self.search = search
         self._queue: list[HardwarePidCandidate] = [self._center_candidate("baseline")]
@@ -101,7 +99,7 @@ class HardwareGridHeuristicTuner:
                 self._coordinate_loaded = True
                 remaining = self._remaining_coordinate_budget(history)
                 if remaining > 0:
-                    self._queue.extend(self._coordinate_grid()[:remaining])
+                    self._queue.extend(self._coordinate_grid(remaining))
                 continue
 
             if not self._pairwise_loaded and best is not None:
@@ -119,40 +117,6 @@ class HardwareGridHeuristicTuner:
 
             return None
 
-    def next_candidate_batch(
-        self,
-        history: list[IterationRecord],
-        best: IterationRecord | None,
-        max_count: int,
-    ) -> list[HardwarePidCandidate]:
-        """Return a small batch of compatible candidates for coarse hardware scans.
-
-        The first candidate decides the batch phase. Baseline, pairwise, and local
-        refine stay single-candidate so adaptive tuning still waits for the latest
-        result before choosing the next point. Coordinate candidates are independent
-        enough to be measured in small batches.
-        """
-
-        remaining = max(0, _total_iteration_budget(self.search) - len(history))
-        limit = max(1, min(int(max_count), remaining))
-        first = self.next_candidate(history, best)
-        if first is None:
-            return []
-        if first.phase != "coordinate" or limit == 1:
-            return [first]
-
-        candidates = [first]
-        while len(candidates) < limit:
-            candidate = self.next_candidate(history, best)
-            if candidate is None:
-                break
-            if candidate.phase != first.phase:
-                self._queue.insert(0, candidate)
-                self._seen.discard(hardware_candidate_key(candidate))
-                break
-            candidates.append(candidate)
-        return candidates
-
     def _center_candidate(self, phase: str) -> HardwarePidCandidate:
         values = {
             name: _typed_value(name, parameter.clamped(parameter.center))
@@ -161,13 +125,15 @@ class HardwareGridHeuristicTuner:
         }
         return HardwarePidCandidate(**values, phase=phase)
 
-    def _coordinate_grid(self) -> list[HardwarePidCandidate]:
+    def _coordinate_grid(self, target_count: int | None = None) -> list[HardwarePidCandidate]:
         center = self._center_candidate("coordinate")
         value_sets = {
             name: _range_values(_range_for(self.search, name), name)
             for name in HARDWARE_TUNING_FIELD_NAMES
         }
-        return _sample_coordinate_combinations(center, value_sets, max(0, _coarse_iteration_budget(self.search) - 1))
+        if target_count is None:
+            target_count = max(0, _coarse_iteration_budget(self.search) - 1)
+        return _sample_coordinate_combinations(center, value_sets, max(0, target_count))
 
     def _pairwise_coarse(self, history: list[IterationRecord], best: IterationRecord) -> list[HardwarePidCandidate]:
         base = best.candidate or self._center_candidate("pairwise_coarse")
@@ -265,14 +231,11 @@ def _refined_iteration_budget(search: SearchSpace) -> int:
 
 
 def _coarse_phase_budgets(search: SearchSpace) -> tuple[int, int]:
-    # Baseline consumes one coarse slot. The remaining coarse budget is split
-    # between independent coordinate combinations and best-based pairwise coarse.
+    # Baseline consumes one coarse slot. Every remaining coarse iteration samples
+    # the complete multidimensional search space. Heuristic refinement has its own
+    # explicit refined-iteration budget and must not truncate global coverage.
     coarse_remaining = max(0, _coarse_iteration_budget(search) - 1)
-    if coarse_remaining <= 0:
-        return (0, 0)
-    coordinate_budget = int(math.ceil(coarse_remaining * HardwareGridHeuristicTuner.COORDINATE_COARSE_FRACTION))
-    coordinate_budget = min(max(0, coordinate_budget), coarse_remaining)
-    return (coordinate_budget, coarse_remaining - coordinate_budget)
+    return (coarse_remaining, 0)
 
 
 def hardware_candidate_key(candidate: HardwarePidCandidate) -> tuple:
@@ -310,12 +273,12 @@ def _sample_coordinate_combinations(
     if target_count <= 0:
         return []
     fields = [name for name in HARDWARE_TUNING_FIELD_NAMES if len(value_sets.get(name, [])) > 1]
+    # kpole1 and kpole2 are written as a coupled pair. Treating them as separate
+    # dimensions creates duplicate candidates and wastes coarse iterations.
+    if "mod0_kpole1" in fields and "mod0_kpole2" in fields:
+        fields.remove("mod0_kpole2")
     if not fields:
         return []
-
-    total = 1
-    for name in fields:
-        total *= len(value_sets[name])
 
     candidates: list[HardwarePidCandidate] = []
     local_seen: set[tuple] = set()
@@ -337,39 +300,92 @@ def _sample_coordinate_combinations(
         local_seen.add(key)
         candidates.append(candidate)
 
-    lengths = [len(value_sets[name]) for name in fields]
+    normalized_sets = {
+        name: _dedupe_search_values(value_sets[name], name)
+        for name in fields
+    }
+    lengths = [len(normalized_sets[name]) for name in fields]
+    total = math.prod(lengths)
     target = min(target_count, total - 1)
     if target <= 0:
         return []
 
-    stride = max(1, total // target)
-    while math.gcd(stride, total) != 1:
-        stride += 1
+    # Seed both opposite corners so every field's configured min/max is always
+    # represented, even with a small coarse budget.
+    add_from_values({name: normalized_sets[name][0] for name in fields})
+    if len(candidates) < target:
+        add_from_values({name: normalized_sets[name][-1] for name in fields})
 
-    attempts = 0
-    index = 0
-    max_attempts = min(total, max(target_count * 100, 500))
-    while len(candidates) < target_count and attempts < max_attempts:
-        combo_indexes = _mixed_radix_indexes(index, lengths)
-        values = {
-            name: value_sets[name][combo_indexes[field_index]]
-            for field_index, name in enumerate(fields)
-        }
+    # A deterministic stratified pass covers every discrete level in every
+    # dimension before adding more combinations. Different coprime strides and
+    # offsets prevent equal-length dimensions from moving in lockstep.
+    max_levels = max(lengths)
+    coverage_attempts = max(max_levels, target)
+    for sample_index in range(coverage_attempts):
+        if len(candidates) >= target:
+            break
+        values: dict[str, float] = {}
+        for field_index, name in enumerate(fields):
+            length = len(normalized_sets[name])
+            stride = _coprime_stride(length, field_index + 1)
+            offset = (field_index * field_index + field_index) % length
+            level_index = (sample_index * stride + offset) % length
+            values[name] = normalized_sets[name][level_index]
         add_from_values(values)
-        index = (index + stride) % total
-        attempts += 1
+
+    # Fill the remaining budget with a low-discrepancy sequence. Unlike the old
+    # mixed-radix prefix, each prefix spans every axis instead of exhausting low
+    # kp values first.
+    sample_index = 1
+    max_attempts = max(target * 200, 1000)
+    while len(candidates) < target and sample_index <= max_attempts:
+        values = {}
+        for field_index, name in enumerate(fields):
+            levels = normalized_sets[name]
+            fraction = _radical_inverse(sample_index, _prime_for_dimension(field_index))
+            level_index = min(len(levels) - 1, int(fraction * len(levels)))
+            values[name] = levels[level_index]
+        add_from_values(values)
+        sample_index += 1
 
     return candidates
 
 
-def _mixed_radix_indexes(index: int, lengths: list[int]) -> list[int]:
-    indexes = [0] * len(lengths)
-    for position in range(len(lengths) - 1, -1, -1):
-        length = max(1, lengths[position])
-        indexes[position] = index % length
-        index //= length
-    return indexes
+def _dedupe_search_values(values: list[float], name: str) -> list[float]:
+    deduped: list[float] = []
+    seen: set[float | int] = set()
+    for value in values:
+        typed = _typed_value(name, value)
+        key: float | int = typed if _is_int_field(name) else round(float(typed), 9)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(typed)
+    return sorted(deduped)
 
+
+def _coprime_stride(length: int, seed: int) -> int:
+    if length <= 1:
+        return 1
+    stride = 1 + (2 * seed) % length
+    while math.gcd(stride, length) != 1:
+        stride = stride % length + 1
+    return stride
+
+
+def _prime_for_dimension(index: int) -> int:
+    primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
+    return primes[index % len(primes)]
+
+
+def _radical_inverse(index: int, base: int) -> float:
+    result = 0.0
+    factor = 1.0 / base
+    while index > 0:
+        index, digit = divmod(index, base)
+        result += digit * factor
+        factor /= base
+    return result
 
 def _record_priority(record: IterationRecord) -> tuple[float, float, float, int, float, int]:
     metrics = record.metrics

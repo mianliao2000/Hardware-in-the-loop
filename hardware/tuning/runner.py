@@ -33,7 +33,6 @@ from .search import HardwareGridHeuristicTuner, TuningCandidate, select_best_res
 
 LOCAL_REFINE_IMPROVEMENT_EPSILON = 1e-9
 LOCAL_REFINE_STALL_PATIENCE = 2 * len(HARDWARE_TUNING_FIELD_NAMES)
-COORDINATE_BATCH_SIZE = 20
 
 
 class AutotuneExperimentRunner(Protocol):
@@ -204,7 +203,7 @@ class PidAutotuneSession:
             if self._snapshot.state == "running":
                 return self.status()
             self._stop_requested = False
-            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=False)
+            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=True)
             self._snapshot.state = "running"
             self._snapshot.message = "Hardware auto-tune started."
             self._worker = threading.Thread(target=self._run_loop, name="pid-autotune", daemon=True)
@@ -225,7 +224,7 @@ class PidAutotuneSession:
             if self._snapshot.state not in {"paused", "stopped", "idle"}:
                 raise RuntimeError(f"Cannot resume from state '{self._snapshot.state}'.")
             self._stop_requested = False
-            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=False)
+            self._snapshot.experiment = replace(self._snapshot.experiment, async_artifacts=True)
             self._snapshot.state = "running"
             self._snapshot.message = "Hardware auto-tune resumed."
             self._worker = threading.Thread(target=self._run_loop, name="pid-autotune", daemon=True)
@@ -251,12 +250,13 @@ class PidAutotuneSession:
             return self.status()
 
     def stop(self) -> dict:
-        with self._lock:
-            self._stop_requested = True
-            if self._snapshot.state == "running":
-                self._snapshot.state = "stopped"
-                self._snapshot.message = "Stop requested."
-            return self.status()
+        """Compatibility entry point for clients that still call ``stop``.
+
+        Hardware tuning is resumable: a stop request has the same safe,
+        between-candidate behavior as pause instead of terminating the search.
+        """
+
+        return self.pause()
 
     def step(self, config: TuningConfig | None = None, experiment: AutotuneExperimentConfig | None = None) -> dict:
         with self._lock:
@@ -291,48 +291,31 @@ class PidAutotuneSession:
                     return
             did_run = self._run_next_background_unit()
             if not did_run:
+                with self._lock:
+                    if self._stop_requested and self._snapshot.state == "running":
+                        self._snapshot.state = "paused"
+                        self._snapshot.message = "Paused."
                 return
             with self._lock:
                 if self._stop_requested and self._snapshot.state == "running":
                     self._snapshot.state = "paused"
                     self._snapshot.message = "Paused."
                     return
-            time.sleep(0.2)
+            time.sleep(0.01)
 
     def _run_next_background_unit(self) -> bool:
         with self._lock:
             config = self._snapshot.config
             experiment = self._snapshot.experiment
             best = self._snapshot.best
-            if experiment.enable_transient_analysis and experiment.enable_bode_analysis:
-                candidates = self._next_candidate_batch(best, COORDINATE_BATCH_SIZE)
-            else:
-                candidate = self._tuner.next_candidate(self._snapshot.history, best)
-                candidates = [candidate] if candidate is not None else []
-            if not candidates:
+            candidate = self._tuner.next_candidate(self._snapshot.history, best)
+            if candidate is None:
                 self._mark_search_complete_locked(config, best)
                 return False
 
-        if (
-            len(candidates) > 1
-            and candidates[0].phase == "coordinate"
-            and experiment.enable_transient_analysis
-            and experiment.enable_bode_analysis
-        ):
-            return self._run_coordinate_batch(candidates, config, experiment)
-
-        return self._run_candidate_serial(candidates[0], config, experiment)
-
-    def _next_candidate_batch(
-        self,
-        best: IterationRecord | None,
-        max_count: int,
-    ) -> list[HardwarePidCandidate]:
-        batch_method = getattr(self._tuner, "next_candidate_batch", None)
-        if callable(batch_method):
-            return list(batch_method(self._snapshot.history, best, max_count))
-        candidate = self._tuner.next_candidate(self._snapshot.history, best)
-        return [candidate] if candidate is not None else []
+        # Complete each candidate end to end so measurements, history,
+        # pause behavior, and hardware recovery stay aligned.
+        return self._run_candidate_serial(candidate, config, experiment)
 
     def _optimizer_metadata_for(self, candidate: HardwarePidCandidate) -> dict[str, Any]:
         metadata_method = getattr(self._tuner, "metadata_for", None)
@@ -341,6 +324,11 @@ class PidAutotuneSession:
             if isinstance(metadata, dict):
                 return dict(metadata)
         return {"algorithm": str(self._snapshot.experiment.optimization_algorithm or "heuristic")}
+
+    def _set_experiment_iteration_context(self, iteration: int) -> None:
+        setter = getattr(self._experiment_runner, "set_iteration_context", None)
+        if callable(setter):
+            setter(iteration)
 
     def _run_one_iteration(self) -> bool:
         with self._lock:
@@ -363,6 +351,9 @@ class PidAutotuneSession:
         try:
             started = time.perf_counter()
             optimizer_metadata = self._optimizer_metadata_for(candidate)
+            with self._lock:
+                iteration = len(self._snapshot.history) + 1
+            self._set_experiment_iteration_context(iteration)
             supports_split = bool(getattr(self._experiment_runner, "supports_split_analysis", False))
             if experiment.enable_transient_analysis and experiment.enable_bode_analysis and supports_split:
                 transient_experiment = replace(experiment, enable_transient_analysis=True, enable_bode_analysis=False)
@@ -400,92 +391,6 @@ class PidAutotuneSession:
                     return keep_running
                 except Exception as recovery_exc:
                     exc = recovery_exc
-            with self._lock:
-                self._snapshot.state = "error"
-                self._snapshot.message = str(exc)
-            return False
-
-    def _run_coordinate_batch(
-        self,
-        candidates: list[HardwarePidCandidate],
-        config: TuningConfig,
-        experiment: AutotuneExperimentConfig,
-    ) -> bool:
-        transient_experiment = replace(experiment, enable_transient_analysis=True, enable_bode_analysis=False)
-        bode_experiment = replace(experiment, enable_transient_analysis=False, enable_bode_analysis=True)
-        transient_results: list[tuple[HardwarePidCandidate, ExperimentResult, float, dict[str, Any]]] = []
-        try:
-            for index, candidate in enumerate(candidates, 1):
-                with self._lock:
-                    self._snapshot.message = (
-                        f"Coordinate batch transient {index}/{len(candidates)} "
-                        f"({len(self._snapshot.history) + index}/{_total_iteration_budget(config.search)})."
-                )
-                started = time.perf_counter()
-                try:
-                    optimizer_metadata = self._optimizer_metadata_for(candidate)
-                    transient_results.append(
-                        (
-                            candidate,
-                            self._experiment_runner.evaluate(candidate, config, transient_experiment),
-                            started,
-                            optimizer_metadata,
-                        )
-                    )
-                except Exception as exc:
-                    if not _is_recoverable_transient_failure(exc):
-                        raise
-                    recovery = self._recover_after_transient_protection(experiment, config)
-                    failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
-                    keep_running = self._append_iteration_result(
-                        candidate,
-                        failed_result,
-                        started,
-                        config,
-                        optimizer_metadata=self._optimizer_metadata_for(candidate),
-                    )
-                    if not keep_running:
-                        return False
-
-            for index, (candidate, transient_result, started, optimizer_metadata) in enumerate(transient_results, 1):
-                with self._lock:
-                    self._snapshot.message = (
-                        f"Coordinate batch Bode {index}/{len(transient_results)} "
-                        f"({len(self._snapshot.history) + 1}/{_total_iteration_budget(config.search)})."
-                    )
-                try:
-                    bode_result = self._experiment_runner.evaluate(candidate, config, bode_experiment)
-                except Exception as exc:
-                    if not _is_recoverable_transient_failure(exc):
-                        raise
-                    recovery = self._recover_after_transient_protection(experiment, config)
-                    failed_result = _skipped_protection_result(candidate, exc, recovery, time.perf_counter() - started)
-                    keep_running = self._append_iteration_result(
-                        candidate,
-                        failed_result,
-                        started,
-                        config,
-                        optimizer_metadata=optimizer_metadata,
-                    )
-                    if not keep_running:
-                        return False
-                    continue
-                combined_result = self._merge_split_experiment_results(
-                    transient_result,
-                    bode_result,
-                    config,
-                )
-                keep_running = self._append_iteration_result(
-                    candidate,
-                    combined_result,
-                    started,
-                    config,
-                    optimizer_metadata=optimizer_metadata,
-                )
-                if not keep_running:
-                    return False
-            return True
-        except Exception as exc:
             with self._lock:
                 self._snapshot.state = "error"
                 self._snapshot.message = str(exc)
@@ -742,6 +647,10 @@ def _compact_bode_result(value: Any) -> Any:
         "bode_png_pending",
         "margins",
         "duration_s",
+        "session_reused",
+        "config_reused",
+        "retried_stale_session",
+        "stage_durations_s",
         "timestamp",
     }
     return {key: value.get(key) for key in keep if key in value}
@@ -771,6 +680,10 @@ def _compact_scope_result(value: Any) -> Any:
         "scope_trigger_offset_from_left_s",
         "scope_trigger_position_percent",
         "duration_s",
+        "session_reused",
+        "config_reused",
+        "session_retry",
+        "stage_durations_s",
         "timestamp",
     }
     compact = {key: value.get(key) for key in keep if key in value}

@@ -33,6 +33,8 @@ METRIC_FIELDS = (
     "crossover_frequency_khz",
     "gain_margin_db",
 )
+
+SETTLING_WEIGHT_PER_US = 10.0
 INVALID_REASON_TOKENS = (
     "protection skipped",
     "transient protection",
@@ -211,8 +213,8 @@ def relabeled_score(metrics: Mapping[str, Any], targets: TuningTargets) -> tuple
     score += max(0.0, mapping["overshoot_pct"] - targets.overshoot_pct)
     score += max(0.0, mapping["undershoot_pct"] - targets.undershoot_pct)
     target_us = targets.settling_time_s * 1e6
-    score += 3.0 * max(0.0, mapping["overshoot_settling_time_us"] - target_us)
-    score += 3.0 * max(0.0, mapping["undershoot_settling_time_us"] - target_us)
+    score += SETTLING_WEIGHT_PER_US * max(0.0, mapping["overshoot_settling_time_us"] - target_us)
+    score += SETTLING_WEIGHT_PER_US * max(0.0, mapping["undershoot_settling_time_us"] - target_us)
 
     phase_ok = False
     crossover_ok = False
@@ -245,8 +247,8 @@ def relabeled_score(metrics: Mapping[str, Any], targets: TuningTargets) -> tuple
     if passed:
         reward = 0.15 * _headroom(targets.overshoot_pct, mapping["overshoot_pct"])
         reward += 0.15 * _headroom(targets.undershoot_pct, mapping["undershoot_pct"])
-        reward += 3.0 * max(0.0, target_us - mapping["overshoot_settling_time_us"])
-        reward += 3.0 * max(0.0, target_us - mapping["undershoot_settling_time_us"])
+        reward += SETTLING_WEIGHT_PER_US * max(0.0, target_us - mapping["overshoot_settling_time_us"])
+        reward += SETTLING_WEIGHT_PER_US * max(0.0, target_us - mapping["undershoot_settling_time_us"])
         # Match ResponseAnalyzer._passed_reward: every passing PM has zero
         # phase error and therefore receives the configured tolerance reward.
         reward += max(0.0, targets.phase_margin_tolerance_deg) * 0.05

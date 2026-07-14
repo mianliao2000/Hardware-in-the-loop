@@ -33,7 +33,7 @@ import {
   Sun,
   Zap
 } from "lucide-react";
-import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getDrlWorkflowStatus, getTuningRuns, getTuningStatus, loadTuningRun, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runDrlWorkflowAction, runSelfTestDevice, saveTuningAnimationGif, sendLlmChat, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopDrlWorkflow, stopTuning, warmScope } from "./api";
+import { archiveCurrentTuningRun, captureScope, deleteTuningRun, getDrlWorkflowStatus, getTuningRuns, getTuningStatus, loadTuningRun, pauseTuning, readFunctionGenerator, readInductance, readPmbusOutput, readPowerSupply, readVout, readXdpOutput, readXdpPid, resetTuning, resumeTuning, runBodeSweep, runDrlWorkflowAction, runSelfTestDevice, saveTuningAnimationGif, sendLlmChat, setFunctionGenerator, setInductance, setPmbusOutput, setPowerSupply, setScopeAcquisition, setVout, setXdpOutput, setXdpPid, startTuning, stepTuning, stopDrlWorkflow, warmScope } from "./api";
 import type { AutotuneExperimentConfig, AutotuneGifResponse, AutotuneRunsResponse, BodeSweepConfig, BodeSweepReadback, DrlWorkflowStatus, FunctionGeneratorReadback, InductanceField, InductanceReadback, InstrumentKey, InstrumentTestResult, IterationRecord, LlmChatMessage, PmbusOutputAction, PmbusOutputReadback, PowerSupplyReadback, ScopeCaptureReadback, SearchParameter, SelfTestResponse, TuningConfig, TuningStatus, VoutReadback, XdpOutputAction, XdpOutputReadback, XdpPidReadback } from "./types";
 import "./styles.css";
 
@@ -229,7 +229,6 @@ const defaultFunctionGeneratorConfig = {
   phase_deg: 0
 };
 type AppTab = "autotune" | "manual" | "selftest";
-type Language = "zh" | "en";
 type ThemeMode = "light" | "dark";
 type ManualWriteSelection = {
   vout: boolean;
@@ -271,7 +270,6 @@ type ScopeAxisSettings = {
   channelAxes: Record<string, ScopeAxisSide>;
 };
 const tabStorageKey = "tpu_a1_active_tab";
-const languageStorageKey = "tpu_a1_language";
 const themeStorageKey = "tpu_a1_theme";
 const appTabs: AppTab[] = ["autotune", "manual", "selftest"];
 const defaultTelemetryAxisSettings: TelemetryAxisSettings = {
@@ -330,76 +328,40 @@ function getInitialTab(): AppTab {
   return "autotune";
 }
 
-function getInitialLanguage(): Language {
-  const stored = window.localStorage.getItem(languageStorageKey);
-  return stored === "zh" || stored === "en" ? stored : "en";
-}
-
 function getInitialTheme(): ThemeMode {
   const stored = window.localStorage.getItem(themeStorageKey);
   return stored === "light" || stored === "dark" ? stored : "light";
 }
 
 const copy = {
-  en: {
-    platform: "AI Powered Hardware-in-the-loop Platform",
-    copyright: "Copyright © Google LLC",
-    author: "Author: Jackson (Mian) Liao",
-    backend: "Backend",
-    pidProgramming: "PID programming",
-    iterations: "Iterations",
-    autoTune: "PID Auto-Tune",
-    manualTuning: "Manual Tuning",
-    selfTesting: "Self Testing",
-    pidNotice: "No hardware PID writes are being sent. The current PID path is a stub until the XDP/I2C register map is verified.",
-    xdpConnection: "XDP Connection",
-    edit: "Edit",
-    hide: "Hide",
-    liveReadback: "Real Time Feedback",
-    readAll: "Read Outputs/Inductance/PID",
-    manualParameters: "Manual Parameters",
-    writeVout: "Write VOUT_COMMAND",
-    voutTarget: "Vout target (V)",
-    writeOutputInductance: "Write Output Inductance",
-    outputInductance: "Output Inductance (nH)",
-    writeEffectiveLc: "Write Effective Lc Inductance",
-    effectiveLc: "Effective Lc Inductance (nH)",
-    writePid: "Write mod0 PID register",
-    writing: "Writing...",
-    writeSelected: "Write Selected to XDP",
-    writeNote: "Only VOUT_COMMAND is selected by default. PID and inductance writes are raw register writes and remain opt-in.",
-    liveData: "Live Data"
-  },
-  zh: {
-    platform: "AI 驱动的硬件在环平台",
-    copyright: "版权 © Google LLC",
-    author: "Author: Jackson (Mian) Liao",
-    backend: "后端",
-    pidProgramming: "PID 写入",
-    iterations: "迭代次数",
-    autoTune: "PID 自动调参",
-    manualTuning: "手动调参",
-    selfTesting: "自检",
-    pidNotice: "当前不会写入真实硬件 PID。PID 通路会保持 stub，直到 XDP/I2C register map 完成验证。",
-    xdpConnection: "XDP 连接",
-    edit: "编辑",
-    hide: "收起",
-    liveReadback: "Real Time Feedback",
-    readAll: "读取 Outputs/Inductance/PID",
-    manualParameters: "手动参数",
-    writeVout: "写入 VOUT_COMMAND",
-    voutTarget: "Vout 目标值 (V)",
-    writeOutputInductance: "写入 Output Inductance",
-    outputInductance: "Output Inductance (nH)",
-    writeEffectiveLc: "写入 Effective Lc Inductance",
-    effectiveLc: "Effective Lc Inductance (nH)",
-    writePid: "写入 mod0 PID register",
-    writing: "写入中...",
-    writeSelected: "写入选中参数到 XDP",
-    writeNote: "默认只选中 VOUT_COMMAND。PID 和电感写入是 raw register 写入，需要手动勾选。",
-    liveData: "实时数据"
-  }
-} satisfies Record<Language, Record<string, string>>;
+  platform: "AI Powered Hardware-in-the-loop Platform",
+  copyright: "Copyright © Google LLC",
+  author: "Author: Jackson (Mian) Liao",
+  backend: "Backend",
+  pidProgramming: "PID programming",
+  iterations: "Iterations",
+  autoTune: "PID Auto-Tune",
+  manualTuning: "Manual Tuning",
+  selfTesting: "Self Testing",
+  pidNotice: "No hardware PID writes are being sent. The current PID path is a stub until the XDP/I2C register map is verified.",
+  xdpConnection: "XDP Connection",
+  edit: "Edit",
+  hide: "Hide",
+  liveReadback: "Real Time Feedback",
+  readAll: "Read Outputs/Inductance/PID",
+  manualParameters: "Manual Parameters",
+  writeVout: "Write VOUT_COMMAND",
+  voutTarget: "Vout target (V)",
+  writeOutputInductance: "Write Output Inductance",
+  outputInductance: "Output Inductance (nH)",
+  writeEffectiveLc: "Write Effective Lc Inductance",
+  effectiveLc: "Effective Lc Inductance (nH)",
+  writePid: "Write mod0 PID register",
+  writing: "Writing...",
+  writeSelected: "Write Selected to XDP",
+  writeNote: "Only VOUT_COMMAND is selected by default. PID and inductance writes are raw register writes and remain opt-in.",
+  liveData: "Live Data"
+};
 
 function appendTelemetrySample(current: VoutReadback[], next: VoutReadback) {
   const timestamp = next.timestamp ?? Date.now() / 1000;
@@ -559,9 +521,10 @@ function App() {
   const [config, setConfig] = useState<TuningConfig>(() => cloneDefaultConfig());
   const [status, setStatus] = useState<TuningStatus | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>(getInitialTab);
-  const [language, setLanguage] = useState<Language>(getInitialLanguage);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialTheme);
   const [error, setError] = useState("");
+  const [connectionError, setConnectionError] = useState("");
+  const statusRefreshFailures = useRef(0);
   const [vout, setVoutState] = useState<VoutReadback | null>(null);
   const [voutRequest, setVoutRequest] = useState({ ...defaultManualVoutRequest });
   const [inductance, setInductanceState] = useState<InductanceReadback | null>(null);
@@ -604,7 +567,7 @@ function App() {
   const [selfTest, setSelfTest] = useState<SelfTestResponse | null>(null);
   const [selfTestRunning, setSelfTestRunning] = useState(false);
   const [activeSelfTestKey, setActiveSelfTestKey] = useState<InstrumentKey | null>(null);
-  const t = copy[language];
+  const t = copy;
 
   const refresh = async () => {
     if (viewingLoadedRun.current) return;
@@ -615,9 +578,13 @@ function App() {
       if (["drl-collection", "deep-reinforcement", "safe-sac"].includes(next.experiment?.optimization_algorithm ?? "")) {
         setConfig(normalizeTuningConfig(next.config));
       }
-      setError("");
+      statusRefreshFailures.current = 0;
+      setConnectionError("");
     } catch (exc) {
-      setError(String(exc));
+      statusRefreshFailures.current += 1;
+      if (statusRefreshFailures.current >= 3) {
+        setConnectionError(String(exc));
+      }
     }
   };
 
@@ -632,7 +599,7 @@ function App() {
         if (first) setSelectedAutotuneRun(`${first.kind}:${first.run_id}`);
       }
     } catch (exc) {
-      setError(String(exc));
+      console.warn("Could not refresh the result library:", exc);
     }
   };
 
@@ -640,7 +607,7 @@ function App() {
     try {
       setDrlStatus(await getDrlWorkflowStatus());
     } catch (exc) {
-      setError(String(exc));
+      console.warn("Could not refresh the DRL workflow status:", exc);
     }
   };
 
@@ -668,10 +635,6 @@ function App() {
     url.searchParams.set("tab", activeTab);
     window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
   }, [activeTab]);
-
-  useEffect(() => {
-    window.localStorage.setItem(languageStorageKey, language);
-  }, [language]);
 
   useEffect(() => {
     window.localStorage.setItem(themeStorageKey, themeMode);
@@ -728,16 +691,16 @@ function App() {
     return { voutReadback: nextVout, pidRequest, inductanceValues };
   };
 
-  const runAction = async (action: "start" | "pause" | "resume" | "stop" | "step") => {
+  const runAction = async (action: "start" | "pause" | "resume" | "step") => {
+    setError("");
+    setConnectionError("");
     try {
-      if (action === "pause" || action === "resume" || action === "stop") {
+      if (action === "pause" || action === "resume") {
         const resumeRun = action === "resume" && viewingLoadedRun.current ? status?.run : undefined;
         viewingLoadedRun.current = false;
         const next = action === "pause"
           ? await pauseTuning()
-          : action === "resume"
-            ? await resumeTuning(resumeRun?.run_id, resumeRun?.kind)
-            : await stopTuning();
+          : await resumeTuning(resumeRun?.run_id, resumeRun?.kind);
         setStatus(next);
         setConfig(normalizeTuningConfig(next.config));
         refreshAutotuneRuns();
@@ -1339,8 +1302,6 @@ function App() {
         </div>
         <div className="topbar-actions">
           <HeaderToggles
-            language={language}
-            setLanguage={setLanguage}
             themeMode={themeMode}
             setThemeMode={setThemeMode}
           />
@@ -1359,10 +1320,10 @@ function App() {
         </button>
       </nav>
 
-      {error && (
+      {(error || connectionError) && (
         <div className="banner error">
           <AlertTriangle size={18} />
-          <span>{error}</span>
+          <span>{error || connectionError}</span>
         </div>
       )}
 
@@ -1467,7 +1428,6 @@ function App() {
         activeTab={activeTab}
         status={status}
         config={config}
-        language={language}
         optimizationAlgorithm={optimizationAlgorithm}
       />
     </main>
@@ -1478,18 +1438,14 @@ function LlmAssistantWidget({
   activeTab,
   status,
   config,
-  language,
   optimizationAlgorithm
 }: {
   activeTab: AppTab;
   status: TuningStatus | null;
   config: TuningConfig;
-  language: Language;
   optimizationAlgorithm: string;
 }) {
-  const greeting = language === "zh"
-    ? "你好，我可以帮你理解这个 GUI、Auto-Tune 流程、Manual Tuning、Self Testing，以及 Bode 100 / Scope / Function Generator / PMBus 这些模块。"
-    : "Hi, I can help explain this GUI, the Auto-Tune flow, Manual Tuning, Self Testing, and the Bode 100 / Scope / Function Generator / PMBus panels.";
+  const greeting = "Hi, I can help explain this GUI, the Auto-Tune flow, Manual Tuning, Self Testing, and the Bode 100 / Scope / Function Generator / PMBus panels.";
   const initialMessages = () => {
     try {
       const stored = localStorage.getItem(AI_COPILOT_HISTORY_KEY);
@@ -1778,13 +1734,9 @@ function MarkdownMessage({ content }: { content: string }) {
 }
 
 function HeaderToggles({
-  language,
-  setLanguage,
   themeMode,
   setThemeMode
 }: {
-  language: Language;
-  setLanguage: (language: Language) => void;
   themeMode: ThemeMode;
   setThemeMode: (themeMode: ThemeMode) => void;
 }) {
@@ -1800,24 +1752,6 @@ function HeaderToggles({
         <HelpCircle size={16} />
         Penalty Explanation
       </button>
-      <div className="pill-toggle language-toggle" role="group" aria-label="Language">
-        <button
-          type="button"
-          className={language === "zh" ? "active" : ""}
-          aria-pressed={language === "zh"}
-          onClick={() => setLanguage("zh")}
-        >
-          中
-        </button>
-        <button
-          type="button"
-          className={language === "en" ? "active" : ""}
-          aria-pressed={language === "en"}
-          onClick={() => setLanguage("en")}
-        >
-          EN
-        </button>
-      </div>
       <div className="pill-toggle icon-toggle" role="group" aria-label="Theme">
         <button
           type="button"
@@ -1865,7 +1799,10 @@ function PenaltyExplanationDialog({ onClose }: { onClose: () => void }) {
             important than over-optimizing one metric.
           </p>
           <div className="formula-box">
-            transient penalty = excess OS [%] + excess US [%] + 3 x excess OS settling [us] + 3 x excess US settling [us]
+            transient penalty = excess OS [%] + excess US [%] + 10 x excess OS settling [us] + 10 x excess US settling [us]
+          </div>
+          <div className="formula-box">
+            passing settling reward = 10 x OS settling headroom [us] + 10 x US settling headroom [us]
           </div>
           <div className="formula-box">
             Bode penalty = 1.5 x phase-margin shortage [deg] + 0.5 x crossover upper-limit excess [%]
@@ -2109,12 +2046,16 @@ function AutotuneWorkbench({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [history, selectedIteration]);
   useEffect(() => {
-    if (status?.state === "running" || history.length < 2) {
+    if (status?.state === "running" || history.length < 1) {
       setLivePlayback(false);
     }
   }, [history.length, status?.state]);
   useEffect(() => {
-    if (!livePlayback || history.length < 2) return;
+    if (!livePlayback || history.length < 1) return;
+    if (history.length === 1) {
+      setSelectedIteration(history[0].iteration);
+      return;
+    }
     const parsedDurationS = Number.parseFloat(gifFrameDurationS);
     const safeDurationS = Number.isFinite(parsedDurationS) ? parsedDurationS : 0.1;
     const frameMs = Math.round(Math.max(0.05, Math.min(5, safeDurationS)) * 1000);
@@ -2174,7 +2115,7 @@ function AutotuneWorkbench({
                   title="Optimization algorithm"
                   value={optimizationAlgorithm}
                   onChange={(event) => setOptimizationAlgorithm(event.target.value)}
-                  disabled={status?.state === "running" || status?.state === "paused"}
+                  disabled={status?.state === "running"}
                 >
                   {OPTIMIZATION_ALGORITHM_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -2186,31 +2127,28 @@ function AutotuneWorkbench({
               {optimizationAlgorithm === "deep-reinforcement" && (
                 <DrlControl status={drlStatus} tuningState={status?.state} onAction={runDrlAction} />
               )}
-              <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || status?.state === "paused" || !canRunAnalysis || drlStartBlocked}>
+              <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || !canRunAnalysis || drlStartBlocked}>
                 Start Auto-Tune
               </button>
               <button className="autotune-control-button iterate" onClick={() => runAction("step")} disabled={status?.state === "running" || !canRunAnalysis || drlStartBlocked}>
                 Run Single Iteration
               </button>
               <div className="autotune-control-grid">
-                <button className="autotune-control-button" onClick={() => runAction("pause")} disabled={status?.state !== "running"}>
-                  Pause
-                </button>
                 <button className="autotune-control-button" onClick={() => runAction("resume")} disabled={status?.state !== "paused" && status?.state !== "stopped"}>
                   Resume
                 </button>
-                <button className="autotune-control-button" onClick={() => runAction("stop")} disabled={status?.state !== "running" && status?.state !== "paused"}>
+                <button className="autotune-control-button" onClick={() => runAction("pause")} disabled={status?.state !== "running"}>
                   Stop
                 </button>
               </div>
               <div className="gif-save-row">
-                <button className="autotune-control-button gif-save-button" onClick={saveGif} disabled={status?.state === "running" || history.length < 2}>
+                <button className="autotune-control-button gif-save-button" onClick={saveGif} disabled={status?.state === "running" || history.length < 1}>
                   Save GIF
                 </button>
                 <button
                   className={`autotune-control-button gif-save-button live-playback-button${livePlayback ? " active" : ""}`}
                   onClick={toggleLivePlayback}
-                  disabled={status?.state === "running" || history.length < 2}
+                  disabled={status?.state === "running" || history.length < 1}
                   aria-pressed={livePlayback}
                   title={livePlayback ? "Stop live iteration playback" : "Start live iteration playback"}
                 >
@@ -2496,7 +2434,7 @@ function ManualTuningView({
   resetManualDefaults: () => void;
   experimentSettings: ManualExperimentSettings;
   setExperimentSettings: React.Dispatch<React.SetStateAction<ManualExperimentSettings>>;
-  labels: (typeof copy)[Language];
+  labels: typeof copy;
 }) {
   const voutExponent = voutExponentFromReadback(vout);
   const voutRegisterStep = voutRegisterStepFromExponent(voutExponent);
@@ -4193,7 +4131,7 @@ function AutotuneResultImage({
     setLoadFailed(false);
   }, [imagePath, String(version), pending]);
 
-  if (pending) {
+  if (pending && !imagePath) {
     return (
       <div className="autotune-image-empty">
         <p>Generating image...</p>
@@ -4223,6 +4161,7 @@ function AutotuneResultImage({
           }
         }}
       />
+      {pending && loadFailed ? <p className="message-line">Generating image...</p> : null}
       {loadFailed ? <p className="message-line bad-text">Image file is not ready yet. Retrying on the next status update.</p> : null}
       {error ? <p className="message-line bad-text">{error}</p> : null}
     </div>

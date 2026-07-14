@@ -140,6 +140,20 @@ class DrlCoreTest(unittest.TestCase):
         failing = dict(passing, undershoot_settling_time_s=2.1e-6)
         self.assertFalse(relabeled_score({"metrics": failing}, config.targets)[1])
 
+    def test_relabelled_settling_penalty_uses_ten_per_microsecond(self) -> None:
+        metrics = {
+            "overshoot_pct": 3.0,
+            "undershoot_pct": 3.0,
+            "overshoot_settling_time_s": 3e-6,
+            "undershoot_settling_time_s": 4e-6,
+            "phase_margin_deg": 45.0,
+            "crossover_frequency_hz": 200_000.0,
+            "gain_margin_db": 6.0,
+        }
+        score, passed = relabeled_score({"metrics": metrics}, TuningConfig().targets)
+        self.assertFalse(passed)
+        self.assertAlmostEqual(score, 30.0)
+
     def test_action_quantization_and_trust_region(self) -> None:
         search = TuningConfig().search
         candidate = candidate_from_normalized([1, -1, 0, 0.9, 0, 0], search, "test")

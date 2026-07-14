@@ -86,7 +86,11 @@ from hardware.tuning.drl import DrlWorkflowManager
 
 
 DEVICE_LOCK = threading.Lock()
-ARTIFACT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="autotune-artifact")
+# Matplotlib is not reliably thread-safe. A single bounded worker keeps file
+# saving/rendering off the hardware path without letting work accumulate over a
+# long auto-tune run.
+ARTIFACT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autotune-artifact")
+ARTIFACT_QUEUE_SLOTS = threading.BoundedSemaphore(8)
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 SCOPE_CONNECTIONS: dict[str, TektronixOscilloscope] = {}
 BODE_CONNECTIONS: dict[str, dict[str, object]] = {}
@@ -100,9 +104,10 @@ AUTOTUNE_RUN_DIR = RESULTS_DIR / "autotune_runs"
 AUTOTUNE_RECENT_DIR = AUTOTUNE_RUN_DIR / "recent"
 AUTOTUNE_SAVED_DIR = AUTOTUNE_RUN_DIR / "saved"
 AUTOTUNE_RECENT_LIMIT = 5
+AUTOTUNE_RECENT_MIN_ITERATIONS = 10
 SCOPE_CAPTURE_CACHE: dict[str, dict] = {}
 SCOPE_CAPTURE_CACHE_LIMIT = 1
-SCOPE_DISPLAY_MAX_POINTS = 200_000
+SCOPE_DISPLAY_MAX_POINTS = 140_000
 SCOPE_TRIGGER_OFFSET_FROM_LEFT_S = 2e-6
 DEFAULT_SCOPE_AXIS_SETTINGS = {
     "leftMin": -0.5,
@@ -122,10 +127,34 @@ DEFAULT_SCOPE_AXIS_SETTINGS = {
 }
 
 
+def _submit_artifact(function, *args) -> None:
+    ARTIFACT_QUEUE_SLOTS.acquire()
+
+    def run_artifact() -> None:
+        try:
+            function(*args)
+        except Exception as exc:
+            print(f"Artifact task failed: {exc}", file=sys.stderr)
+        finally:
+            ARTIFACT_QUEUE_SLOTS.release()
+
+    try:
+        ARTIFACT_EXECUTOR.submit(run_artifact)
+    except Exception:
+        ARTIFACT_QUEUE_SLOTS.release()
+        raise
+
+
 class ServerHardwareExperimentRunner:
     """Run one real hardware tuning candidate through the existing bench APIs."""
 
     supports_split_analysis = True
+
+    def __init__(self) -> None:
+        self._iteration_context: int | None = None
+
+    def set_iteration_context(self, iteration: int) -> None:
+        self._iteration_context = max(1, int(iteration))
 
     def recover_after_transient_protection(
         self,
@@ -255,6 +284,7 @@ class ServerHardwareExperimentRunner:
         experiment: AutotuneExperimentConfig,
     ) -> ExperimentResult:
         started = time.perf_counter()
+        iteration_number = self._iteration_context
         stage_started = started
         stage_durations: dict[str, float] = {}
 
@@ -273,9 +303,10 @@ class ServerHardwareExperimentRunner:
         bode_result: dict[str, object] = {}
         scope_result: dict[str, object] = {}
         waveform: Waveform | None = None
-        # Keep hardware auto-tune strictly serial: data saving, PNG rendering,
-        # metrics, and persistence all finish before the next candidate starts.
-        async_artifacts = False
+        # Metrics remain synchronous because adaptive search needs them before
+        # selecting the next candidate. Only independent NPZ/PNG artifacts may
+        # use the bounded background pipeline during continuous auto-tune.
+        async_artifacts = bool(experiment.async_artifacts)
         afg_enabled = False
         fg_config = dict(experiment.function_generator_config)
         fg_resource = str(fg_config.get("resource", DEFAULT_AFG_RESOURCE))
@@ -342,6 +373,7 @@ class ServerHardwareExperimentRunner:
                     timeout_ms=int(bode_cfg.get("timeout_ms", 60000)),
                     async_artifacts=async_artifacts,
                     reuse_session=True,
+                    iteration_number=iteration_number,
                 )
                 mark_stage("bode_sweep")
                 if not bode_result.get("ok"):
@@ -376,6 +408,7 @@ class ServerHardwareExperimentRunner:
                     function_generator_frequency_hz=_optional_float_value(fg_config.get("frequency_hz")),
                     scope_axis_settings=_normalize_scope_axis_settings(scope_cfg.get("scope_axis_settings")),
                     async_artifacts=async_artifacts,
+                    iteration_number=iteration_number,
                 )
                 mark_stage("scope_capture")
                 if not scope_result.get("ok"):
@@ -411,24 +444,40 @@ class ServerHardwareExperimentRunner:
 class AutotuneRunStore:
     """Keep a rolling local history of hardware auto-tune runs."""
 
-    def __init__(self, recent_dir: Path, saved_dir: Path, recent_limit: int):
+    def __init__(self, recent_dir: Path, saved_dir: Path, recent_limit: int, recent_min_iterations: int = 10):
         self.recent_dir = recent_dir
         self.saved_dir = saved_dir
         self.recent_limit = recent_limit
+        self.recent_min_iterations = recent_min_iterations
         self._lock = threading.RLock()
         self._current_run_id: str | None = None
         self._current_run_kind: str | None = None
         self._persisted_iterations = 0
+        # Status polling continues after a run reaches a terminal state. Keep
+        # the final write idempotent so each poll does not rewrite the full run.
+        self._last_persisted_signature: tuple[object, ...] | None = None
 
     def start_new(self, status: dict | None = None) -> dict:
         with self._lock:
             self.recent_dir.mkdir(parents=True, exist_ok=True)
+            previous_run_id = self._current_run_id
+            previous_kind = self._current_run_kind
+            if previous_run_id and previous_kind == "recent":
+                previous_dir = self.recent_dir / previous_run_id
+                previous_status = self._read_json(previous_dir / "run_status.json") or {}
+                previous_history = previous_status.get("history")
+                previous_iterations = len(previous_history) if isinstance(previous_history, list) else 0
+                # Starting a new search supersedes a paused short trial, so it
+                # should not remain in Recent as an unusable partial result.
+                if previous_iterations < self.recent_min_iterations:
+                    shutil.rmtree(previous_dir, ignore_errors=True)
             run_dir = self._next_friendly_run_dir("recent")
             run_id = run_dir.name
             (run_dir / "files").mkdir(parents=True, exist_ok=True)
             self._current_run_id = run_id
             self._current_run_kind = "recent"
             self._persisted_iterations = 0
+            self._last_persisted_signature = None
             initial_status = copy.deepcopy(status) if isinstance(status, dict) else {}
             initial_status["run"] = self._run_payload(run_id, "recent", run_dir)
             self._write_json(run_dir / "run_status.json", initial_status)
@@ -481,7 +530,11 @@ class AutotuneRunStore:
                 if index < persisted_cutoff and iteration in previous_by_iteration:
                     merged_history.append(copy.deepcopy(previous_by_iteration[iteration]))
                     continue
-                self._copy_record_assets(record, run_dir, scope_axis_settings=axis_settings)
+                # Scope/Bode capture already creates its raw data and PNG
+                # artifacts during the iteration. Rebuilding every plot here
+                # made the last status update replay an entire 100+ point run.
+                # Artifact materialization is reserved for explicit rebuilds
+                # and archive operations, where the user expects that work.
                 merged_history.append(record)
                 if index >= self._persisted_iterations:
                     new_records_for_log.append(record)
@@ -505,8 +558,9 @@ class AutotuneRunStore:
                     iteration = 0
                 if iteration in history_by_iteration:
                     next_status[key] = history_by_iteration[iteration]
-                else:
-                    self._copy_record_assets(record, run_dir, scope_axis_settings=axis_settings)
+
+            if next_status.get("state") != "running":
+                _refresh_status_artifact_readiness(next_status)
 
             if new_records_for_log:
                 with (run_dir / "iterations.jsonl").open("a", encoding="utf-8") as handle:
@@ -515,16 +569,40 @@ class AutotuneRunStore:
                 self._persisted_iterations = len(history)
             self._write_json(run_dir / "run_status.json", next_status)
             self._write_summary(run_dir, next_status)
-            self._auto_save_completion_gif(run_dir, next_status)
+            self._last_persisted_signature = self._status_persistence_signature(next_status)
+            if self._discard_terminal_short_recent_run(run_dir, run_kind, next_status):
+                return next_status
             if run_kind == "recent":
                 self._enforce_recent_limit()
             return next_status
+
+    def needs_persist(self, status: dict) -> bool:
+        """Return whether a status poll contains unsaved run state."""
+
+        with self._lock:
+            if self._current_run_id is None:
+                return False
+            return self._last_persisted_signature != self._status_persistence_signature(status)
+
+    @staticmethod
+    def _status_persistence_signature(status: dict) -> tuple[object, ...]:
+        history = status.get("history") if isinstance(status.get("history"), list) else []
+        current = status.get("current") if isinstance(status.get("current"), dict) else {}
+        best = status.get("best") if isinstance(status.get("best"), dict) else {}
+        return (
+            status.get("state"),
+            status.get("message"),
+            len(history),
+            current.get("iteration"),
+            best.get("iteration"),
+        )
 
     def stop_current(self) -> None:
         with self._lock:
             self._current_run_id = None
             self._current_run_kind = None
             self._persisted_iterations = 0
+            self._last_persisted_signature = None
 
     def archive_current(self, name: str | None = None) -> dict:
         with self._lock:
@@ -555,6 +633,9 @@ class AutotuneRunStore:
                 self._write_json(source / "summary.json", summary)
                 return {"ok": True, "saved_run": summary}
             self.saved_dir.mkdir(parents=True, exist_ok=True)
+            # Recent runs retain references to the fast live artifacts. Make
+            # a self-contained copy only when the user explicitly archives it.
+            self._materialize_run_assets(source)
             target = self._next_friendly_run_dir("saved", name)
             shutil.copytree(source, target)
             status = self._read_json(target / "run_status.json")
@@ -580,6 +661,32 @@ class AutotuneRunStore:
                 self._persisted_iterations = len(status["history"])
             return {"ok": True, "saved_run": summary}
 
+    def _materialize_run_assets(self, run_dir: Path) -> None:
+        status = self._read_json(run_dir / "run_status.json")
+        if not isinstance(status, dict):
+            return
+        axis_settings = _scope_axis_settings_from_status(status)
+        history = status.get("history") if isinstance(status.get("history"), list) else []
+        for record in history:
+            if isinstance(record, dict):
+                self._copy_record_assets(record, run_dir, scope_axis_settings=axis_settings)
+        by_iteration = {
+            int(record.get("iteration") or 0): record
+            for record in history
+            if isinstance(record, dict)
+        }
+        for key in ("current", "best"):
+            record = status.get(key)
+            if not isinstance(record, dict):
+                continue
+            iteration = int(record.get("iteration") or 0)
+            if iteration in by_iteration:
+                status[key] = by_iteration[iteration]
+            else:
+                self._copy_record_assets(record, run_dir, scope_axis_settings=axis_settings)
+        self._write_json(run_dir / "run_status.json", status)
+        self._write_summary(run_dir, status)
+
     def archive_run(self, run_id: str, kind: str = "recent", name: str | None = None) -> dict:
         with self._lock:
             source = self._run_dir(kind, run_id)
@@ -600,6 +707,8 @@ class AutotuneRunStore:
                 self._write_json(source / "summary.json", summary)
                 return {"ok": True, "saved_run": summary}
             self.saved_dir.mkdir(parents=True, exist_ok=True)
+            self._materialize_run_assets(source)
+            status = self._read_json(source / "run_status.json") or status
             target = self._next_friendly_run_dir("saved", name)
             shutil.copytree(source, target)
             self._repair_run_status_artifact_paths(target, status)
@@ -650,6 +759,7 @@ class AutotuneRunStore:
                 raise RuntimeError(f"No saved status was found for run '{run_id}'.")
             status = copy.deepcopy(status)
             repaired = self._repair_run_status_artifact_paths(run_dir, status)
+            repaired = _refresh_status_artifact_readiness(status) or repaired
             saved_state = str(status.get("state") or "")
             if saved_state in {"running", "paused"}:
                 status["loaded_state"] = saved_state
@@ -765,19 +875,6 @@ class AutotuneRunStore:
         result["opened"] = True
         result["opened_path"] = str(gif_path.relative_to(ROOT)).replace("\\", "/")
         return result
-
-    def _auto_save_completion_gif(self, run_dir: Path, status: dict) -> None:
-        if status.get("state") != "complete":
-            return
-        history = status.get("history") if isinstance(status.get("history"), list) else []
-        if len(history) < 2:
-            return
-        output_dir = run_dir / "animations"
-        target = output_dir / "combined_response_bode.gif"
-        if target.exists():
-            return
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self._make_combined_gif(history, target=target, scope_axis_settings=_scope_axis_settings_from_status(status))
 
     def rebuild_all_run_images(self) -> dict:
         """Rebuild stored run PNG/GIF artifacts from saved numeric data."""
@@ -1542,10 +1639,36 @@ class AutotuneRunStore:
 
     def _enforce_recent_limit(self) -> None:
         runs = self._list_kind(self.recent_dir, "recent")
+        for item in runs:
+            run_id = str(item.get("run_id", ""))
+            if not run_id or run_id == self._current_run_id:
+                continue
+            if self._is_terminal_short_run(item):
+                shutil.rmtree(self.recent_dir / run_id, ignore_errors=True)
+        runs = self._list_kind(self.recent_dir, "recent")
         for item in runs[self.recent_limit :]:
             run_id = str(item.get("run_id", ""))
             if run_id and run_id != self._current_run_id:
                 shutil.rmtree(self.recent_dir / run_id, ignore_errors=True)
+
+    def _discard_terminal_short_recent_run(self, run_dir: Path, run_kind: str, status: dict) -> bool:
+        """Discard completed/error short trial runs instead of filling Recent."""
+
+        if run_kind != "recent" or run_dir.name != self._current_run_id:
+            return False
+        if not self._is_terminal_short_run(status):
+            return False
+        shutil.rmtree(run_dir, ignore_errors=True)
+        self.stop_current()
+        return True
+
+    def _is_terminal_short_run(self, payload: dict) -> bool:
+        state = str(payload.get("state") or "").lower()
+        if state not in {"complete", "error", "stopped"}:
+            return False
+        history = payload.get("history")
+        iteration_count = len(history) if isinstance(history, list) else int(payload.get("iteration_count") or 0)
+        return iteration_count < self.recent_min_iterations
 
     def _run_dir(self, kind: str, run_id: str) -> Path:
         folder = self.saved_dir if kind == "saved" else self.recent_dir
@@ -1562,6 +1685,7 @@ class AutotuneRunStore:
             "kind": kind,
             "path": _path_label(run_dir),
             "recent_limit": self.recent_limit,
+            "recent_min_iterations": self.recent_min_iterations,
         }
 
     def _next_friendly_run_dir(self, kind: str, requested_name: str | None = None) -> Path:
@@ -1635,7 +1759,12 @@ TUNING_SESSION = PidAutotuneSession(
     experiment_runner=ServerHardwareExperimentRunner(),
     tuner_factory=DRL_WORKFLOW.candidate_tuner_factory,
 )
-AUTOTUNE_RUN_STORE = AutotuneRunStore(AUTOTUNE_RECENT_DIR, AUTOTUNE_SAVED_DIR, AUTOTUNE_RECENT_LIMIT)
+AUTOTUNE_RUN_STORE = AutotuneRunStore(
+    AUTOTUNE_RECENT_DIR,
+    AUTOTUNE_SAVED_DIR,
+    AUTOTUNE_RECENT_LIMIT,
+    AUTOTUNE_RECENT_MIN_ITERATIONS,
+)
 
 
 def _start_drl_hardware(config: TuningConfig, experiment: AutotuneExperimentConfig) -> dict:
@@ -1767,15 +1896,6 @@ def _should_web_search(query: str) -> bool:
         "search",
         "lookup",
         "google",
-        "查一下",
-        "搜索",
-        "联网",
-        "最新",
-        "最近",
-        "今天",
-        "现在",
-        "资料",
-        "官网",
     ]
     return any(trigger in lowered for trigger in triggers)
 
@@ -1913,7 +2033,7 @@ def _call_llm_chat(messages: object, context: object, model_choice: object = Non
         "You are a concise assistant embedded inside the Google Power Auto-Tuner GUI. "
         "Help users understand this hardware-in-the-loop PID tuning interface: PID Auto-Tune, "
         "Manual Tuning, Self Testing, XDP/PMBus board control, Bode 100, oscilloscope, "
-        "function generator, and power supply panels. Use the user's language. "
+        "function generator, and power supply panels. Respond in English. "
         "Do not claim that you can directly control hardware; tell the user which GUI control "
         "or workflow to use. Be safety-aware and practical.\n\n"
         f"Current GUI context JSON:\n{gui_context}"
@@ -2007,7 +2127,9 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tuning/status":
             status = TUNING_SESSION.status()
-            if AUTOTUNE_RUN_STORE._current_run_id is not None and status.get("state") != "running":
+            is_running = status.get("state") == "running"
+            artifacts_changed = _refresh_status_artifact_readiness(status, include_history=not is_running)
+            if not is_running and (artifacts_changed or AUTOTUNE_RUN_STORE.needs_persist(status)):
                 status = AUTOTUNE_RUN_STORE.persist_status(status)
             self._send_json({"ok": True, **status})
             return
@@ -2107,7 +2229,7 @@ class GuiHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
             return
         if parsed.path == "/api/tuning/stop":
-            status = TUNING_SESSION.stop()
+            status = TUNING_SESSION.pause()
             if status.get("history") or AUTOTUNE_RUN_STORE._current_run_id:
                 status = AUTOTUNE_RUN_STORE.persist_status(status)
             self._send_json({"ok": True, **status})
@@ -3134,9 +3256,18 @@ def _run_bode_sweep(
     timeout_ms: int,
     async_artifacts: bool = False,
     reuse_session: bool = False,
+    iteration_number: int | None = None,
     _retry_stale_session: bool = True,
 ) -> dict:
     started = time.perf_counter()
+    stage_started = started
+    stage_durations: dict[str, float] = {}
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        now = time.perf_counter()
+        stage_durations[name] = round(now - stage_started, 3)
+        stage_started = now
     if start_hz <= 0 or stop_hz <= start_hz:
         return {"ok": False, "error": "Bode sweep requires 0 < start_hz < stop_hz."}
     if not 2 <= points <= 2001:
@@ -3146,28 +3277,33 @@ def _run_bode_sweep(
     effective_source_dbm = _vpp_to_dbm(source_vpp) if source_vpp is not None else source_dbm
 
     bode_driver = Bode100Driver(host=host, port=port, startup_timeout_s=max(timeout_ms / 1000.0, 5.0))
-    try:
-        bode_driver.ensure_scpi_server()
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": (
-                f"No Bode SCPI TCP listener is reachable at {host}:{port}: {exc}"
-            ),
-            "host": host,
-            "port": port,
-            "resource": bode_driver.resource_name,
-            "config": {
-                "start_hz": start_hz,
-                "stop_hz": stop_hz,
-                "points": points,
-                "bandwidth_hz": bandwidth_hz,
-                "source_vpp": source_vpp,
-                "source_dbm": effective_source_dbm,
-            },
-            "duration_s": round(time.perf_counter() - started, 3),
-            "timestamp": time.time(),
-        }
+    cached_session_available = reuse_session and _has_bode_connection(host, port)
+    if not cached_session_available:
+        try:
+            bode_driver.ensure_scpi_server()
+            mark_stage("ensure_scpi_server")
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": (
+                    f"No Bode SCPI TCP listener is reachable at {host}:{port}: {exc}"
+                ),
+                "host": host,
+                "port": port,
+                "resource": bode_driver.resource_name,
+                "config": {
+                    "start_hz": start_hz,
+                    "stop_hz": stop_hz,
+                    "points": points,
+                    "bandwidth_hz": bandwidth_hz,
+                    "source_vpp": source_vpp,
+                    "source_dbm": effective_source_dbm,
+                },
+                "duration_s": round(time.perf_counter() - started, 3),
+                "timestamp": time.time(),
+            }
+    else:
+        mark_stage("ensure_scpi_server")
 
     bode = None
     close_when_done = not reuse_session
@@ -3189,14 +3325,29 @@ def _run_bode_sweep(
                 bode.lock()
             except Exception:
                 pass
-        bode.configure_gain_phase(
-            start_hz=start_hz,
-            stop_hz=stop_hz,
-            points=points,
-            bandwidth_hz=bandwidth_hz,
-            source_dbm=effective_source_dbm,
+        mark_stage("session")
+        config_signature = (
+            float(start_hz),
+            float(stop_hz),
+            int(points),
+            float(bandwidth_hz),
+            None if effective_source_dbm is None else float(effective_source_dbm),
         )
+        config_reused = bool(
+            reuse_session and getattr(bode, "_autotune_config_signature", None) == config_signature
+        )
+        if not config_reused:
+            bode.configure_gain_phase(
+                start_hz=start_hz,
+                stop_hz=stop_hz,
+                points=points,
+                bandwidth_hz=bandwidth_hz,
+                source_dbm=effective_source_dbm,
+            )
+            bode._autotune_config_signature = config_signature
+        mark_stage("configure")
         data = bode.run_sweep()
+        mark_stage("acquire_transfer")
         margins = data.stability_margins.as_dict()
         timestamp = time.time()
         sweep_id = uuid.uuid4().hex[:12]
@@ -3238,11 +3389,17 @@ def _run_bode_sweep(
                     "timestamp": float(timestamp),
                 },
             )
+        mark_stage("data_artifact")
         bode_png = None
         bode_png_error = None
         bode_png_pending = False
         try:
             bode_png_path = RESULTS_DIR / "bode_sweeps" / f"{time.strftime('%Y%m%d_%H%M%S')}_{sweep_id}.png"
+            bode_title = (
+                f"Iteration {iteration_number} - Bode 100 Sweep - Full Data"
+                if iteration_number is not None
+                else "Latest Bode 100 Sweep - Full Data"
+            )
             if async_artifacts:
                 bode_png = _scope_png_public_path(bode_png_path)
                 bode_png_pending = True
@@ -3252,6 +3409,7 @@ def _run_bode_sweep(
                     phase_deg=data.phase_deg,
                     margins=margins,
                     path=bode_png_path,
+                    title=bode_title,
                 )
             else:
                 bode_png = _plot_full_bode_sweep_png(
@@ -3260,17 +3418,20 @@ def _run_bode_sweep(
                     phase_deg=data.phase_deg,
                     margins=margins,
                     path=bode_png_path,
+                    title=bode_title,
                 )
                 LATEST_BODE_PNG.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(bode_png_path, LATEST_BODE_PNG)
         except Exception as exc:
             bode_png_error = str(exc)
             bode_png_pending = False
+        mark_stage("png_artifact")
         system_error = ""
         try:
             system_error = bode.get_error()
         except Exception:
             pass
+        mark_stage("error_query")
         return {
             "ok": True,
             "identity": identity,
@@ -3298,7 +3459,9 @@ def _run_bode_sweep(
             "bode_png_error": bode_png_error,
             "bode_png_pending": bode_png_pending,
             "session_reused": session_reused,
+            "config_reused": config_reused,
             "retried_stale_session": retried_stale_session,
+            "stage_durations_s": stage_durations,
             "system_error": system_error,
             "duration_s": round(time.perf_counter() - started, 3),
             "timestamp": timestamp,
@@ -3319,6 +3482,7 @@ def _run_bode_sweep(
                     timeout_ms=timeout_ms,
                     async_artifacts=async_artifacts,
                     reuse_session=reuse_session,
+                    iteration_number=iteration_number,
                     _retry_stale_session=False,
                 )
         return {
@@ -3352,6 +3516,14 @@ def _run_bode_sweep(
 
 def _bode_connection_key(host: str, port: int) -> str:
     return f"{host}:{int(port)}"
+
+
+def _has_bode_connection(host: str, port: int) -> bool:
+    key = _bode_connection_key(host, port)
+    with BODE_CONNECTION_LOCK:
+        cached = BODE_CONNECTIONS.get(key)
+        client = cached.get("client") if cached else None
+        return isinstance(client, BodeScpiClient) and getattr(client, "_inst", None) is not None
 
 
 def _get_bode_connection(
@@ -3770,7 +3942,7 @@ def _schedule_scope_capture_artifact(channels: dict[str, dict], path: Path, meta
             "original_points": int(record.get("original_points") or len(record["y"])),
             "transfer_encoding": record.get("transfer_encoding") or "",
         }
-    ARTIFACT_EXECUTOR.submit(_write_scope_capture_artifact, compact_channels, path, copy.deepcopy(metadata))
+    _submit_artifact(_write_scope_capture_artifact, compact_channels, path, copy.deepcopy(metadata))
 
 
 def _write_scope_capture_artifact(channels: dict[str, dict], path: Path, metadata: dict) -> None:
@@ -3798,7 +3970,7 @@ def _write_scope_capture_artifact(channels: dict[str, dict], path: Path, metadat
             dtype=np.int64,
         )
         payload[f"transfer_encoding_{safe_source}"] = np.asarray(record.get("transfer_encoding") or "")
-    np.savez(path, **payload)
+    np.savez_compressed(path, **payload)
 
 
 def _load_scope_waveform_npz(data_file: Path, source: str | None = None) -> dict | None:
@@ -3931,6 +4103,42 @@ def _path_from_result_reference(value: object) -> Path | None:
     except Exception:
         return None
     return path
+
+
+def _refresh_status_artifact_readiness(status: dict, *, include_history: bool = True) -> bool:
+    """Clear stale async-artifact flags once their files reach disk."""
+
+    changed = False
+    seen: set[int] = set()
+    records: list[dict] = []
+    if include_history:
+        history = status.get("history")
+        if isinstance(history, list):
+            records.extend(record for record in history if isinstance(record, dict))
+    for key in ("current", "best"):
+        record = status.get(key)
+        if isinstance(record, dict):
+            records.append(record)
+
+    for record in records:
+        identity = id(record)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        for result_key, file_key, pending_key, error_key in (
+            ("scope_result", "scope_png", "scope_png_pending", "scope_png_error"),
+            ("bode_result", "bode_png", "bode_png_pending", "bode_png_error"),
+        ):
+            result = record.get(result_key)
+            if not isinstance(result, dict) or result.get(pending_key) is not True:
+                continue
+            path = _path_from_result_reference(result.get(file_key))
+            if path is None or not path.is_file() or path.stat().st_size <= 0:
+                continue
+            result[pending_key] = False
+            result[error_key] = None
+            changed = True
+    return changed
 
 
 def _normalize_scope_axis_settings(raw: object) -> dict:
@@ -4204,7 +4412,7 @@ def _schedule_bode_data_artifact(
     path: Path,
     metadata: dict,
 ) -> None:
-    ARTIFACT_EXECUTOR.submit(
+    _submit_artifact(
         _write_bode_data_artifact,
         np.asarray(frequency_hz, dtype=np.float64).copy(),
         np.asarray(magnitude_db, dtype=np.float64).copy(),
@@ -4585,18 +4793,20 @@ def _schedule_bode_png_artifact(
     phase_deg: list[float],
     margins: dict | None,
     path: Path,
+    title: str,
 ) -> None:
     frequency_copy = np.asarray(frequency_hz, dtype=np.float64).copy()
     magnitude_copy = np.asarray(magnitude_db, dtype=np.float64).copy()
     phase_copy = np.asarray(phase_deg, dtype=np.float64).copy()
     margins_copy = copy.deepcopy(margins or {})
-    ARTIFACT_EXECUTOR.submit(
+    _submit_artifact(
         _write_bode_png_artifact,
         frequency_copy,
         magnitude_copy,
         phase_copy,
         margins_copy,
         path,
+        title,
     )
 
 
@@ -4606,6 +4816,7 @@ def _write_bode_png_artifact(
     phase_deg: np.ndarray,
     margins: dict,
     path: Path,
+    title: str,
 ) -> None:
     _plot_full_bode_sweep_png(
         frequency_hz=frequency_hz.tolist(),
@@ -4613,6 +4824,7 @@ def _write_bode_png_artifact(
         phase_deg=phase_deg.tolist(),
         margins=margins,
         path=path,
+        title=title,
     )
     LATEST_BODE_PNG.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, LATEST_BODE_PNG)
@@ -4623,14 +4835,20 @@ def _schedule_scope_png_artifact(
     capture_entry: dict,
     scope_axis_settings: dict | None,
     path: Path,
+    title: str,
 ) -> None:
     capture_copy = _copy_scope_capture_for_plot(capture_entry)
     axis_copy = copy.deepcopy(scope_axis_settings)
-    ARTIFACT_EXECUTOR.submit(_write_scope_png_artifact, capture_copy, axis_copy, path)
+    _submit_artifact(_write_scope_png_artifact, capture_copy, axis_copy, path, title)
 
 
-def _write_scope_png_artifact(capture_entry: dict, scope_axis_settings: dict | None, path: Path) -> None:
-    _plot_full_scope_capture_png(capture_entry, scope_axis_settings, path=path)
+def _write_scope_png_artifact(
+    capture_entry: dict,
+    scope_axis_settings: dict | None,
+    path: Path,
+    title: str,
+) -> None:
+    _plot_full_scope_capture_png(capture_entry, scope_axis_settings, path=path, title=title)
     LATEST_SCOPE_PNG.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, LATEST_SCOPE_PNG)
 
@@ -4715,8 +4933,17 @@ def _capture_scope(
     function_generator_frequency_hz: float | None = None,
     scope_axis_settings: dict | None = None,
     async_artifacts: bool = False,
+    iteration_number: int | None = None,
 ) -> dict:
     started = time.perf_counter()
+    stage_started = started
+    stage_durations: dict[str, float] = {}
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        now = time.perf_counter()
+        stage_durations[name] = round(now - stage_started, 3)
+        stage_started = now
     timestamp = time.time()
     capture_id = uuid.uuid4().hex[:12]
     safe_channels = [
@@ -4741,6 +4968,7 @@ def _capture_scope(
         for attempt in range(2):
             try:
                 scope, opened = _get_scope_connection(resource, timeout_ms=6000)
+                mark_stage("session")
                 waveforms = []
                 measurement_rows = []
                 capture_cache_entry = {
@@ -4748,29 +4976,46 @@ def _capture_scope(
                     "resource": resource,
                     "channels": {},
                 }
-                selected_channels = set(safe_channels)
-                for index in range(1, 9):
-                    channel = f"CH{index}"
-                    scope.set_channel_display(channel, channel in selected_channels)
-                scope.set_edge_trigger("CH1", "RISE")
-                if scope_window_s is not None:
-                    scope_scale_s_per_div = scope.set_horizontal_window(scope_window_s)
-                    scope_actual_window_s = 10.0 * scope_scale_s_per_div
-                    scope_trigger_position_percent = scope.set_trigger_position_from_left(
-                        SCOPE_TRIGGER_OFFSET_FROM_LEFT_S,
-                        scope_actual_window_s,
-                    )
+                config_signature = (tuple(safe_channels), scope_window_s)
+                config_reused = bool(
+                    not opened and getattr(scope, "_autotune_config_signature", None) == config_signature
+                )
+                if config_reused:
+                    scope_scale_s_per_div = getattr(scope, "_autotune_scale_s_per_div", None)
+                    scope_actual_window_s = getattr(scope, "_autotune_actual_window_s", None)
+                    scope_trigger_position_percent = getattr(scope, "_autotune_trigger_position_percent", None)
+                else:
+                    selected_channels = set(safe_channels)
+                    for index in range(1, 9):
+                        channel = f"CH{index}"
+                        scope.set_channel_display(channel, channel in selected_channels)
+                    scope.set_edge_trigger("CH1", "RISE")
+                    if scope_window_s is not None:
+                        scope_scale_s_per_div = scope.set_horizontal_window(scope_window_s)
+                        scope_actual_window_s = 10.0 * scope_scale_s_per_div
+                        scope_trigger_position_percent = scope.set_trigger_position_from_left(
+                            SCOPE_TRIGGER_OFFSET_FROM_LEFT_S,
+                            scope_actual_window_s,
+                        )
+                    scope._autotune_config_signature = config_signature
+                    scope._autotune_scale_s_per_div = scope_scale_s_per_div
+                    scope._autotune_actual_window_s = scope_actual_window_s
+                    scope._autotune_trigger_position_percent = scope_trigger_position_percent
+                mark_stage("configure")
                 force_after_s = 0.5 if scope_window_s is None else max(0.25, min(2.0, scope_window_s * 1.5))
                 scope.single_acquisition(timeout_s=8.0, force_after_s=force_after_s)
+                mark_stage("acquisition")
                 captures = []
                 for channel in safe_channels:
                     captures.append(scope.capture_waveform(channel, start=1, stop=stop, max_plot_points=None))
+                mark_stage("waveform_transfer")
                 data_file, full_records = _store_full_scope_capture(
                     capture_id,
                     captures,
                     timestamp,
                     async_save=async_artifacts,
                 )
+                mark_stage("data_artifact")
                 for channel, full_record in full_records.items():
                     capture_cache_entry["channels"][channel] = full_record
                 for capture in captures:
@@ -4807,12 +5052,18 @@ def _capture_scope(
                             measurement_rows.append(
                                 {"source": source_channel, "measurement": measurement, "value": None, "ok": False, "error": str(exc)}
                             )
+                mark_stage("display_data")
                 _remember_scope_capture(capture_id, capture_cache_entry)
                 scope_png = None
                 scope_png_error = None
                 scope_png_pending = False
                 try:
                     scope_png_path = RESULTS_DIR / "scope_captures" / f"{time.strftime('%Y%m%d_%H%M%S')}_{capture_id}.png"
+                    scope_title = (
+                        f"Iteration {iteration_number} - Scope Capture - Full Data"
+                        if iteration_number is not None
+                        else "Latest Scope Capture - Full Data"
+                    )
                     if async_artifacts:
                         scope_png = _scope_png_public_path(scope_png_path)
                         scope_png_pending = True
@@ -4820,14 +5071,21 @@ def _capture_scope(
                             capture_entry=capture_cache_entry,
                             scope_axis_settings=scope_axis_settings,
                             path=scope_png_path,
+                            title=scope_title,
                         )
                     else:
-                        scope_png = _plot_full_scope_capture_png(capture_cache_entry, scope_axis_settings, path=scope_png_path)
+                        scope_png = _plot_full_scope_capture_png(
+                            capture_cache_entry,
+                            scope_axis_settings,
+                            path=scope_png_path,
+                            title=scope_title,
+                        )
                         LATEST_SCOPE_PNG.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(scope_png_path, LATEST_SCOPE_PNG)
                 except Exception as exc:
                     scope_png_error = str(exc)
                     scope_png_pending = False
+                mark_stage("png_artifact")
                 return {
                     "ok": True,
                     "resource": resource,
@@ -4852,7 +5110,9 @@ def _capture_scope(
                     "acquisition_started": True,
                     "acquisition_stopped": True,
                     "session_reused": not opened,
+                    "config_reused": config_reused,
                     "session_retry": attempt,
+                    "stage_durations_s": stage_durations,
                     "duration_s": round(time.perf_counter() - started, 3),
                     "timestamp": time.time(),
                 }
@@ -5330,7 +5590,9 @@ def _compact_bode_result(result: dict) -> dict:
         "display_points": result.get("display_points"),
         "bode_png_pending": result.get("bode_png_pending"),
         "session_reused": result.get("session_reused"),
+        "config_reused": result.get("config_reused"),
         "retried_stale_session": result.get("retried_stale_session"),
+        "stage_durations_s": result.get("stage_durations_s"),
         "duration_s": result.get("duration_s"),
         "error": result.get("error"),
     }
@@ -5376,6 +5638,10 @@ def _compact_scope_result(result: dict) -> dict:
         "scope_trigger_source": result.get("scope_trigger_source"),
         "scope_trigger_slope": result.get("scope_trigger_slope"),
         "scope_trigger_offset_from_left_s": result.get("scope_trigger_offset_from_left_s"),
+        "session_reused": result.get("session_reused"),
+        "config_reused": result.get("config_reused"),
+        "session_retry": result.get("session_retry"),
+        "stage_durations_s": result.get("stage_durations_s"),
         "duration_s": result.get("duration_s"),
         "error": result.get("error"),
     }

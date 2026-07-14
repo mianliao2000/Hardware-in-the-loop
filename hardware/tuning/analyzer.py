@@ -8,6 +8,9 @@ import math
 from .models import ResponseMetrics, TuningTargets, Waveform
 
 
+SETTLING_WEIGHT_PER_US = 10.0
+
+
 @dataclass(frozen=True)
 class _StepEvent:
     index: int
@@ -902,7 +905,12 @@ def score_metrics(
     excess_us = max(0.0, undershoot_pct - targets.undershoot_pct)
     excess_os_settling_us = max(0.0, (overshoot_settling_time_s - targets.settling_time_s) * 1e6)
     excess_us_settling_us = max(0.0, (undershoot_settling_time_s - targets.settling_time_s) * 1e6)
-    return excess_os + excess_us + 3.0 * excess_os_settling_us + 3.0 * excess_us_settling_us
+    return (
+        excess_os
+        + excess_us
+        + SETTLING_WEIGHT_PER_US * excess_os_settling_us
+        + SETTLING_WEIGHT_PER_US * excess_us_settling_us
+    )
 
 
 def _passed_reward(
@@ -918,15 +926,21 @@ def _passed_reward(
 
     OS/US amplitude headroom stays a small tie-breaker. Settling-time
     headroom mirrors the transient penalty units and coefficients: microseconds
-    with the same 3x coefficient used for excess settling time.
+    with the same 10x coefficient used for excess settling time.
     """
 
     reward = 0.0
     if enable_transient and transient is not None:
         reward += 0.15 * _headroom(targets.overshoot_pct, transient.overshoot_pct)
         reward += 0.15 * _headroom(targets.undershoot_pct, transient.undershoot_pct)
-        reward += 3.0 * max(0.0, (targets.settling_time_s - transient.overshoot_settling_time_s) * 1e6)
-        reward += 3.0 * max(0.0, (targets.settling_time_s - transient.undershoot_settling_time_s) * 1e6)
+        reward += SETTLING_WEIGHT_PER_US * max(
+            0.0,
+            (targets.settling_time_s - transient.overshoot_settling_time_s) * 1e6,
+        )
+        reward += SETTLING_WEIGHT_PER_US * max(
+            0.0,
+            (targets.settling_time_s - transient.undershoot_settling_time_s) * 1e6,
+        )
 
     if enable_bode:
         if phase_error is not None:
