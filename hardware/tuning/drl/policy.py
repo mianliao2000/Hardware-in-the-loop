@@ -18,6 +18,7 @@ except ImportError:  # The heuristic server remains usable without ML extras.
 
 from ..models import HardwarePidCandidate, IterationRecord, TuningConfig
 from .common import (
+    ACTION_FIELDS,
     METRIC_FIELDS,
     atomic_write_json,
     candidate_from_normalized,
@@ -112,7 +113,7 @@ class SurrogateTuningEnv(gym.Env if gym is not None else object):  # type: ignor
         self._uncertainty = float(prediction["uncertainty"][0])
         if (
             safety_probability < 0.995
-            or validity_probability < 0.50
+            or float(np.max(invalid_probability)) >= self.ensemble.invalid_probability_threshold
             or self._uncertainty > self.ensemble.uncertainty_threshold
         ):
             return self._observation(), -5.0, True, False, {
@@ -202,12 +203,16 @@ def train_safe_sac_policy(
     max_episode_steps: int = 15,
     seed: int = 20260709,
     progress: Callable[[float, str], None] | None = None,
+    allow_unaccepted_surrogate: bool = False,
+    policy_net_arch: tuple[int, ...] = (256, 256),
+    batch_size: int = 256,
+    train_frequency: int = 1,
 ) -> dict[str, Any]:
     require_ml_dependencies()
     from stable_baselines3 import SAC
     from stable_baselines3.common.callbacks import BaseCallback
 
-    if not ensemble.accepted:
+    if not ensemble.accepted and not allow_unaccepted_surrogate:
         raise RuntimeError("The surrogate acceptance gates failed; Safe SAC training is blocked.")
     environment = SurrogateTuningEnv(ensemble, dataset, config, max_steps=max_episode_steps, seed=seed)
 
@@ -224,12 +229,12 @@ def train_safe_sac_policy(
         learning_rate=3e-4,
         buffer_size=min(max(100_000, total_steps), 1_000_000),
         learning_starts=min(10_000, max(100, total_steps // 20)),
-        batch_size=256,
+        batch_size=max(16, int(batch_size)),
         gamma=0.98,
         tau=0.005,
-        train_freq=1,
+        train_freq=max(1, int(train_frequency)),
         gradient_steps=1,
-        policy_kwargs={"net_arch": [256, 256]},
+        policy_kwargs={"net_arch": [max(16, int(width)) for width in policy_net_arch]},
         verbose=0,
         seed=seed,
         device=device,
@@ -253,9 +258,13 @@ def train_safe_sac_policy(
         {
             "policy_file": "safe_sac_policy.zip",
             "policy_training_steps": int(total_steps),
+            "policy_net_arch": [max(16, int(width)) for width in policy_net_arch],
+            "policy_batch_size": max(16, int(batch_size)),
+            "policy_train_frequency": max(1, int(train_frequency)),
             "policy_evaluation": evaluation,
             "policy_accepted": policy_accepted,
             "ready": bool(ensemble.accepted and policy_accepted),
+            "hardware_protection_policy": bool(allow_unaccepted_surrogate),
             "policy_created_at": time.time(),
         }
     )
@@ -335,12 +344,14 @@ class SafeSacTuner:
         episode_budget: int = 15,
         confirmation_count: int = 3,
         validation_episodes: int = 1,
+        hardware_protection_mode: bool = False,
+        run_full_budget: bool = False,
         seed: int = 20260709,
     ):
         require_ml_dependencies()
         from stable_baselines3 import SAC
 
-        if not bool(ensemble.manifest.get("ready", False)):
+        if not hardware_protection_mode and not bool(ensemble.manifest.get("ready", False)):
             raise RuntimeError(f"DRL model '{ensemble.model_id}' is not accepted and ready for hardware use.")
         if not policy_path.exists():
             raise RuntimeError(f"Safe SAC policy file is missing: {policy_path}")
@@ -352,6 +363,8 @@ class SafeSacTuner:
         self.confirmation_count = max(1, int(confirmation_count))
         self.validation_starts = validation_starts or [_center_candidate(config)]
         self.validation_episodes = max(1, int(validation_episodes))
+        self.hardware_protection_mode = bool(hardware_protection_mode)
+        self.run_full_budget = bool(run_full_budget)
         self.seed = seed
         self._rng = np.random.default_rng(seed)
         self._last_metadata: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -372,11 +385,17 @@ class SafeSacTuner:
 
         last = episode_records[-1]
         confirmation = _confirmation_streak(episode_records)
-        if last.metrics.passed and confirmation < self.confirmation_count and last.candidate is not None:
+        if (
+            not self.run_full_budget
+            and last.metrics.passed
+            and confirmation < self.confirmation_count
+            and last.candidate is not None
+        ):
             candidate = _with_phase(last.candidate, "drl_confirm")
             self._remember(candidate, episode, len(episode_records) + 1, "pass_confirmation", None)
             return candidate
-        if confirmation >= self.confirmation_count or len(episode_records) >= self.episode_budget:
+        confirmation_complete = not self.run_full_budget and confirmation >= self.confirmation_count
+        if confirmation_complete or len(episode_records) >= self.episode_budget:
             next_episode = episode + 1
             if next_episode >= self.validation_episodes:
                 return None
@@ -416,16 +435,21 @@ class SafeSacTuner:
             validity_probability = float(
                 prediction.get("validity_probability", prediction["safety_probability"])[0]
             )
+            invalid_probability = np.asarray(
+                prediction.get("invalid_probability", np.zeros((1, 3), dtype=np.float64))[0],
+                dtype=np.float64,
+            )
             uncertainty = float(prediction["uncertainty"][0])
-            if safety_probability < 0.995:
-                rejections["protection_probability"] += 1
-                continue
-            if validity_probability < 0.50:
-                rejections["invalid_probability"] += 1
-                continue
-            if uncertainty > self.ensemble.uncertainty_threshold:
-                rejections["uncertainty"] += 1
-                continue
+            if not self.hardware_protection_mode:
+                if safety_probability < 0.995:
+                    rejections["protection_probability"] += 1
+                    continue
+                if float(np.max(invalid_probability)) >= self.ensemble.invalid_probability_threshold:
+                    rejections["invalid_probability"] += 1
+                    continue
+                if uncertainty > self.ensemble.uncertainty_threshold:
+                    rejections["uncertainty"] += 1
+                    continue
             metrics = np.asarray(prediction["metric_mean"][0], dtype=np.float64)
             score, predicted_pass = relabeled_score(_metric_payload(metrics), self.config.targets)
             metadata = {
@@ -436,14 +460,60 @@ class SafeSacTuner:
                 "safety_probability": safety_probability,
                 "validity_probability": validity_probability,
                 "uncertainty": uncertainty,
+                "hardware_protection_mode": self.hardware_protection_mode,
                 "rejected_proposals": dict(rejections),
             }
             proposals.append((score, candidate, metadata))
+        if not proposals and self.hardware_protection_mode:
+            # A long hardware run can exhaust the policy's small local trust
+            # region even though the legal search space still contains many
+            # untested points. Hardware-protection mode is intentionally
+            # allowed to fall back to a fresh global candidate; the board's
+            # trip recovery remains the safety boundary for that experiment.
+            for _ in range(512):
+                candidate = candidate_from_normalized(
+                    self._rng.uniform(-1.0, 1.0, len(ACTION_FIELDS)),
+                    self.config.search,
+                    "drl_policy",
+                )
+                if candidate_key(candidate) in seen:
+                    rejections["duplicate"] += 1
+                    continue
+                feature = np.concatenate(
+                    [
+                        candidate_to_normalized(candidate, self.config.search),
+                        baseline,
+                        np.ones(len(METRIC_FIELDS), dtype=np.float64),
+                    ]
+                ).reshape(1, -1)
+                prediction = self.ensemble.predict_features(feature)
+                metrics = np.asarray(prediction["metric_mean"][0], dtype=np.float64)
+                score, predicted_pass = relabeled_score(_metric_payload(metrics), self.config.targets)
+                safety_probability = float(prediction["safety_probability"][0])
+                validity_probability = float(
+                    prediction.get("validity_probability", prediction["safety_probability"])[0]
+                )
+                metadata = {
+                    "predicted_metrics": vector_to_metric_mapping(metrics),
+                    "metric_std": vector_to_metric_mapping(np.asarray(prediction["metric_std"][0])),
+                    "predicted_score": score,
+                    "predicted_pass": predicted_pass,
+                    "safety_probability": safety_probability,
+                    "validity_probability": validity_probability,
+                    "uncertainty": float(prediction["uncertainty"][0]),
+                    "hardware_protection_mode": True,
+                    "proposal_fallback": "global_legal_search",
+                    "rejected_proposals": dict(rejections),
+                }
+                proposals.append((score, candidate, metadata))
+                break
         if not proposals:
-            raise RuntimeError(
-                "Safe SAC fail-closed: no fresh proposal passed the 0.995 protection, validity, and uncertainty "
-                f"gates (rejections={rejections})."
+            gate_description = (
+                "duplicate filtering"
+                if self.hardware_protection_mode
+                else "the 0.995 protection, validity, and uncertainty gates"
             )
+            raise RuntimeError(f"Safe SAC found no fresh proposal after {gate_description} (rejections={rejections}).")
         _, selected, metadata = min(proposals, key=lambda item: item[0])
         metadata["rejected_proposals"] = dict(rejections)
         self._remember(selected, episode, len(episode_records) + 1, "safe_sac", metadata)

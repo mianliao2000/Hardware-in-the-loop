@@ -118,7 +118,8 @@ class DrlWorkflowManager:
             raise RuntimeError("Safe SAC is fail-closed because no persisted model is available.")
         if not signatures_compatible(manifest.get("operating_signature") or {}, signature):
             raise RuntimeError(f"Safe SAC model '{model_id}' is incompatible with the current configuration.")
-        if not bool(manifest.get("ready")):
+        hardware_protection_mode = bool(experiment.drl_hardware_protection_mode)
+        if not hardware_protection_mode and not bool(manifest.get("ready")):
             raise RuntimeError(f"Safe SAC model '{model_id}' did not pass synthetic acceptance gates.")
         is_validation = str(experiment.drl_workflow_mode).strip().lower() == "validate"
         if is_validation:
@@ -130,7 +131,7 @@ class DrlWorkflowManager:
                 )
             if not authorized:
                 raise RuntimeError("Safe SAC validation is fail-closed because it is not the active workflow.")
-        if not is_validation and not bool(manifest.get("hardware_ready")):
+        if not hardware_protection_mode and not is_validation and not bool(manifest.get("hardware_ready")):
             raise RuntimeError(f"Safe SAC model '{model_id}' has not passed hardware validation.")
 
         ensemble = SurrogateEnsemble.load(model_dir)
@@ -154,6 +155,8 @@ class DrlWorkflowManager:
             episode_budget=experiment.drl_episode_budget,
             confirmation_count=experiment.drl_confirmation_count,
             validation_episodes=VALIDATION_EPISODES if is_validation else 1,
+            hardware_protection_mode=hardware_protection_mode,
+            run_full_budget=bool(experiment.ignore_pass_until_max_iterations),
         )
 
     def status(self) -> dict[str, Any]:
@@ -429,7 +432,8 @@ class DrlWorkflowManager:
                 progress=lambda value, message: self._progress(0.03 + value * 0.37, message),
             )
             self._raise_if_stopped()
-            if not ensemble.accepted:
+            hardware_protection_mode = bool(experiment.drl_hardware_protection_mode)
+            if not ensemble.accepted and not hardware_protection_mode:
                 with self._lock:
                     self._set_locked(
                         state="model_rejected",
@@ -458,26 +462,37 @@ class DrlWorkflowManager:
                 evaluation_episodes=_env_int("DRL_EVAL_EPISODES", 10_000),
                 max_episode_steps=VALIDATION_EPISODE_BUDGET,
                 progress=lambda value, message: self._progress(0.42 + value * 0.58, message),
+                allow_unaccepted_surrogate=hardware_protection_mode,
             )
             self._raise_if_stopped()
             manifest.update(_artifact_context(signature))
             manifest["dataset_id"] = dataset_id
             manifest["hardware_ready"] = False
+            manifest["hardware_protection_policy"] = hardware_protection_mode
             manifest["files_sha256"] = _directory_hashes(model_dir)
             atomic_write_json(model_dir / "manifest.json", manifest)
             ready = bool(manifest.get("ready"))
+            protection_policy_ready = hardware_protection_mode and bool(manifest.get("policy_file"))
             with self._lock:
                 self._set_locked(
-                    state="ready_for_validation" if ready else "model_rejected",
+                    state="ready_for_validation" if ready else ("hardware_protection_ready" if protection_policy_ready else "model_rejected"),
                     busy=False,
                     progress=1.0,
                     model_id=model_id,
-                    model_status="ready_for_validation" if ready else "synthetic_rejected",
+                    model_status=(
+                        "ready_for_validation"
+                        if ready
+                        else ("hardware_protection_ready" if protection_policy_ready else "synthetic_rejected")
+                    ),
                     model_compatible=True,
                     message=(
                         "Safe SAC passed synthetic gates and is ready for guarded hardware validation."
                         if ready
-                        else "Safe SAC failed synthetic acceptance gates; hardware validation remains disabled."
+                        else (
+                            "Safe SAC policy is available in hardware-protection mode; trip recovery remains authoritative."
+                            if protection_policy_ready
+                            else "Safe SAC failed synthetic acceptance gates; hardware validation remains disabled."
+                        )
                     ),
                     acceptance=manifest.get("acceptance"),
                     policy_evaluation=manifest.get("policy_evaluation"),

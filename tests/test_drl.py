@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -20,15 +21,18 @@ from hardware.tuning.drl.common import (
     relabeled_score,
     signatures_compatible,
 )
-from hardware.tuning.drl.dataset import DrlDataset, build_collection_plan
+from hardware.tuning.drl.dataset import DrlDataset, build_collection_plan, load_autotune_dataset
 from hardware.tuning.drl.model import SurrogateEnsemble, dependency_status
 from hardware.tuning.drl.tuner import PlannedCandidateTuner
 from hardware.tuning.drl.workflow import DrlWorkflowManager
 from hardware.tuning.models import (
     AutotuneExperimentConfig,
+    ExperimentResult,
     HardwarePidCandidate,
+    ResponseMetrics,
     SearchSpace,
     TuningConfig,
+    Waveform,
 )
 from hardware.tuning.runner import PidAutotuneSession, default_candidate_tuner_factory
 
@@ -106,6 +110,32 @@ class SafePredictor:
 
 
 class DrlCoreTest(unittest.TestCase):
+    def test_saved_dataset_excludes_actions_outside_current_search_space(self) -> None:
+        config = TuningConfig()
+        inside = HardwarePidCandidate(mod0_kp=int(config.search.mod0_kp.min))
+        outside = HardwarePidCandidate(mod0_kp=int(config.search.mod0_kp.min) - 1)
+        metrics = {
+            "overshoot_pct": 1.0,
+            "undershoot_pct": 1.0,
+            "overshoot_settling_time_s": 1e-6,
+            "undershoot_settling_time_s": 1e-6,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "saved" / "run-1"
+            run.mkdir(parents=True)
+            rows = [
+                {"candidate": inside.__dict__, "metrics": metrics},
+                {"candidate": outside.__dict__, "metrics": metrics},
+            ]
+            (run / "iterations.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            (run / "run_status.json").write_text(json.dumps({"history": rows}), encoding="utf-8")
+            dataset, manifest = load_autotune_dataset([run.parent], config)
+        self.assertEqual(dataset.size, 1)
+        self.assertEqual(manifest["excluded_out_of_search_space_count"], 1)
+
     def test_old_candidate_without_cm_gain_defaults_to_two(self) -> None:
         candidate = candidate_from_mapping({"mod0_kp": 151, "mod0_ki": 201, "mod0_kd": 111})
         self.assertEqual(candidate.mod0_cm_gain, 2)
@@ -242,7 +272,7 @@ class DrlCoreTest(unittest.TestCase):
         self.assertEqual(selected.mod0_kp, 151)
         self.assertEqual(tuner.metadata_for(selected)["plan_index"], 2)
 
-    def test_transient_protection_skips_bode_recovers_and_pauses(self) -> None:
+    def test_transient_protection_skips_bode_recovers_and_completes_candidate(self) -> None:
         candidate = HardwarePidCandidate(phase="drl_policy")
 
         class OneCandidateTuner:
@@ -286,11 +316,136 @@ class DrlCoreTest(unittest.TestCase):
             tuner_factory=lambda *_: OneCandidateTuner(),
         )
         status = session.step(config, experiment)
-        self.assertEqual(status["state"], "paused")
+        self.assertEqual(status["state"], "complete")
         self.assertEqual(runner.transient_calls, 1)
         self.assertEqual(runner.bode_calls, 0)
         self.assertEqual(runner.recoveries, 1)
         self.assertEqual(status["history"][0]["optimizer_metadata"]["model_id"], "test-model")
+
+    def test_background_drl_continues_with_next_candidate_after_recovered_trip(self) -> None:
+        candidates = [
+            HardwarePidCandidate(mod0_kp=150, phase="drl_policy"),
+            HardwarePidCandidate(mod0_kp=151, phase="drl_policy"),
+        ]
+
+        class TwoCandidateTuner:
+            def next_candidate(self, history, best):
+                return candidates[len(history)] if len(history) < len(candidates) else None
+
+            def metadata_for(self, value):
+                return {"algorithm": "deep-reinforcement", "model_id": "test-model"}
+
+        class RecoveringRunner:
+            supports_split_analysis = False
+
+            def __init__(self):
+                self.calls = 0
+                self.recoveries = 0
+
+            def evaluate(self, value, config, experiment):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("Scope safety check failed: protected waveform")
+                return ExperimentResult(
+                    waveform=Waveform(time_s=[0.0, 1e-6], vout_v=[0.9, 0.9], input_v=[0.0, 1.0]),
+                    metrics=ResponseMetrics(
+                        overshoot_pct=0.0,
+                        undershoot_pct=0.0,
+                        settling_time_s=0.0,
+                        oscillations=0,
+                        score=1.0,
+                        passed=False,
+                    ),
+                    write_results={"ok": True},
+                    bode_result={"ok": True},
+                    scope_result={"ok": True},
+                )
+
+            def recover_after_transient_protection(self, experiment, config):
+                self.recoveries += 1
+                return {"ok": True, "steps": [{"ok": True, "name": "power_cycle"}]}
+
+        runner = RecoveringRunner()
+        config = TuningConfig(
+            search=replace(
+                SearchSpace(),
+                max_iterations=2,
+                max_coarse_iterations=2,
+                max_refined_iterations=0,
+            )
+        )
+        experiment = replace(fixed_experiment(), optimization_algorithm="deep-reinforcement")
+        session = PidAutotuneSession(
+            config=config,
+            experiment_runner=runner,
+            tuner_factory=lambda *_: TwoCandidateTuner(),
+        )
+        session.start(config, experiment)
+        deadline = time.monotonic() + 2.0
+        status = session.status()
+        while status["state"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = session.status()
+
+        self.assertEqual(status["state"], "complete")
+        self.assertEqual(len(status["history"]), 2)
+        self.assertEqual(status["history"][0]["metrics"]["score"], 300.0)
+        self.assertEqual(status["history"][1]["candidate"]["mod0_kp"], 151)
+        self.assertEqual(runner.calls, 2)
+        self.assertEqual(runner.recoveries, 1)
+
+    def test_hardware_protection_mode_runs_full_episode_budget_after_pass(self) -> None:
+        if not dependency_status()["ok"]:
+            self.skipTest("Optional ML dependencies are not installed.")
+        ensemble = mock.Mock()
+        ensemble.manifest = {"ready": False}
+        ensemble.model_id = "test-model"
+        ensemble.device = "cpu"
+        with mock.patch("stable_baselines3.SAC.load") as load:
+            load.return_value = mock.Mock()
+            with tempfile.TemporaryDirectory() as temporary:
+                policy_path = Path(temporary) / "safe_sac_policy.zip"
+                policy_path.write_bytes(b"policy")
+                from hardware.tuning.drl.policy import SafeSacTuner
+
+                tuner = SafeSacTuner(
+                    ensemble=ensemble,
+                    policy_path=policy_path,
+                    config=TuningConfig(),
+                    episode_budget=2,
+                    confirmation_count=1,
+                    hardware_protection_mode=True,
+                    run_full_budget=True,
+                )
+        passed_record = mock.Mock()
+        passed_record.candidate = HardwarePidCandidate(mod0_kp=150)
+        passed_record.metrics = ResponseMetrics(
+            overshoot_pct=1.0,
+            undershoot_pct=1.0,
+            settling_time_s=1e-6,
+            oscillations=0,
+            score=1.0,
+            passed=True,
+            overshoot_settling_time_s=1e-6,
+            undershoot_settling_time_s=1e-6,
+            phase_margin_deg=60.0,
+            crossover_frequency_hz=150_000.0,
+            gain_margin_db=10.0,
+        )
+        passed_record.optimizer_metadata = {"algorithm": "deep-reinforcement", "episode": 0}
+        with mock.patch.object(tuner, "_observation", return_value=mock.Mock()):
+            tuner.policy.predict.return_value = ([0.1] * 6, None)
+            tuner.ensemble.predict_features.return_value = {
+                "safety_probability": [0.0],
+                "validity_probability": [0.0],
+                "invalid_probability": [[1.0, 1.0, 1.0]],
+                "uncertainty": [999.0],
+                "metric_mean": [[1.0, 1.0, 1.0, 1.0, 50.0, 150.0, 10.0]],
+                "metric_std": [[1.0] * 7],
+            }
+            proposed = tuner.next_candidate([passed_record], passed_record)
+        self.assertIsNotNone(proposed)
+        self.assertEqual(proposed.phase, "drl_policy")
 
 
 class DrlWorkflowStateMachineTest(unittest.TestCase):

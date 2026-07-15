@@ -89,11 +89,13 @@ def load_autotune_dataset(
     run_roots: Iterable[Path],
     config: TuningConfig,
     experiment: AutotuneExperimentConfig | None = None,
+    allow_legacy_inferred: bool = True,
 ) -> tuple[DrlDataset, dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     source_runs: list[dict[str, Any]] = []
     source_record_count = 0
     excluded_action_count = 0
+    excluded_out_of_search_space_count = 0
     for root in run_roots:
         if not root.exists():
             continue
@@ -103,7 +105,7 @@ def load_autotune_dataset(
                 continue
             compatible, compatibility = _run_compatibility(run_dir, config, experiment)
             source_record_count += len(rows)
-            if not compatible:
+            if not compatible or (not allow_legacy_inferred and compatibility != "exact_fixed_condition"):
                 source_runs.append(
                     {
                         "run_id": run_dir.name,
@@ -111,6 +113,11 @@ def load_autotune_dataset(
                         "path": str(run_dir),
                         "compatibility": compatibility,
                         "included": False,
+                        "exclusion_reason": (
+                            "legacy_metadata_not_allowed"
+                            if compatible and compatibility != "exact_fixed_condition"
+                            else "incompatible_operating_condition"
+                        ),
                     }
                 )
                 continue
@@ -132,6 +139,13 @@ def load_autotune_dataset(
                 candidate = candidate_from_mapping(candidate_payload, phase=str(row.get("phase") or "loaded"))
                 if not _candidate_is_representable(candidate):
                     excluded_action_count += 1
+                    continue
+                # Historical runs can contain values outside the search space
+                # configured for the policy being trained. Those samples are
+                # useful for archival analysis, but they distort a normalized
+                # action model that can never propose them at runtime.
+                if not _candidate_is_legal(candidate, config.search):
+                    excluded_out_of_search_space_count += 1
                     continue
                 metric_values, metric_mask = metric_vector(metrics_payload)
                 score, passed = relabeled_score(row, config.targets)
@@ -156,7 +170,9 @@ def load_autotune_dataset(
         "sample_count": dataset.size,
         "source_record_count": source_record_count,
         "excluded_incompatible_action_count": excluded_action_count,
+        "excluded_out_of_search_space_count": excluded_out_of_search_space_count,
         "source_runs": source_runs,
+        "allow_legacy_inferred": allow_legacy_inferred,
         "metric_fields": list(METRIC_FIELDS),
         "feature_layout": [
             "normalized_action[6]",

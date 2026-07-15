@@ -125,6 +125,7 @@ export type AutotuneExperimentConfig = {
   drl_collection_plan_id?: string;
   drl_episode_budget?: number;
   drl_confirmation_count?: number;
+  drl_hardware_protection_mode?: boolean;
 };
 
 export type DrlWorkflowStatus = {

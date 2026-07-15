@@ -92,13 +92,20 @@ class SurrogateEnsemble:
     def uncertainty_threshold(self) -> float:
         return float(self.manifest.get("uncertainty_threshold", 1.0))
 
+    @property
+    def invalid_probability_threshold(self) -> float:
+        return float(self.manifest.get("invalid_probability_threshold", 0.25))
+
     def predict_features(self, features: np.ndarray) -> dict[str, np.ndarray]:
         import torch
 
         values = np.asarray(features, dtype=np.float32)
         if values.ndim == 1:
             values = values.reshape(1, -1)
-        normalized = (values - self.feature_mean) / self.feature_std
+        # Sparse session-level baseline features can place a new power cycle
+        # outside the small training hull. Bound standardized inputs so an
+        # unseen session cannot drive an unconstrained neural extrapolation.
+        normalized = np.clip((values - self.feature_mean) / self.feature_std, -6.0, 6.0)
         tensor = torch.as_tensor(normalized, dtype=torch.float32, device=self.device)
         metric_predictions: list[np.ndarray] = []
         invalid_probabilities: list[np.ndarray] = []
@@ -106,7 +113,11 @@ class SurrogateEnsemble:
             for member in self.members:
                 member.eval()
                 metric_scaled, invalid_logits = member(tensor)
-                metric = metric_scaled.cpu().numpy() * self.metric_std + self.metric_mean
+                metric_scaled_np = metric_scaled.cpu().numpy()
+                if self.manifest.get("prediction_target") == "baseline_residual":
+                    metric = metric_scaled_np * self.metric_std + values[:, 6:13]
+                else:
+                    metric = metric_scaled_np * self.metric_std + self.metric_mean
                 invalid = torch.sigmoid(invalid_logits).cpu().numpy()
                 metric_predictions.append(metric)
                 invalid_probabilities.append(invalid)
@@ -204,7 +215,10 @@ def train_surrogate_ensemble(
     feature_std = np.std(dataset.features[train_indexes], axis=0)
     feature_std = np.where(feature_std < 1e-6, 1.0, feature_std)
     metric_mean, metric_std = _masked_mean_std(dataset.metrics[train_indexes], dataset.metric_mask[train_indexes])
-    x = ((dataset.features - feature_mean) / feature_std).astype(np.float32)
+    x = np.clip((dataset.features - feature_mean) / feature_std, -6.0, 6.0).astype(np.float32)
+    # Session baseline metrics remain explicit input context. Predict absolute
+    # metrics so incomplete or legacy baseline rows cannot force a biased
+    # residual target.
     y = ((dataset.metrics - metric_mean) / metric_std).astype(np.float32)
     mask = dataset.metric_mask.astype(np.float32)
     invalid = dataset.invalid_labels.astype(np.float32)
@@ -305,6 +319,8 @@ def train_surrogate_ensemble(
         "dependency": dependency,
         "training_device": device,
         "torch_cpu_threads": cpu_threads,
+        "prediction_target": "absolute_metrics",
+        "invalid_probability_threshold": 0.25,
         "accepted": False,
     }
     atomic_write_json(artifact_dir / "manifest.json", initial_manifest)
@@ -365,22 +381,33 @@ def evaluate_surrogate(
     actual_unsafe = np.max(dataset.invalid_labels[selected], axis=1) > 0
     safe_uncertainty = uncertainty[~actual_unsafe]
     uncertainty_threshold = float(np.quantile(safe_uncertainty, 0.95)) if safe_uncertainty.size else 1.0
+    invalid_probability = np.asarray(predictions["invalid_probability"])
+    invalid_threshold = ensemble.invalid_probability_threshold
     predicted_unsafe = (
-        np.asarray(predictions["validity_probability"]) < 0.50
+        np.max(invalid_probability, axis=1) >= invalid_threshold
     ) | (uncertainty > uncertainty_threshold)
     safety_recall = float(np.mean(predicted_unsafe[actual_unsafe])) if np.any(actual_unsafe) else 1.0
+    validity_specificity = float(np.mean(~predicted_unsafe[~actual_unsafe])) if np.any(~actual_unsafe) else 0.0
     interval_coverage = float(np.mean(coverage_values)) if coverage_values else 0.0
     fixed_thresholds = np.asarray([0.25, 0.25, 0.75, 0.75, 5.0, 20.0, float("inf")])
     thresholds = np.maximum(fixed_thresholds, repeat_mad * 1.25)
     mae_values = np.asarray([mae[name] if mae[name] is not None else float("inf") for name in METRIC_FIELDS])
     metric_gate = bool(np.all(mae_values[:6] <= thresholds[:6]))
-    accepted = bool(rank_correlation >= 0.65 and interval_coverage >= 0.85 and safety_recall >= 1.0 and metric_gate)
+    accepted = bool(
+        rank_correlation >= 0.65
+        and interval_coverage >= 0.85
+        and safety_recall >= 1.0
+        and validity_specificity >= 0.30
+        and metric_gate
+    )
     return {
         "accepted": accepted,
         "acceptance": {
             "penalty_spearman": rank_correlation,
             "interval_coverage_90": interval_coverage,
             "safety_recall": safety_recall,
+            "validity_specificity": validity_specificity,
+            "invalid_probability_threshold": invalid_threshold,
             "metric_gate": metric_gate,
             "metric_mean_absolute_error": mae,
             "metric_error_thresholds": {

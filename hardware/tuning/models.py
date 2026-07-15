@@ -172,6 +172,7 @@ class AutotuneExperimentConfig:
     drl_collection_plan_id: str = ""
     drl_episode_budget: int = 15
     drl_confirmation_count: int = 3
+    drl_hardware_protection_mode: bool = True
 
 
 @dataclass(frozen=True)

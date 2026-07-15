@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import ReactECharts from "echarts-for-react";
 import ReactMarkdown from "react-markdown";
@@ -56,6 +56,11 @@ const OPTIMIZATION_ALGORITHM_OPTIONS = [
   { value: "heuristic", label: "Grid Search + Heuristic Algorithm" },
   { value: "deep-reinforcement", label: "Deep Reinforcement Learning" }
 ];
+
+const optimizationAlgorithmLabel = (value: string | null | undefined) =>
+  OPTIMIZATION_ALGORITHM_OPTIONS.find((option) => option.value === value)?.label
+  ?? value
+  ?? "Grid Search + Heuristic Algorithm";
 
 const defaultConfig: TuningConfig = {
   plant: {
@@ -184,6 +189,8 @@ const defaultTelemetryWindowSeconds = 15;
 const telemetryHistoryWindowSeconds = 120;
 const telemetryAxisStepMs = 5000;
 const telemetryMovingAverageSeconds = 0.5;
+const telemetryDisplayMaxPoints = 6000;
+const telemetryUiRefreshIntervalMs = 50;
 const telemetryVoutAxisMax = 1.2;
 const telemetryIoutAxisMax = 1000;
 const defaultVoutExponent = -9;
@@ -367,33 +374,71 @@ function appendTelemetrySample(current: VoutReadback[], next: VoutReadback) {
   const timestamp = next.timestamp ?? Date.now() / 1000;
   const sample = { ...next, timestamp };
   const cutoff = timestamp - telemetryHistoryWindowSeconds;
-  return [...current, sample].filter((item) => (item.timestamp ?? timestamp) >= cutoff);
+  current.push(sample);
+  const oldestTimestamp = current[0]?.timestamp ?? timestamp;
+  // Trim in one-second batches instead of shifting a large array for every
+  // high-rate sample. The chart axis still clips exactly to the chosen window.
+  if (oldestTimestamp < cutoff - 1) {
+    let expired = 0;
+    while (expired < current.length && (current[expired].timestamp ?? timestamp) < cutoff) expired += 1;
+    if (expired > 0) current.splice(0, expired);
+  }
+  return current;
 }
 
 function smoothTelemetryHistory(history: VoutReadback[], windowSeconds = telemetryMovingAverageSeconds) {
   if (history.length === 0) return [];
+  let windowStart = 0;
+  let voutSum = 0;
+  let voutCount = 0;
+  let ioutSum = 0;
+  let ioutCount = 0;
+  let commandSum = 0;
+  let commandCount = 0;
+
+  const accumulate = (sample: VoutReadback, direction: 1 | -1) => {
+    if (typeof sample.read_vout_v === "number" && Number.isFinite(sample.read_vout_v)) {
+      voutSum += direction * sample.read_vout_v;
+      voutCount += direction;
+    }
+    if (typeof sample.read_iout_a === "number" && Number.isFinite(sample.read_iout_a)) {
+      ioutSum += direction * sample.read_iout_a;
+      ioutCount += direction;
+    }
+    if (typeof sample.vout_command_v === "number" && Number.isFinite(sample.vout_command_v)) {
+      commandSum += direction * sample.vout_command_v;
+      commandCount += direction;
+    }
+  };
+
   return history.map((sample, index) => {
     const timestamp = sample.timestamp ?? Date.now() / 1000;
-    const start = timestamp - windowSeconds;
-    const window = history
-      .slice(0, index + 1)
-      .filter((item) => {
-        const itemTimestamp = item.timestamp ?? timestamp;
-        return itemTimestamp >= start && itemTimestamp <= timestamp;
-      });
+    accumulate(sample, 1);
+    const cutoff = timestamp - windowSeconds;
+    while (windowStart < index && (history[windowStart].timestamp ?? timestamp) < cutoff) {
+      accumulate(history[windowStart], -1);
+      windowStart += 1;
+    }
     return {
       ...sample,
-      read_vout_v: averageDefined(window.map((item) => item.read_vout_v)),
-      read_iout_a: averageDefined(window.map((item) => item.read_iout_a)),
-      vout_command_v: averageDefined(window.map((item) => item.vout_command_v))
+      read_vout_v: voutCount > 0 ? voutSum / voutCount : undefined,
+      read_iout_a: ioutCount > 0 ? ioutSum / ioutCount : undefined,
+      vout_command_v: commandCount > 0 ? commandSum / commandCount : undefined
     };
   });
 }
 
-function averageDefined(values: Array<number | undefined>) {
-  const valid = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
-  if (valid.length === 0) return undefined;
-  return valid.reduce((total, value) => total + value, 0) / valid.length;
+function decimateTelemetryHistory(history: VoutReadback[], maxPoints = telemetryDisplayMaxPoints) {
+  if (history.length <= maxPoints || maxPoints < 2) return history;
+  const output: VoutReadback[] = [];
+  const step = (history.length - 1) / (maxPoints - 1);
+  let previousIndex = -1;
+  for (let index = 0; index < maxPoints; index += 1) {
+    const sourceIndex = Math.min(history.length - 1, Math.round(index * step));
+    if (sourceIndex !== previousIndex) output.push(history[sourceIndex]);
+    previousIndex = sourceIndex;
+  }
+  return output;
 }
 
 function clampTelemetryDuration(value: number) {
@@ -490,7 +535,8 @@ function buildAutotuneExperiment(
   settings: ManualExperimentSettings,
   analysisSelection: { bode: boolean; transient: boolean },
   optimizationAlgorithm: string,
-  drlModelId = ""
+  drlModelId = "",
+  drlEpisodeBudget = 15
 ): AutotuneExperimentConfig {
   return {
     board_address: voutRequest.address,
@@ -513,7 +559,9 @@ function buildAutotuneExperiment(
     vout_tolerance_v: 0.15,
     response_abs_limit_v: 0.25,
     ignore_pass_until_max_iterations: true,
-    drl_model_id: drlModelId
+    drl_model_id: drlModelId,
+    drl_episode_budget: Math.max(1, Math.round(drlEpisodeBudget)),
+    drl_hardware_protection_mode: true
   };
 }
 
@@ -550,6 +598,10 @@ function App() {
   const viewingLoadedRun = useRef(false);
   const [manualExperimentSettings, setManualExperimentSettings] = useState<ManualExperimentSettings>(defaultManualExperimentSettings);
   const [telemetryHistory, setTelemetryHistory] = useState<VoutReadback[]>([]);
+  const telemetryHistoryRef = useRef<VoutReadback[]>([]);
+  const telemetryPendingReadback = useRef<VoutReadback | null>(null);
+  const telemetryPublishTimer = useRef<number | null>(null);
+  const telemetryLastPublishMs = useRef(0);
   const [manualLiveRefresh, setManualLiveRefresh] = useState(false);
   const [manualLiveRateHz, setManualLiveRateHz] = useState(liveTelemetryDefaultHz);
   const [manualWriteSelection, setManualWriteSelection] = useState<ManualWriteSelection>({
@@ -568,6 +620,34 @@ function App() {
   const [selfTestRunning, setSelfTestRunning] = useState(false);
   const [activeSelfTestKey, setActiveSelfTestKey] = useState<InstrumentKey | null>(null);
   const t = copy;
+
+  const flushTelemetryDisplay = () => {
+    telemetryPublishTimer.current = null;
+    const pending = telemetryPendingReadback.current;
+    telemetryPendingReadback.current = null;
+    if (pending) setVoutState(pending);
+    setTelemetryHistory([...telemetryHistoryRef.current]);
+    telemetryLastPublishMs.current = performance.now();
+  };
+
+  const publishTelemetryReadback = (next: VoutReadback, deferRender = false) => {
+    if (next.ok && next.read_vout_v !== undefined) {
+      appendTelemetrySample(telemetryHistoryRef.current, next);
+    }
+    telemetryPendingReadback.current = next;
+    if (!deferRender) {
+      if (telemetryPublishTimer.current !== null) {
+        window.clearTimeout(telemetryPublishTimer.current);
+        telemetryPublishTimer.current = null;
+      }
+      flushTelemetryDisplay();
+      return;
+    }
+    if (telemetryPublishTimer.current !== null) return;
+    const elapsed = performance.now() - telemetryLastPublishMs.current;
+    const delay = Math.max(0, telemetryUiRefreshIntervalMs - elapsed);
+    telemetryPublishTimer.current = window.setTimeout(flushTelemetryDisplay, delay);
+  };
 
   const refresh = async () => {
     if (viewingLoadedRun.current) return;
@@ -620,6 +700,10 @@ function App() {
     return () => {
       window.clearInterval(timer);
       window.clearInterval(drlTimer);
+      if (telemetryPublishTimer.current !== null) {
+        window.clearTimeout(telemetryPublishTimer.current);
+        telemetryPublishTimer.current = null;
+      }
     };
   }, []);
 
@@ -650,10 +734,7 @@ function App() {
 
     if (!nextVout?.ok) {
       nextVout = await readVout(voutRequest.address, voutRequest.page, voutRequest.adapter);
-      setVoutState(nextVout);
-      if (nextVout.ok && nextVout.read_vout_v !== undefined) {
-        setTelemetryHistory((current) => appendTelemetrySample(current, nextVout as VoutReadback));
-      }
+      publishTelemetryReadback(nextVout);
     }
 
     const pidFieldsFromState = nextPid?.pid_registers?.fields;
@@ -724,7 +805,8 @@ function App() {
         manualExperimentSettings,
         autotuneAnalysisSelection,
         optimizationAlgorithm,
-        drlStatus?.model_id ?? ""
+        drlStatus?.model_id ?? "",
+        configuredMaxCoarseIterations(runConfig.search) + configuredMaxRefinedIterations(runConfig.search)
       );
       const next =
         action === "start" ? await startTuning(runConfig, experiment) : await stepTuning(runConfig, experiment);
@@ -767,7 +849,8 @@ function App() {
         manualExperimentSettings,
         { transient: true, bode: true },
         "deep-reinforcement",
-        drlStatus?.model_id ?? ""
+        drlStatus?.model_id ?? "",
+        configuredMaxCoarseIterations(runConfig.search) + configuredMaxRefinedIterations(runConfig.search)
       );
       const next = await runDrlWorkflowAction(action, runConfig, experiment);
       setDrlStatus(next);
@@ -792,13 +875,10 @@ function App() {
     }
   };
 
-  const readBoardVout = async () => {
+  const readBoardVout = async (deferRender = false) => {
     try {
       const next = await readVout(voutRequest.address, voutRequest.page, voutRequest.adapter);
-      setVoutState(next);
-      if (next.ok && next.read_vout_v !== undefined) {
-        setTelemetryHistory((current) => appendTelemetrySample(current, next));
-      }
+      publishTelemetryReadback(next, deferRender);
       setError("");
     } catch (exc) {
       setError(String(exc));
@@ -809,11 +889,8 @@ function App() {
     try {
       const requestedVoltage = snapVoutToRegister(voutRequest.voltage, voutExponentFromReadback(vout));
       const next = await setVout(voutRequest.address, voutRequest.page, voutRequest.adapter, requestedVoltage);
-      setVoutState(next);
+      publishTelemetryReadback(next);
       setVoutRequest((current) => ({ ...current, voltage: requestedVoltage }));
-      if (next.ok && next.read_vout_v !== undefined) {
-        setTelemetryHistory((current) => appendTelemetrySample(current, next));
-      }
       setError("");
     } catch (exc) {
       setError(String(exc));
@@ -889,10 +966,7 @@ function App() {
       const next = await setPmbusOutput(voutRequest.address, voutRequest.page, voutRequest.adapter, action);
       setPmbusOutputState(next);
       const refreshed = await readVout(voutRequest.address, voutRequest.page, voutRequest.adapter);
-      setVoutState(refreshed);
-      if (refreshed.ok && refreshed.read_vout_v !== undefined) {
-        setTelemetryHistory((current) => appendTelemetrySample(current, refreshed));
-      }
+      publishTelemetryReadback(refreshed);
       setError("");
     } catch (exc) {
       setError(String(exc));
@@ -907,10 +981,7 @@ function App() {
       const next = await setXdpOutput(voutRequest.address, voutRequest.page, voutRequest.adapter, action);
       setXdpOutputState(next);
       const refreshed = await readVout(voutRequest.address, voutRequest.page, voutRequest.adapter);
-      setVoutState(refreshed);
-      if (refreshed.ok && refreshed.read_vout_v !== undefined) {
-        setTelemetryHistory((current) => appendTelemetrySample(current, refreshed));
-      }
+      publishTelemetryReadback(refreshed);
       setError("");
     } catch (exc) {
       setError(String(exc));
@@ -928,7 +999,7 @@ function App() {
     const telemetryLoop = async () => {
       while (!cancelled) {
         const started = performance.now();
-        await readBoardVout();
+        await readBoardVout(true);
         const elapsed = performance.now() - started;
         await wait(Math.max(0, 1000 / clampTelemetryRate(manualLiveRateHz) - elapsed));
       }
@@ -1011,11 +1082,8 @@ function App() {
       setManualWriteRunning(true);
       if (snapshot.selection.vout) {
         const nextVout = await setVout(snapshot.address, snapshot.page, snapshot.adapter, snapshot.voltage);
-        setVoutState(nextVout);
+        publishTelemetryReadback(nextVout);
         setVoutRequest((current) => ({ ...current, voltage: snapshot.voltage }));
-        if (nextVout.ok && nextVout.read_vout_v !== undefined) {
-          setTelemetryHistory((current) => appendTelemetrySample(current, nextVout));
-        }
       }
       if (Object.keys(inductancePayload).length > 0) {
         const nextInductance = await setInductance(
@@ -1031,10 +1099,7 @@ function App() {
         setXdpPidState(nextPid);
       }
       const refreshed = await readVout(snapshot.address, snapshot.page, snapshot.adapter);
-      setVoutState(refreshed);
-      if (refreshed.ok && refreshed.read_vout_v !== undefined) {
-        setTelemetryHistory((current) => appendTelemetrySample(current, refreshed));
-      }
+      publishTelemetryReadback(refreshed);
       setError("");
     } catch (exc) {
       setError(String(exc));
@@ -1294,7 +1359,7 @@ function App() {
                 </span>
                 <span className="cloud-title" aria-hidden="true">Cloud</span>
               </span>{" "}
-              <span className="product-title">Power Auto Tuner (V1.0)</span>
+              <span className="product-title">Power AI Auto Tuner (V1.0)</span>
             </h1>
             <p>{t.platform} ({t.copyright})</p>
             <p>{t.author}</p>
@@ -1808,7 +1873,7 @@ function PenaltyExplanationDialog({ onClose }: { onClose: () => void }) {
             Bode penalty = 1.5 x phase-margin shortage [deg] + 0.5 x crossover upper-limit excess [%]
           </div>
           <p>
-            Default limits: OS at or below 3%, US at or below 3%, OS/US settling below 1 us, phase margin at or above
+            Default limits: OS at or below 3%, US at or below 3%, OS/US settling at or below 2 us, phase margin at or above
             45 deg, and crossover frequency upper limit = 200 kHz. The OS/US terms are percentage points, settling terms
             are microseconds, phase margin is degrees, and crossover upper-limit excess is percent.
           </p>
@@ -2014,8 +2079,6 @@ function AutotuneWorkbench({
   const voutRegisterStep = voutRegisterStepFromExponent(voutExponent);
   const fgConfig = experimentSettings.fgConfig;
   const canRunAnalysis = analysisSelection.transient || analysisSelection.bode;
-  const drlHardwareReady = Boolean(drlStatus?.model_status === "hardware_ready" && drlStatus.model_compatible);
-  const drlStartBlocked = optimizationAlgorithm === "deep-reinforcement" && !drlHardwareReady;
   const [selectedIteration, setSelectedIteration] = useState<number | null>(null);
   const [livePlayback, setLivePlayback] = useState(false);
   const selectedRecord = selectedIteration === null ? null : history.find((item) => item.iteration === selectedIteration) ?? null;
@@ -2127,10 +2190,10 @@ function AutotuneWorkbench({
               {optimizationAlgorithm === "deep-reinforcement" && (
                 <DrlControl status={drlStatus} tuningState={status?.state} onAction={runDrlAction} />
               )}
-              <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || !canRunAnalysis || drlStartBlocked}>
+              <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || !canRunAnalysis}>
                 Start Auto-Tune
               </button>
-              <button className="autotune-control-button iterate" onClick={() => runAction("step")} disabled={status?.state === "running" || !canRunAnalysis || drlStartBlocked}>
+              <button className="autotune-control-button iterate" onClick={() => runAction("step")} disabled={status?.state === "running" || !canRunAnalysis}>
                 Run Single Iteration
               </button>
               <div className="autotune-control-grid">
@@ -2326,6 +2389,7 @@ function AutotuneWorkbench({
             best={best}
             history={history}
             record={visibleRecord}
+            selectedAlgorithm={optimizationAlgorithm}
           />
           <CandidateMetricsPanel
             title="Best Result"
@@ -2698,7 +2762,15 @@ function ManualTuningView({
     }
   };
 
-  const displayTelemetryHistory = smoothTelemetryHistory(telemetryHistory);
+  const displayTelemetryHistory = useMemo(
+    () => decimateTelemetryHistory(smoothTelemetryHistory(telemetryHistory)),
+    [telemetryHistory]
+  );
+  const telemetryDarkMode = typeof document !== "undefined" && document.body.classList.contains("theme-dark");
+  const telemetryChartOption = useMemo(
+    () => telemetryOption(displayTelemetryHistory, telemetryAxisSettings),
+    [displayTelemetryHistory, telemetryAxisSettings, telemetryDarkMode]
+  );
   const latestSmoothedTelemetry = displayTelemetryHistory.at(-1);
   const displayVout = latestSmoothedTelemetry && vout
     ? { ...vout, ...latestSmoothedTelemetry }
@@ -2888,7 +2960,7 @@ function ManualTuningView({
               />
             </div>
             <div className="chart-shell" onDoubleClick={() => setAxisEditor("telemetry")}>
-              <ReactECharts option={telemetryOption(displayTelemetryHistory, telemetryAxisSettings)} className="chart tall" lazyUpdate />
+              <ReactECharts option={telemetryChartOption} className="chart tall" lazyUpdate />
             </div>
           </Panel>
 
@@ -4561,7 +4633,7 @@ function RateValue({
 }) {
   return (
     <label className="live-value rate-value">
-      <span>Rate</span>
+      <span>Refresh Rate</span>
       <div className="rate-input-row">
         <input
           type="number"
@@ -4753,7 +4825,8 @@ function RunCurrentPanel({
   current,
   best,
   history,
-  record
+  record,
+  selectedAlgorithm
 }: {
   title: string;
   candidateTitle: string;
@@ -4763,12 +4836,19 @@ function RunCurrentPanel({
   best: IterationRecord | null;
   history: IterationRecord[];
   record: IterationRecord | null;
+  selectedAlgorithm?: string;
 }) {
   return (
     <Panel title={title} icon={<Activity size={17} />}>
       <div className="combined-result-section">
         <h4>Run Status</h4>
-        <RunStatusReadout status={status} current={current} best={best} history={history} />
+        <RunStatusReadout
+          status={status}
+          current={current}
+          best={best}
+          history={history}
+          selectedAlgorithm={selectedAlgorithm}
+        />
       </div>
       <div className="combined-result-divider" />
       <div className="combined-result-section">
@@ -4836,12 +4916,14 @@ function RunStatusReadout({
   status,
   current,
   best,
-  history
+  history,
+  selectedAlgorithm
 }: {
   status: TuningStatus | null;
   current: IterationRecord | null;
   best: IterationRecord | null;
   history: IterationRecord[];
+  selectedAlgorithm?: string;
 }) {
   const iteration = history.length;
   const search = normalizeTuningConfig(status?.config).search;
@@ -4854,6 +4936,11 @@ function RunStatusReadout({
   const currentLabel = current ? `#${current.iteration} ${current.phase}` : "-";
   const bestPenalty = best ? displayPenaltyScore(best) : null;
   const bestLabel = best ? `#${best.iteration} penalty ${formatMaybeNumber(bestPenalty, 3)}` : "-";
+  const algorithm = optimizationAlgorithmLabel(
+    status?.state === "running"
+      ? status.experiment?.optimization_algorithm
+      : selectedAlgorithm ?? status?.experiment?.optimization_algorithm
+  );
   const resultsSaved = Boolean(
     current?.scope_result && typeof current.scope_result === "object" && "scope_png" in current.scope_result
   ) || Boolean(
@@ -4867,6 +4954,8 @@ function RunStatusReadout({
         <dd>{status ? status.state : "connecting"}</dd>
         <dt>Mode</dt>
         <dd>{status?.state === "running" ? "Running" : "Ready"}</dd>
+        <dt>Algorithm</dt>
+        <dd>{algorithm}</dd>
         <dt>Iter Coarse</dt>
         <dd>{coarseDone} / {maxCoarse}</dd>
         <dt>Iter Refined</dt>

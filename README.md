@@ -116,6 +116,21 @@ heuristic server does not require PyTorch:
 pip install -r requirements-ml.txt
 ```
 
+Archived fixed-condition Auto-Tune runs can be used to pretrain and validate
+the DRL surrogate without touching hardware:
+
+```powershell
+python scripts/pretrain_drl.py
+```
+
+The command holds out complete hardware runs for validation, writes its
+dataset, ensemble, and report under `results/autotune_ml/pretraining/`, and
+does not mark the result hardware-ready. Use `--exact-only` to diagnose only
+runs that contain complete operating-condition metadata. Safe SAC pretraining
+is allowed only after the surrogate passes the metric, interval, ranking, and
+safety gates; real-board use still requires the guarded hardware validation
+workflow.
+
 Install frontend dependencies:
 
 ```powershell

@@ -635,9 +635,12 @@ class AutotuneRunStore:
             self.saved_dir.mkdir(parents=True, exist_ok=True)
             # Recent runs retain references to the fast live artifacts. Make
             # a self-contained copy only when the user explicitly archives it.
+            source_run_id = self._current_run_id
             self._materialize_run_assets(source)
             target = self._next_friendly_run_dir("saved", name)
-            shutil.copytree(source, target)
+            # Recent and saved runs live on the same volume. Moving the
+            # self-contained run avoids copying every waveform a second time.
+            shutil.move(str(source), str(target))
             status = self._read_json(target / "run_status.json")
             if isinstance(status, dict):
                 self._repair_run_status_artifact_paths(target, status)
@@ -648,13 +651,12 @@ class AutotuneRunStore:
             summary.update({
                 "run_id": target.name,
                 "display_name": self._display_name_for_run(target.name, "saved"),
-                "source_run_id": self._current_run_id,
+                "source_run_id": source_run_id,
                 "kind": "saved",
                 "archived_at": time.time(),
                 "path": _path_label(target),
             })
             self._write_json(target / "summary.json", summary)
-            shutil.rmtree(source, ignore_errors=True)
             self._current_run_id = target.name
             self._current_run_kind = "saved"
             if isinstance(status, dict) and isinstance(status.get("history"), list):
@@ -710,7 +712,7 @@ class AutotuneRunStore:
             self._materialize_run_assets(source)
             status = self._read_json(source / "run_status.json") or status
             target = self._next_friendly_run_dir("saved", name)
-            shutil.copytree(source, target)
+            shutil.move(str(source), str(target))
             self._repair_run_status_artifact_paths(target, status)
             status["run"] = self._run_payload(target.name, "saved", target)
             self._write_json(target / "run_status.json", status)
@@ -726,7 +728,6 @@ class AutotuneRunStore:
                 "path": _path_label(target),
             })
             self._write_json(target / "summary.json", summary)
-            shutil.rmtree(source, ignore_errors=True)
             if run_id == self._current_run_id and (self._current_run_kind or "recent") == "recent":
                 self._current_run_id = target.name
                 self._current_run_kind = "saved"
@@ -980,6 +981,23 @@ class AutotuneRunStore:
         frames: list[Image.Image] = []
         trend_records = self._penalty_trend_records(history)
         target.parent.mkdir(parents=True, exist_ok=True)
+        frame_cache_dir = target.parent / "frame_cache"
+        frame_cache_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = frame_cache_dir / "manifest.json"
+        cached_manifest = self._read_json(manifest_path) or {}
+        cache_context = {
+            "version": 5,
+            "layout": "scope_bode_left_penalty_right",
+            "trend": trend_records,
+            "scope_axis_settings": scope_axis_settings or {},
+        }
+        cached_frames = (
+            cached_manifest.get("frames")
+            if cached_manifest.get("context") == cache_context and isinstance(cached_manifest.get("frames"), dict)
+            else {}
+        )
+        next_manifest_frames: dict[str, dict] = {}
+        used_cache_files: set[Path] = set()
         try:
             for record in history:
                 if not isinstance(record, dict):
@@ -999,37 +1017,72 @@ class AutotuneRunStore:
                 if not has_scope and not has_bode:
                     continue
                 try:
+                    iteration = int(record.get("iteration") or 0)
                     width = self._gif_frame_width(scope_path, bode_path)
                     height = max(900, min(1400, round(width * 0.58)))
+                    frame_signature = {
+                        "width": width,
+                        "height": height,
+                        "scope": self._gif_result_signature(scope_result, scope_path),
+                        "bode": self._gif_result_signature(bode_result, bode_path),
+                    }
+                    cache_key = str(iteration)
+                    cache_path = frame_cache_dir / f"iteration_{iteration:04d}.png"
+                    used_cache_files.add(cache_path)
+                    next_manifest_frames[cache_key] = frame_signature
+                    if cached_frames.get(cache_key) == frame_signature and cache_path.exists():
+                        with Image.open(cache_path) as cached:
+                            frames.append(cached.copy())
+                        continue
+
                     combined = Image.new("RGB", (width, height), "white")
                     if has_scope and has_bode:
-                        left_width = max(1, round(width * 0.58))
+                        left_width = max(1, round(width * 0.62))
                         right_width = max(1, width - left_width)
-                        top_height = max(1, round(height * 0.55))
-                        bottom_height = max(1, height - top_height)
+                        plot_gap = 6
+                        available_left_height = max(2, height - plot_gap)
+                        top_height = max(1, available_left_height // 2)
+                        bottom_height = max(1, available_left_height - top_height)
                         scope = self._render_scope_for_gif(
                             scope_result,
                             scope_path,
-                            right_width,
+                            left_width,
                             top_height,
                             scope_axis_settings,
                             target.parent,
-                            int(record.get("iteration") or 0),
+                            iteration,
                         )
                         bode = self._render_bode_for_gif(
                             bode_result,
                             bode_path,
                             left_width,
-                            height,
+                            bottom_height,
                             target.parent,
-                            int(record.get("iteration") or 0),
+                            iteration,
                         )
-                        trend = self._make_penalty_trend_frame(trend_records, record, right_width, bottom_height)
-                        combined.paste(bode, (0, 0))
-                        combined.paste(scope, (left_width, 0))
-                        combined.paste(trend, (left_width, top_height))
+                        compact_scope = self._resize_gif_plot_to_width(scope, left_width)
+                        compact_bode = self._resize_gif_plot_to_width(bode, left_width)
+                        stack_height = compact_scope.height + plot_gap + compact_bode.height
+                        if stack_height > height:
+                            stack_scale = height / stack_height
+                            compact_scope = self._resize_gif_plot(compact_scope, stack_scale)
+                            compact_bode = self._resize_gif_plot(compact_bode, stack_scale)
+                            stack_height = compact_scope.height + plot_gap + compact_bode.height
+                        stack_top = max(0, (height - stack_height) // 2)
+                        trend = self._make_penalty_trend_frame(
+                            trend_records,
+                            record,
+                            right_width,
+                            stack_height,
+                        )
+                        combined.paste(compact_scope, (0, stack_top))
+                        combined.paste(compact_bode, (0, stack_top + compact_scope.height + plot_gap))
+                        combined.paste(trend, (left_width, stack_top))
+                        compact_scope.close()
+                        compact_bode.close()
                         bode.close()
                         scope.close()
+                        trend.close()
                     else:
                         plot_height = max(1, round(height * 0.68))
                         trend_height = max(1, height - plot_height)
@@ -1041,7 +1094,7 @@ class AutotuneRunStore:
                                 plot_height,
                                 scope_axis_settings,
                                 target.parent,
-                                int(record.get("iteration") or 0),
+                                iteration,
                             )
                         else:
                             plot = self._render_bode_for_gif(
@@ -1050,17 +1103,25 @@ class AutotuneRunStore:
                                 width,
                                 plot_height,
                                 target.parent,
-                                int(record.get("iteration") or 0),
+                                iteration,
                             )
                         trend = self._make_penalty_trend_frame(trend_records, record, width, trend_height)
                         combined.paste(plot, (0, 0))
                         combined.paste(trend, (0, plot_height))
                         plot.close()
-                    frames.append(combined)
+                        trend.close()
+                    palette_frame = self._quantize_gif_frame(combined)
+                    combined.close()
+                    palette_frame.save(cache_path, format="PNG", optimize=False)
+                    frames.append(palette_frame)
                 except Exception:
                     continue
             if not frames:
                 return None
+            self._write_json(manifest_path, {"context": cache_context, "frames": next_manifest_frames})
+            for cached_path in frame_cache_dir.glob("iteration_*.png"):
+                if cached_path not in used_cache_files:
+                    cached_path.unlink(missing_ok=True)
             if target.exists():
                 target.unlink()
             frames[0].save(
@@ -1069,7 +1130,7 @@ class AutotuneRunStore:
                 append_images=frames[1:],
                 duration=duration_ms,
                 loop=0,
-                optimize=True,
+                optimize=False,
             )
             return target
         finally:
@@ -1091,16 +1152,119 @@ class AutotuneRunStore:
         return max(widths) if widths else 2400
 
     @staticmethod
+    def _gif_result_signature(result: dict | None, image_path: Path | None) -> list[list[object]]:
+        paths: list[Path] = []
+        if image_path is not None:
+            paths.append(image_path)
+        if isinstance(result, dict):
+            data_file = _path_from_result_reference(result.get("data_file"))
+            if data_file is not None:
+                paths.append(data_file)
+            waveforms = result.get("waveforms") if isinstance(result.get("waveforms"), list) else []
+            for waveform in waveforms:
+                if not isinstance(waveform, dict):
+                    continue
+                waveform_file = _path_from_result_reference(waveform.get("data_file"))
+                if waveform_file is not None:
+                    paths.append(waveform_file)
+        signature: list[list[object]] = []
+        seen: set[str] = set()
+        for path in paths:
+            try:
+                resolved = path.resolve()
+                key = str(resolved)
+                if key in seen or not resolved.exists():
+                    continue
+                seen.add(key)
+                stat = resolved.stat()
+                signature.append([key, int(stat.st_size), int(stat.st_mtime_ns)])
+            except OSError:
+                continue
+        return signature
+
+    @staticmethod
+    def _quantize_gif_frame(image: "Image.Image") -> "Image.Image":
+        from PIL import Image
+
+        try:
+            return image.quantize(
+                colors=256,
+                method=Image.Quantize.FASTOCTREE,
+                dither=Image.Dither.NONE,
+            )
+        except AttributeError:
+            return image.convert("P", palette=Image.ADAPTIVE, colors=256)
+
+    @staticmethod
     def _fit_image_no_stretch(image: "Image.Image", width: int, height: int) -> "Image.Image":
         from PIL import Image
 
         resampling = getattr(Image, "Resampling", Image).LANCZOS
-        scale = min(width / max(1, image.width), height / max(1, image.height))
-        scaled = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), resampling)
+        cropped = AutotuneRunStore._trim_near_white_image(image)
+        scale = min(width / max(1, cropped.width), height / max(1, cropped.height))
+        scaled = cropped.resize(
+            (max(1, round(cropped.width * scale)), max(1, round(cropped.height * scale))),
+            resampling,
+        )
+        cropped.close()
         canvas = Image.new("RGB", (width, height), "white")
         canvas.paste(scaled, ((width - scaled.width) // 2, (height - scaled.height) // 2))
         scaled.close()
         return canvas
+
+    @staticmethod
+    def _trim_near_white_image(image: "Image.Image") -> "Image.Image":
+        from PIL import Image, ImageChops
+
+        rgb = image.convert("RGB")
+        white = Image.new("RGB", rgb.size, "white")
+        difference = ImageChops.difference(rgb, white).convert("L")
+        content_mask = difference.point(lambda value: 255 if value > 12 else 0)
+        bounds = content_mask.getbbox()
+        if bounds is not None:
+            padding = 8
+            left = max(0, bounds[0] - padding)
+            top = max(0, bounds[1] - padding)
+            right = min(rgb.width, bounds[2] + padding)
+            bottom = min(rgb.height, bounds[3] + padding)
+            cropped = rgb.crop((left, top, right, bottom))
+        else:
+            cropped = rgb.copy()
+        white.close()
+        difference.close()
+        content_mask.close()
+        if rgb is not image:
+            rgb.close()
+        return cropped
+
+    @staticmethod
+    def _resize_gif_plot_to_width(image: "Image.Image", width: int) -> "Image.Image":
+        from PIL import Image
+
+        cropped = AutotuneRunStore._trim_near_white_image(image)
+        scale = width / max(1, cropped.width)
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        resized = cropped.resize(
+            (width, max(1, round(cropped.height * scale))),
+            resampling,
+        )
+        cropped.close()
+        return resized
+
+    @staticmethod
+    def _resize_gif_plot(image: "Image.Image", scale: float) -> "Image.Image":
+        from PIL import Image
+
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        resized = image.resize(
+            (
+                max(1, round(image.width * scale)),
+                max(1, round(image.height * scale)),
+            ),
+            resampling,
+        )
+        image.close()
+        return resized
 
     @staticmethod
     def _render_scope_for_gif(
@@ -1114,6 +1278,11 @@ class AutotuneRunStore:
     ) -> "Image.Image":
         from PIL import Image
 
+        # Auto-Tune already renders an iteration PNG when acquisition finishes.
+        # Reuse it for GIF export; raw-data plotting is only a repair fallback.
+        if fallback_path and fallback_path.exists() and fallback_path.stat().st_size > 0:
+            with Image.open(fallback_path) as image:
+                return AutotuneRunStore._fit_image_no_stretch(image.convert("RGB"), width, height)
         entry = _scope_capture_entry_from_result(scope_result) if isinstance(scope_result, dict) else None
         if entry is not None:
             temp_path = temp_dir / f".gif_scope_{uuid.uuid4().hex}.png"
@@ -1130,9 +1299,6 @@ class AutotuneRunStore:
                     return image.convert("RGB")
             finally:
                 temp_path.unlink(missing_ok=True)
-        if fallback_path and fallback_path.exists():
-            with Image.open(fallback_path) as image:
-                return AutotuneRunStore._fit_image_no_stretch(image.convert("RGB"), width, height)
         raise RuntimeError("No scope image data is available for GIF rendering.")
 
     @staticmethod
@@ -1146,6 +1312,9 @@ class AutotuneRunStore:
     ) -> "Image.Image":
         from PIL import Image
 
+        if fallback_path and fallback_path.exists() and fallback_path.stat().st_size > 0:
+            with Image.open(fallback_path) as image:
+                return AutotuneRunStore._fit_image_no_stretch(image.convert("RGB"), width, height)
         data_file = _path_from_result_reference(bode_result.get("data_file")) if isinstance(bode_result, dict) else None
         if data_file and data_file.exists():
             temp_path = temp_dir / f".gif_bode_{uuid.uuid4().hex}.png"
@@ -1157,7 +1326,7 @@ class AutotuneRunStore:
                         phase_deg=np.asarray(payload["phase_deg"], dtype=np.float64).tolist(),
                         margins=bode_result.get("margins") if isinstance(bode_result.get("margins"), dict) else None,
                         path=temp_path,
-                        title=f"Iteration {iteration} - Bode 100 Sweep - Full Data",
+                        title=f"Iteration {iteration} - Bode Sweep - Full Data",
                         figsize=(width / 150.0, height / 150.0),
                         dpi=150,
                     )
@@ -1165,9 +1334,6 @@ class AutotuneRunStore:
                     return image.convert("RGB")
             finally:
                 temp_path.unlink(missing_ok=True)
-        if fallback_path and fallback_path.exists():
-            with Image.open(fallback_path) as image:
-                return AutotuneRunStore._fit_image_no_stretch(image.convert("RGB"), width, height)
         raise RuntimeError("No Bode image data is available for GIF rendering.")
 
     @staticmethod
@@ -1456,6 +1622,25 @@ class AutotuneRunStore:
         result[key] = expected
         return True
 
+    @staticmethod
+    def _copy_asset_file(source: Path, target: Path) -> bool:
+        """Materialize an immutable run artifact without an avoidable byte copy."""
+
+        source = source.resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            try:
+                if os.path.samefile(source, target):
+                    return False
+            except OSError:
+                pass
+            target.unlink()
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
+        return True
+
     def _copy_record_assets(
         self,
         record: dict,
@@ -1475,15 +1660,22 @@ class AutotuneRunStore:
             target = files_dir / f"iteration_{iteration:03d}_scope.png"
             if self._copy_scope_channel_data_files(scope_result, files_dir, iteration):
                 changed = True
-            if self._rebuild_scope_png_from_record(scope_result, target, iteration, scope_axis_settings):
+            scope_png_ready = False
+            source = _path_from_result_reference(scope_result.get("scope_png"))
+            if not force_rebuild and source and source.exists() and source.stat().st_size > 0:
+                if self._copy_asset_file(source, target):
+                    changed = True
+                scope_result["scope_png"] = _scope_png_public_path(target)
+                scope_result["scope_png_pending"] = False
+                scope_result["scope_png_error"] = None
+                scope_png_ready = True
+            if not scope_png_ready and self._rebuild_scope_png_from_record(
+                scope_result,
+                target,
+                iteration,
+                scope_axis_settings,
+            ):
                 changed = True
-            else:
-                source = _path_from_result_reference(scope_result.get("scope_png"))
-                if source and source.exists():
-                    if source.resolve() != target.resolve():
-                        shutil.copy2(source, target)
-                        changed = True
-                    scope_result["scope_png"] = _scope_png_public_path(target)
             record["scope_result"] = scope_result
 
         bode_result = record.get("bode_result")
@@ -1493,11 +1685,19 @@ class AutotuneRunStore:
             target_data = None
             if data_source and data_source.exists():
                 target_data = files_dir / f"iteration_{iteration:03d}_bode{data_source.suffix}"
-                if data_source.resolve() != target_data.resolve():
-                    shutil.copy2(data_source, target_data)
+                if self._copy_asset_file(data_source, target_data):
                     changed = True
                 bode_result["data_file"] = str(target_data.relative_to(ROOT)).replace("\\", "/")
-            if self._rebuild_bode_png_from_data_file(
+            bode_png_ready = False
+            source = _path_from_result_reference(bode_result.get("bode_png"))
+            if not force_rebuild and source and source.exists() and source.stat().st_size > 0:
+                if self._copy_asset_file(source, target_png):
+                    changed = True
+                bode_result["bode_png"] = _scope_png_public_path(target_png)
+                bode_result["bode_png_pending"] = False
+                bode_result["bode_png_error"] = None
+                bode_png_ready = True
+            if not bode_png_ready and self._rebuild_bode_png_from_data_file(
                 target_data or _path_from_result_reference(bode_result.get("data_file")),
                 target_png,
                 bode_result.get("margins") if isinstance(bode_result.get("margins"), dict) else None,
@@ -1508,13 +1708,6 @@ class AutotuneRunStore:
                 bode_result["bode_png"] = _scope_png_public_path(target_png)
                 bode_result["bode_png_pending"] = False
                 bode_result["bode_png_error"] = None
-            else:
-                source = _path_from_result_reference(bode_result.get("bode_png"))
-                if source and source.exists():
-                    if source.resolve() != target_png.resolve():
-                        shutil.copy2(source, target_png)
-                        changed = True
-                    bode_result["bode_png"] = _scope_png_public_path(target_png)
             record["bode_result"] = bode_result
         return changed
 
@@ -1522,6 +1715,7 @@ class AutotuneRunStore:
         changed = False
         waveforms = scope_result.get("waveforms") if isinstance(scope_result.get("waveforms"), list) else []
         copied: dict[Path, Path] = {}
+        compact_files: dict[Path, bool] = {}
         for waveform in waveforms:
             if not isinstance(waveform, dict):
                 continue
@@ -1529,21 +1723,25 @@ class AutotuneRunStore:
             data_source = _path_from_result_reference(waveform.get("data_file"))
             if not data_source or not data_source.exists():
                 continue
-            try:
-                with np.load(data_source, allow_pickle=False) as payload:
-                    is_compact = "format_version" in payload.files and int(np.asarray(payload["format_version"]).item()) >= 2
-            except Exception:
-                is_compact = False
+            data_source = data_source.resolve()
+            if data_source in copied:
+                waveform["data_file"] = str(copied[data_source].relative_to(ROOT)).replace("\\", "/")
+                continue
+            if data_source not in compact_files:
+                try:
+                    with np.load(data_source, allow_pickle=False) as payload:
+                        compact_files[data_source] = (
+                            "format_version" in payload.files
+                            and int(np.asarray(payload["format_version"]).item()) >= 2
+                        )
+                except Exception:
+                    compact_files[data_source] = False
+            is_compact = compact_files[data_source]
             target_name = f"iteration_{iteration:03d}_scope{data_source.suffix}" if is_compact else f"iteration_{iteration:03d}_scope_{_safe_file_stem(source_label)}{data_source.suffix}"
             target = files_dir / target_name
-            if data_source in copied:
-                target = copied[data_source]
-            elif data_source.resolve() != target.resolve():
-                shutil.copy2(data_source, target)
+            if self._copy_asset_file(data_source, target):
                 changed = True
-                copied[data_source] = target
-            else:
-                copied[data_source] = target
+            copied[data_source] = target
             waveform["data_file"] = str(target.relative_to(ROOT)).replace("\\", "/")
         return changed
 
@@ -1586,7 +1784,7 @@ class AutotuneRunStore:
                 phase_deg=np.asarray(payload["phase_deg"], dtype=np.float64).tolist(),
                 margins=margins,
                 path=target,
-                title=f"Iteration {iteration} - Bode 100 Sweep - Full Data",
+                title=f"Iteration {iteration} - Bode Sweep - Full Data",
             )
         return True
 
@@ -3396,9 +3594,9 @@ def _run_bode_sweep(
         try:
             bode_png_path = RESULTS_DIR / "bode_sweeps" / f"{time.strftime('%Y%m%d_%H%M%S')}_{sweep_id}.png"
             bode_title = (
-                f"Iteration {iteration_number} - Bode 100 Sweep - Full Data"
+                f"Iteration {iteration_number} - Bode Sweep - Full Data"
                 if iteration_number is not None
-                else "Latest Bode 100 Sweep - Full Data"
+                else "Latest Bode Sweep - Full Data"
             )
             if async_artifacts:
                 bode_png = _scope_png_public_path(bode_png_path)
@@ -4241,7 +4439,7 @@ def _plot_full_bode_sweep_png(
     phase_deg: list[float],
     margins: dict | None = None,
     path: Path = LATEST_BODE_PNG,
-    title: str = "Latest Bode 100 Sweep - Full Data",
+    title: str = "Latest Bode Sweep - Full Data",
     figsize: tuple[float, float] = (16, 6),
     dpi: int = 150,
 ) -> str:
@@ -5399,6 +5597,7 @@ def _experiment_from_payload(payload: dict | None) -> AutotuneExperimentConfig:
         drl_collection_plan_id=str(payload.get("drl_collection_plan_id", "")),
         drl_episode_budget=max(1, _int_field(payload, "drl_episode_budget", 15)),
         drl_confirmation_count=max(1, _int_field(payload, "drl_confirmation_count", 3)),
+        drl_hardware_protection_mode=bool(payload.get("drl_hardware_protection_mode", True)),
     )
 
 

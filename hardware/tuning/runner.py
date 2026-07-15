@@ -382,12 +382,10 @@ class PidAutotuneSession:
                         config,
                         optimizer_metadata=self._optimizer_metadata_for(candidate),
                     )
-                    if _is_drl_algorithm(experiment.optimization_algorithm):
-                        with self._lock:
-                            self._stop_requested = True
-                            self._snapshot.state = "paused"
-                            self._snapshot.message = "DRL paused after transient protection recovery."
-                        return False
+                    # A recovered protection event is an invalid hardware
+                    # sample, not a reason to terminate the whole search.
+                    # The failed candidate remains in history with penalty
+                    # 300 so DRL can learn to avoid that region.
                     return keep_running
                 except Exception as recovery_exc:
                     exc = recovery_exc
@@ -527,11 +525,6 @@ def _is_recoverable_transient_failure(exc: Exception) -> bool:
         or "vout safety check failed: read 0.0000" in message
         or "vout write failed: vout safety check failed: read 0.0000" in message
     )
-
-
-def _is_drl_algorithm(value: object) -> bool:
-    normalized = str(value or "").strip().lower()
-    return normalized in {"deep-reinforcement", "drl-collection", "safe-sac"}
 
 
 def _skipped_protection_result(
