@@ -13,7 +13,7 @@ SETTLING_WEIGHT_PER_US = 10.0
 MAX_PENALTY = 300.0
 INVALID_TRANSIENT_PENALTY = MAX_PENALTY
 SUSTAINED_OSCILLATION_MIN_SIGN_CHANGES = 8
-SETTLING_ANALYSIS_VERSION = 15
+SETTLING_ANALYSIS_VERSION = 19
 
 
 @dataclass(frozen=True)
@@ -569,25 +569,27 @@ class ResponseAnalyzer:
             tail_values = waveform.vout_v[max(start_index, end_index - 8) : end_index]
         sorted_tail = sorted(tail_values)
         tail_center = _quantile(sorted_tail, 0.50)
-        # V15 makes the displayed 600 kHz zero-phase LPF the complete Ts decision
+        # V19 makes the displayed 600 kHz zero-phase LPF the complete Ts decision
         # signal. There is no 0.25 us binning and no second 5/9-bin median
         # filter. This keeps a real post-entry dip visible to the settling
         # detector and makes the plotted LPF directly explain the reported Ts.
         if not reference_locked:
             final_value = tail_center
-        # V15 uses a direction-aware asymmetric band. For a voltage-falling
-        # response (CH1 rising), the band is -5/+3 mV. For a voltage-rising
+        # V19 uses a direction-aware asymmetric band. For a voltage-falling
+        # response (CH1 rising), the band is -4/+3 mV. For a voltage-rising
         # response (CH1 falling), it is -3/+5 mV. The 600 kHz trace can
         # graze this band because of normal switching ripple, so the temporal
         # duration/depth qualification below remains responsible for rejecting
         # non-physical threshold chatter.
         if edge == "rising":
-            lower_tolerance = 5.0e-3
+            lower_tolerance = 4.0e-3
             upper_tolerance = 3.0e-3
-            band_schedule = "voltage falling: -5/+3 mV"
+            minimum_exit_depth = 0.0
+            band_schedule = "voltage falling: -4/+3 mV"
         else:
             lower_tolerance = 3.0e-3
             upper_tolerance = 5.0e-3
+            minimum_exit_depth = 0.5e-3
             band_schedule = "voltage rising: -3/+5 mV"
 
         def band_limits(elapsed_s: float) -> tuple[float, float]:
@@ -605,7 +607,7 @@ class ResponseAnalyzer:
             return max(0.0, final_value - value - lower), lower
 
         diagnostics: dict[str, Any] = {
-            "method": "six_hundred_khz_asymmetric_band_reentry_v15",
+            "method": "six_hundred_khz_asymmetric_band_reentry_v19",
             "edge": edge,
             "valid": False,
             "local_steady_v": float(final_value),
@@ -622,7 +624,9 @@ class ResponseAnalyzer:
             "uses_time_bins": False,
             "stable_dwell_us": 1.0,
             "minimum_exit_duration_us": 0.08,
-            "minimum_exit_depth_mv": 0.5,
+            "late_exit_after_us": 5.0,
+            "late_minimum_exit_duration_us": 3.0,
+            "minimum_exit_depth_mv": float(minimum_exit_depth * 1e3),
             "exit_merge_gap_us": 0.05,
             "prominent_reversal_count": 0,
             "main_watch_us": float(main_watch_s * 1e6),
@@ -639,7 +643,6 @@ class ResponseAnalyzer:
                 waveform.time_s[start_index:end_index],
                 waveform.vout_v[start_index:end_index],
             )
-            if time_s - origin_s <= main_watch_s + 1.0e-6 + 1e-12
         ]
         if not watched:
             diagnostics["reason"] = "no 600 kHz LPF samples in the transient window"
@@ -651,6 +654,8 @@ class ResponseAnalyzer:
         saw_initial_outside = False
         first_entry_index: int | None = None
         for index, (elapsed_s, value) in enumerate(watched):
+            if elapsed_s > main_watch_s + 1e-12:
+                break
             if outside_band(elapsed_s, value):
                 saw_initial_outside = True
             elif saw_initial_outside:
@@ -683,9 +688,13 @@ class ResponseAnalyzer:
 
         # A 600 kHz trace can graze a numeric band edge for a few nanoseconds.
         # That is neither a physical second lobe nor a useful definition of
-        # settling. Merge threshold chatter, then require both meaningful time
-        # outside the band and meaningful depth beyond it. This is temporal
-        # qualification of the original 600 kHz samples, not binning/filtering.
+        # settling. Merge threshold chatter, then require meaningful time
+        # outside the band. For the tighter voltage-falling band, any sustained
+        # excursion counts regardless of depth so a visibly out-of-band
+        # undershoot cannot be hidden by a second amplitude threshold. The
+        # voltage-rising path retains its 0.5 mV noise allowance. This is
+        # temporal qualification of the original 600 kHz samples, not
+        # binning/filtering.
         merged_excursions: list[tuple[int, int]] = []
         for exit_index, reentry_index in raw_excursions:
             if (
@@ -710,11 +719,18 @@ class ResponseAnalyzer:
             extreme_time_s, extreme_value = cluster[extreme_offset]
             duration_s = watched[reentry_index][0] - watched[exit_index][0]
             depth_v, extreme_tolerance = depth_beyond_band(extreme_time_s, extreme_value)
-            qualified = duration_s + sample_dt >= 0.08e-6 and depth_v >= 0.5e-3 - 1e-12
+            required_duration_s = (
+                3.0e-6 if watched[exit_index][0] >= 5.0e-6 - sample_dt else 0.08e-6
+            )
+            qualified = (
+                duration_s + sample_dt >= required_duration_s
+                and depth_v >= minimum_exit_depth - 1e-12
+            )
             detail = {
                 "exit_us": float(watched[exit_index][0] * 1e6),
                 "reentry_us": float(watched[reentry_index][0] * 1e6),
                 "duration_us": float(duration_s * 1e6),
+                "required_duration_us": float(required_duration_s * 1e6),
                 "extreme_us": float(extreme_time_s * 1e6),
                 "extreme_mv_from_steady": float((extreme_value - final_value) * 1e3),
                 "depth_beyond_band_mv": float(depth_v * 1e3),

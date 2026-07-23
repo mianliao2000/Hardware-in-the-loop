@@ -83,6 +83,7 @@ from hardware.tuning import (
     Waveform,
     automatic_search_parameter,
 )
+from hardware.tuning.analyzer import SETTLING_ANALYSIS_VERSION
 from hardware.tuning.drl import DrlWorkflowManager
 
 
@@ -5411,8 +5412,14 @@ def _plot_full_scope_capture_png(
     right_ax.spines["right"].set_color(right_color)
     left_ax.grid(True, color="#d9dee7", linewidth=0.8, alpha=0.8)
     settling_metrics = entry.get("settling_metrics")
-    if not isinstance(settling_metrics, ResponseMetrics):
-        settling_metrics = _scope_response_metrics_from_plot_channels(channels)
+    if (
+        not isinstance(settling_metrics, ResponseMetrics)
+        or int(getattr(settling_metrics, "settling_analysis_version", 0) or 0)
+        < SETTLING_ANALYSIS_VERSION
+    ):
+        current_metrics = _scope_response_metrics_from_plot_channels(channels)
+        if current_metrics is not None:
+            settling_metrics = current_metrics
     _draw_scope_settling_markers(
         left_ax,
         channels=channels,

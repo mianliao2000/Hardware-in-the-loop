@@ -795,7 +795,7 @@ class TuningFrameworkTest(unittest.TestCase):
 
         self.assertLess(metrics.undershoot_settling_time_s, 8e-6)
 
-    def test_settling_v15_uses_direction_aware_asymmetric_band(self) -> None:
+    def test_settling_v19_uses_direction_aware_asymmetric_band(self) -> None:
         dt = 0.05e-6
         time_s = [(index - 40) * dt for index in range(2140)]
         input_v: list[float] = []
@@ -833,19 +833,23 @@ class TuningFrameworkTest(unittest.TestCase):
             Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v)
         )
 
-        self.assertEqual(metrics.settling_analysis_version, 15)
+        self.assertEqual(metrics.settling_analysis_version, 19)
         self.assertGreater(metrics.undershoot_settling_time_s, 3.3e-6)
         self.assertLess(metrics.undershoot_settling_time_s, 3.5e-6)
-        self.assertGreater(metrics.overshoot_settling_time_s, 6.4e-6)
-        self.assertLess(metrics.overshoot_settling_time_s, 6.8e-6)
-        self.assertEqual(metrics.settling_diagnostics["undershoot"]["lower_tolerance_mv"], 5.0)
+        self.assertGreater(metrics.overshoot_settling_time_s, 1.2e-6)
+        self.assertLess(metrics.overshoot_settling_time_s, 1.3e-6)
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["lower_tolerance_mv"], 4.0)
         self.assertEqual(metrics.settling_diagnostics["undershoot"]["upper_tolerance_mv"], 3.0)
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["minimum_exit_depth_mv"], 0.0)
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["late_exit_after_us"], 5.0)
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["late_minimum_exit_duration_us"], 3.0)
         self.assertEqual(metrics.settling_diagnostics["overshoot"]["lower_tolerance_mv"], 3.0)
         self.assertEqual(metrics.settling_diagnostics["overshoot"]["upper_tolerance_mv"], 5.0)
+        self.assertEqual(metrics.settling_diagnostics["overshoot"]["minimum_exit_depth_mv"], 0.5)
         self.assertIsNone(metrics.settling_diagnostics["undershoot"]["band_ramp_start_us"])
         self.assertIsNone(metrics.settling_diagnostics["undershoot"]["band_ramp_stop_us"])
         self.assertEqual(metrics.settling_diagnostics["undershoot"]["decision_filter_hz"], 600_000.0)
-        self.assertEqual(metrics.settling_diagnostics["undershoot"]["band_schedule"], "voltage falling: -5/+3 mV")
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["band_schedule"], "voltage falling: -4/+3 mV")
         self.assertEqual(metrics.settling_diagnostics["overshoot"]["band_schedule"], "voltage rising: -3/+5 mV")
 
     def test_iteration_1728_uses_final_entry_not_first_entry(self) -> None:
@@ -874,6 +878,92 @@ class TuningFrameworkTest(unittest.TestCase):
         self.assertLess(metrics.undershoot_settling_time_s, 2.8e-6)
         self.assertGreater(metrics.overshoot_settling_time_s, 7.3e-6)
         self.assertLess(metrics.overshoot_settling_time_s, 7.6e-6)
+
+    def test_iteration_1775_captures_four_mv_undershoot_reentry(self) -> None:
+        artifact = Path(
+            "results/autotune_runs/saved/Permanent_2026-07-21_02/files/iteration_1775_scope.npz"
+        )
+        if not artifact.is_file():
+            self.skipTest("iteration 1775 scope artifact is not available")
+        with np.load(artifact, allow_pickle=False) as payload:
+            points = int(payload["points"])
+            time_s = (
+                float(payload["x_start"])
+                + np.arange(points, dtype=np.float64) * float(payload["x_increment"])
+            )
+            waveform = Waveform(
+                time_s=time_s.tolist(),
+                vout_v=np.asarray(payload["y_CH3"], dtype=np.float64).tolist(),
+                input_v=np.asarray(payload["y_CH1"], dtype=np.float64).tolist(),
+            )
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(waveform)
+        diagnostics = metrics.settling_diagnostics["undershoot"]
+
+        self.assertTrue(metrics.undershoot_settling_valid)
+        self.assertGreater(metrics.undershoot_settling_time_s, 1.7e-6)
+        self.assertLess(metrics.undershoot_settling_time_s, 1.9e-6)
+        self.assertEqual(diagnostics["lower_tolerance_mv"], 4.0)
+        self.assertEqual(diagnostics["minimum_exit_depth_mv"], 0.0)
+        self.assertEqual(diagnostics["secondary_excursion_count"], 1)
+
+    def test_iteration_72_ignores_late_excursion_shorter_than_three_us(self) -> None:
+        artifact = Path(
+            "results/autotune_runs/saved/Permanent_2026-07-21_02/files/iteration_072_scope.npz"
+        )
+        if not artifact.is_file():
+            self.skipTest("iteration 72 scope artifact is not available")
+        with np.load(artifact, allow_pickle=False) as payload:
+            points = int(payload["points"])
+            time_s = (
+                float(payload["x_start"])
+                + np.arange(points, dtype=np.float64) * float(payload["x_increment"])
+            )
+            waveform = Waveform(
+                time_s=time_s.tolist(),
+                vout_v=np.asarray(payload["y_CH3"], dtype=np.float64).tolist(),
+                input_v=np.asarray(payload["y_CH1"], dtype=np.float64).tolist(),
+            )
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(waveform)
+        diagnostics = metrics.settling_diagnostics["undershoot"]
+
+        self.assertTrue(metrics.undershoot_settling_valid)
+        self.assertGreater(metrics.undershoot_settling_time_s, 1.0e-6)
+        self.assertLess(metrics.undershoot_settling_time_s, 1.1e-6)
+        self.assertAlmostEqual(diagnostics["first_entry_us"], 1.06624, places=5)
+        self.assertEqual(diagnostics["late_minimum_exit_duration_us"], 3.0)
+        self.assertEqual(diagnostics["secondary_excursion_count"], 0)
+        self.assertEqual(diagnostics["rejected_band_graze_count"], 1)
+
+    def test_iteration_74_ignores_two_us_late_excursion(self) -> None:
+        artifact = Path(
+            "results/autotune_runs/saved/Permanent_2026-07-21_02/files/iteration_074_scope.npz"
+        )
+        if not artifact.is_file():
+            self.skipTest("iteration 74 scope artifact is not available")
+        with np.load(artifact, allow_pickle=False) as payload:
+            points = int(payload["points"])
+            time_s = (
+                float(payload["x_start"])
+                + np.arange(points, dtype=np.float64) * float(payload["x_increment"])
+            )
+            waveform = Waveform(
+                time_s=time_s.tolist(),
+                vout_v=np.asarray(payload["y_CH3"], dtype=np.float64).tolist(),
+                input_v=np.asarray(payload["y_CH1"], dtype=np.float64).tolist(),
+            )
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(waveform)
+        diagnostics = metrics.settling_diagnostics["undershoot"]
+
+        self.assertTrue(metrics.undershoot_settling_valid)
+        self.assertGreater(metrics.undershoot_settling_time_s, 1.0e-6)
+        self.assertLess(metrics.undershoot_settling_time_s, 1.1e-6)
+        self.assertAlmostEqual(diagnostics["first_entry_us"], 1.01136, places=5)
+        self.assertEqual(diagnostics["late_minimum_exit_duration_us"], 3.0)
+        self.assertEqual(diagnostics["secondary_excursion_count"], 0)
+        self.assertEqual(diagnostics["rejected_band_graze_count"], 1)
 
     def test_iteration_298_uses_six_hundred_khz_asymmetric_band(self) -> None:
         artifact = Path(
@@ -957,12 +1047,12 @@ class TuningFrameworkTest(unittest.TestCase):
         self.assertGreater(diagnostics["first_entry_us"], 1.0)
         self.assertLess(diagnostics["first_entry_us"], 1.2)
         self.assertFalse(diagnostics["uses_time_bins"])
-        self.assertEqual(diagnostics["lower_tolerance_mv"], 5.0)
+        self.assertEqual(diagnostics["lower_tolerance_mv"], 4.0)
         self.assertEqual(diagnostics["upper_tolerance_mv"], 3.0)
         self.assertEqual(diagnostics["prominent_reversal_count"], 0)
         self.assertEqual(diagnostics["secondary_excursion_count"], 0)
 
-    def test_settling_v15_filters_high_frequency_tail_without_false_invalid(self) -> None:
+    def test_settling_v19_filters_high_frequency_tail_without_false_invalid(self) -> None:
         dt = 0.1e-6
         time_s = [(index - 20) * dt for index in range(1070)]
         input_v: list[float] = []
