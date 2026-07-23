@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
+from dataclasses import replace
 
-from .models import HARDWARE_TUNING_FIELD_NAMES, HardwarePidCandidate, IterationRecord, SearchParameter, SearchSpace
+from .models import (
+    HARDWARE_TUNING_FIELD_NAMES,
+    HardwarePidCandidate,
+    IterationRecord,
+    SearchParameter,
+    SearchSpace,
+    hardware_candidate_key as model_hardware_candidate_key,
+)
+
+
+BASIN_QUALITY_POOL_MULTIPLIER = 6
+CONFIRMED_PASS_COUNT = 3
 
 
 @dataclass(frozen=True)
@@ -86,6 +99,17 @@ class HardwareGridHeuristicTuner:
             if record.candidate is not None:
                 self._seen.add(hardware_candidate_key(record.candidate))
 
+        confirmation = _confirmation_streak_for_last(history)
+        if history and history[-1].metrics.passed and 0 < confirmation < CONFIRMED_PASS_COUNT:
+            candidate = history[-1].candidate
+            if candidate is not None:
+                return replace(candidate, phase="grid_confirm")
+        if confirmation >= CONFIRMED_PASS_COUNT:
+            climb = _next_higher_bandwidth_candidate(history, self.search, self._seen)
+            if climb is not None:
+                self._seen.add(hardware_candidate_key(climb))
+                return climb
+
         while True:
             if self._queue:
                 candidate = self._queue.pop(0)
@@ -131,6 +155,7 @@ class HardwareGridHeuristicTuner:
             name: _range_values(_range_for(self.search, name), name)
             for name in HARDWARE_TUNING_FIELD_NAMES
         }
+        value_sets["mod0_ll_bw"] = sorted(value_sets["mod0_ll_bw"], reverse=True)
         if target_count is None:
             target_count = max(0, _coarse_iteration_budget(self.search) - 1)
         return _sample_coordinate_combinations(center, value_sets, max(0, target_count))
@@ -192,10 +217,15 @@ class HardwareGridHeuristicTuner:
             if _is_int_field(name):
                 step = max(1.0, step)
             center = getattr(base, name)
-            for value in (
-                _typed_value(name, parameter.clamped(center - step)),
-                _typed_value(name, parameter.clamped(center + step)),
-            ):
+            values = (
+                (_typed_value(name, parameter.clamped(center + step)),)
+                if name == "mod0_ll_bw"
+                else (
+                    _typed_value(name, parameter.clamped(center - step)),
+                    _typed_value(name, parameter.clamped(center + step)),
+                )
+            )
+            for value in values:
                 candidates.append(_candidate_with(base, name, value, "local_refine"))
         return candidates
 
@@ -204,9 +234,199 @@ def select_best_result(records: list[IterationRecord]) -> IterationRecord | None
     if not records:
         return None
     valid = [record for record in records if not _is_invalid_hardware_record(record)]
+    objective_eligible = [record for record in valid if _has_bandwidth_objective(record)]
+    if objective_eligible:
+        valid = objective_eligible
+    confirmed_best = select_confirmed_best_result(valid)
+    if confirmed_best is not None:
+        return confirmed_best
     passing = [record for record in valid if record.metrics.passed]
     pool = passing or valid or records
     return min(pool, key=_record_priority)
+
+
+def select_confirmed_best_result(records: list[IterationRecord]) -> IterationRecord | None:
+    valid = [record for record in records if not _is_invalid_hardware_record(record)]
+    objective_eligible = [record for record in valid if _has_bandwidth_objective(record)]
+    if objective_eligible:
+        valid = objective_eligible
+    confirmed = _confirmed_candidate_groups(valid)
+    if not confirmed:
+        return None
+    _, measurements = min(
+        confirmed.items(),
+        key=lambda item: _aggregate_candidate_priority(item[1]),
+    )
+    return _aggregate_representative(measurements)
+
+
+def select_diverse_results(records: list[IterationRecord], limit: int = 5) -> list[IterationRecord]:
+    """Return low-penalty representatives from distinct hardware-search basins."""
+
+    valid = [record for record in records if record.candidate is not None and not _is_invalid_hardware_record(record)]
+    # A partially migrated archive can contain both first-entry V1 labels and
+    # final-entry V2 labels. Once V2 measurements exist, never let an old
+    # false-fast Ts displace them in the Quality Basin panel.
+    latest_settling_version = max(
+        (int(record.metrics.settling_analysis_version or 0) for record in valid),
+        default=0,
+    )
+    if latest_settling_version >= 2:
+        valid = [
+            record
+            for record in valid
+            if int(record.metrics.settling_analysis_version or 0) == latest_settling_version
+        ]
+    objective_eligible = [record for record in valid if _has_bandwidth_objective(record)]
+    if objective_eligible:
+        valid = objective_eligible
+    confirmed = _confirmed_candidate_groups(valid)
+    aggregate_priorities: dict[tuple, tuple] = {}
+    if confirmed:
+        ranked = []
+        for key, measurements in confirmed.items():
+            aggregate_priorities[key] = _aggregate_candidate_priority(measurements)
+            ranked.append(_aggregate_representative(measurements))
+        ranked.sort(key=lambda record: aggregate_priorities[hardware_candidate_key(record.candidate)])
+        # Confirmed candidates own the highest ranking tier, but they should
+        # not make a "Top 5" panel contain fewer than five entries. Fill the
+        # remaining slots with the best single-pass candidates and then failed
+        # candidates, while keeping duplicate hardware keys out.
+        confirmed_keys = set(confirmed)
+        ranked.extend(
+            sorted(
+                (
+                    record
+                    for record in valid
+                    if hardware_candidate_key(record.candidate) not in confirmed_keys
+                ),
+                key=_basin_priority,
+            )
+        )
+    else:
+        ranked = sorted(valid, key=_basin_priority)
+    unique_ranked: list[IterationRecord] = []
+    ranked_keys: set[tuple] = set()
+    for record in ranked:
+        candidate = record.candidate
+        if candidate is None:
+            continue
+        key = hardware_candidate_key(candidate)
+        if key in ranked_keys:
+            continue
+        ranked_keys.add(key)
+        unique_ranked.append(record)
+
+    safe_limit = max(0, int(limit))
+    # Diversity is useful only among reasonably good results. Restricting the
+    # search to the best N penalties prevents a distant but poor region from
+    # displacing a much better nearby basin.
+    quality_pool_size = max(safe_limit, safe_limit * BASIN_QUALITY_POOL_MULTIPLIER)
+    quality_pool = unique_ranked[:quality_pool_size]
+    selected: list[IterationRecord] = []
+    selected_keys: set[tuple] = set()
+    for minimum_distance in (0.18, 0.10, 0.0):
+        for record in quality_pool:
+            if len(selected) >= safe_limit:
+                return _sort_selected_basins(selected, aggregate_priorities)
+            candidate = record.candidate
+            if candidate is None:
+                continue
+            key = hardware_candidate_key(candidate)
+            if key in selected_keys:
+                continue
+            vector = _diversity_vector(candidate)
+            if minimum_distance > 0 and any(
+                _euclidean_distance(vector, _diversity_vector(item.candidate)) < minimum_distance
+                for item in selected
+                if item.candidate is not None
+            ):
+                continue
+            selected.append(record)
+            selected_keys.add(key)
+    return _sort_selected_basins(selected, aggregate_priorities)
+
+
+def _confirmed_candidate_groups(
+    records: list[IterationRecord],
+    required: int = CONFIRMED_PASS_COUNT,
+) -> dict[tuple, list[IterationRecord]]:
+    """Return candidates with at least ``required`` consecutive passing measurements."""
+
+    confirmed_keys: set[tuple] = set()
+    previous_key: tuple | None = None
+    streak = 0
+    for record in records:
+        candidate = record.candidate
+        key = hardware_candidate_key(candidate) if candidate is not None else None
+        if record.metrics.passed and key is not None and key == previous_key:
+            streak += 1
+        elif record.metrics.passed and key is not None:
+            streak = 1
+        else:
+            streak = 0
+        previous_key = key
+        if key is not None and streak >= max(1, int(required)):
+            confirmed_keys.add(key)
+
+    grouped: dict[tuple, list[IterationRecord]] = {key: [] for key in confirmed_keys}
+    for record in records:
+        if record.candidate is None:
+            continue
+        key = hardware_candidate_key(record.candidate)
+        if key in grouped:
+            grouped[key].append(record)
+    return grouped
+
+
+def _aggregate_candidate_priority(records: list[IterationRecord]) -> tuple:
+    scores = [float(record.metrics.score) for record in records]
+    objectives = [_record_objective_score(record) for record in records]
+    failure_rate = sum(not record.metrics.passed for record in records) / max(1, len(records))
+    worst_transient = [max(record.metrics.overshoot_pct, record.metrics.undershoot_pct) for record in records]
+    settling = [float(record.metrics.settling_time_s) for record in records]
+    return (
+        float(statistics.median(objectives)),
+        -float(records[0].candidate.mod0_ll_bw) if records[0].candidate is not None else 0.0,
+        float(statistics.median(scores)),
+        failure_rate,
+        max(scores),
+        float(statistics.median(worst_transient)),
+        float(statistics.median(settling)),
+        min(record.iteration for record in records),
+    )
+
+
+def _aggregate_representative(records: list[IterationRecord]) -> IterationRecord:
+    median_score = float(statistics.median(_record_objective_score(record) for record in records))
+    return min(
+        records,
+        key=lambda record: (
+            abs(_record_objective_score(record) - median_score),
+            0 if record.metrics.passed else 1,
+            _record_priority(record),
+        ),
+    )
+
+
+def _sort_selected_basins(
+    records: list[IterationRecord],
+    aggregate_priorities: dict[tuple, tuple],
+) -> list[IterationRecord]:
+    if not aggregate_priorities:
+        return sorted(records, key=_basin_priority)
+
+    def priority(record: IterationRecord) -> tuple:
+        aggregate = aggregate_priorities.get(hardware_candidate_key(record.candidate))
+        if aggregate is not None:
+            return (0, *aggregate)
+        basin = _basin_priority(record)
+        return (1 if record.metrics.passed else 2, *basin[1:])
+
+    return sorted(
+        records,
+        key=priority,
+    )
 
 
 def _total_iteration_budget(search: SearchSpace) -> int:
@@ -239,16 +459,7 @@ def _coarse_phase_budgets(search: SearchSpace) -> tuple[int, int]:
 
 
 def hardware_candidate_key(candidate: HardwarePidCandidate) -> tuple:
-    return (
-        int(candidate.mod0_kp),
-        int(candidate.mod0_ki),
-        int(candidate.mod0_kd),
-        int(candidate.mod0_kpole1),
-        int(candidate.mod0_kpole2),
-        int(candidate.mod0_cm_gain),
-        round(float(candidate.output_inductance_nh), 6),
-        round(float(candidate.effective_lc_inductance_nh), 6),
-    )
+    return model_hardware_candidate_key(candidate)
 
 
 def _dedupe_candidates(candidates: list[HardwarePidCandidate], seen: set[tuple]) -> list[HardwarePidCandidate]:
@@ -273,10 +484,6 @@ def _sample_coordinate_combinations(
     if target_count <= 0:
         return []
     fields = [name for name in HARDWARE_TUNING_FIELD_NAMES if len(value_sets.get(name, [])) > 1]
-    # kpole1 and kpole2 are written as a coupled pair. Treating them as separate
-    # dimensions creates duplicate candidates and wastes coarse iterations.
-    if "mod0_kpole1" in fields and "mod0_kpole2" in fields:
-        fields.remove("mod0_kpole2")
     if not fields:
         return []
 
@@ -287,12 +494,7 @@ def _sample_coordinate_combinations(
         nonlocal candidates
         values = {field: getattr(center, field) for field in HARDWARE_TUNING_FIELD_NAMES}
         for field, value in values_by_field.items():
-            if field in {"mod0_kpole1", "mod0_kpole2"}:
-                kpole_value = _kpole_pair_value(float(value))
-                values["mod0_kpole1"] = kpole_value
-                values["mod0_kpole2"] = kpole_value
-            else:
-                values[field] = _typed_value(field, value)
+            values[field] = _typed_value(field, value)
         candidate = HardwarePidCandidate(**values, phase="coordinate")
         key = hardware_candidate_key(candidate)
         if key == hardware_candidate_key(center) or key in local_seen:
@@ -387,15 +589,109 @@ def _radical_inverse(index: int, base: int) -> float:
         factor /= base
     return result
 
-def _record_priority(record: IterationRecord) -> tuple[float, float, float, int, float, int]:
+def _record_priority(record: IterationRecord) -> tuple:
     metrics = record.metrics
     if _is_invalid_hardware_record(record):
         return (2.0, metrics.score, max(metrics.overshoot_pct, metrics.undershoot_pct), metrics.oscillations, metrics.settling_time_s, record.iteration)
     if metrics.passed:
-        balance = metrics.overshoot_pct**2 + metrics.undershoot_pct**2
-        worst = max(metrics.overshoot_pct, metrics.undershoot_pct)
-        return (0.0, balance, worst, metrics.oscillations, metrics.settling_time_s, record.iteration)
+        bandwidth = record.candidate.mod0_ll_bw if record.candidate is not None else 0
+        return (0.0, _record_objective_score(record), -bandwidth, metrics.score, record.iteration)
     return (1.0, metrics.score, max(metrics.overshoot_pct, metrics.undershoot_pct), metrics.oscillations, metrics.settling_time_s, record.iteration)
+
+
+def _basin_priority(record: IterationRecord) -> tuple:
+    """Rank basin representatives by measured penalty before tie-break metrics."""
+
+    metrics = record.metrics
+    return (
+        0 if metrics.passed else 1,
+        _record_objective_score(record) if metrics.passed else metrics.score,
+        -(record.candidate.mod0_ll_bw if record.candidate is not None else 0),
+        metrics.score,
+        max(metrics.overshoot_pct, metrics.undershoot_pct),
+        metrics.oscillations,
+        metrics.settling_time_s,
+        record.iteration,
+    )
+
+
+def _has_bandwidth_objective(record: IterationRecord) -> bool:
+    try:
+        return math.isfinite(float(record.objective_score)) and math.isfinite(float(record.bandwidth_bonus))
+    except (TypeError, ValueError):
+        return False
+
+
+def _record_objective_score(record: IterationRecord) -> float:
+    value = record.objective_score
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(record.metrics.score)
+    return parsed if math.isfinite(parsed) else float(record.metrics.score)
+
+
+def _confirmation_streak_for_last(records: list[IterationRecord]) -> int:
+    if not records or not records[-1].metrics.passed or records[-1].candidate is None:
+        return 0
+    key = hardware_candidate_key(records[-1].candidate)
+    streak = 0
+    for record in reversed(records):
+        if record.candidate is None or not record.metrics.passed or hardware_candidate_key(record.candidate) != key:
+            break
+        streak += 1
+    return streak
+
+
+def _candidate_key_without_bandwidth(candidate: HardwarePidCandidate) -> tuple:
+    key = list(hardware_candidate_key(candidate))
+    del key[6]
+    return tuple(key)
+
+
+def _next_higher_bandwidth_candidate(
+    records: list[IterationRecord],
+    search: SearchSpace,
+    seen: set[tuple],
+) -> HardwarePidCandidate | None:
+    current_record = records[-1]
+    current = current_record.candidate
+    if current is None or not _has_bandwidth_objective(current_record):
+        return None
+    base_key = _candidate_key_without_bandwidth(current)
+    lower_confirmed = [
+        record
+        for record in records[:-CONFIRMED_PASS_COUNT]
+        if record.candidate is not None
+        and record.candidate.mod0_ll_bw < current.mod0_ll_bw
+        and _candidate_key_without_bandwidth(record.candidate) == base_key
+        and _confirmation_streak_ending_at(records, record.iteration) >= CONFIRMED_PASS_COUNT
+    ]
+    if lower_confirmed and _record_objective_score(current_record) >= min(
+        _record_objective_score(record) for record in lower_confirmed
+    ):
+        return None
+    # LS/LR bandwidth is a monotonic constrained objective, not a generic
+    # coarse-grid coordinate. Probe every raw register code so a coarse GUI
+    # resolution cannot skip a feasible boundary (for example 76 -> 79).
+    higher = int(current.mod0_ll_bw) + 1
+    if higher > int(math.floor(search.mod0_ll_bw.max)):
+        return None
+    candidate = replace(current, mod0_ll_bw=higher, phase="bandwidth_climb")
+    return None if hardware_candidate_key(candidate) in seen else candidate
+
+
+def _confirmation_streak_ending_at(records: list[IterationRecord], iteration: int) -> int:
+    index = next((i for i, record in enumerate(records) if record.iteration == iteration), -1)
+    if index < 0 or records[index].candidate is None or not records[index].metrics.passed:
+        return 0
+    key = hardware_candidate_key(records[index].candidate)
+    streak = 0
+    for record in reversed(records[: index + 1]):
+        if record.candidate is None or not record.metrics.passed or hardware_candidate_key(record.candidate) != key:
+            break
+        streak += 1
+    return streak
 
 
 def _is_invalid_hardware_record(record: IterationRecord) -> bool:
@@ -408,7 +704,8 @@ def _is_invalid_hardware_record(record: IterationRecord) -> bool:
         or "second 0 db crossover" in reasons
     ):
         return True
-    return math.isfinite(record.metrics.score) and record.metrics.score >= 1.0e6
+    score = float(record.metrics.score)
+    return not math.isfinite(score) or score >= 300.0
 
 
 def _linspace(start: float, stop: float, count: int) -> list[float]:
@@ -441,6 +738,12 @@ def _range_values(parameter: SearchParameter, name: str) -> list[float]:
     else:
         step = (parameter.max - parameter.min) / (points - 1)
         values.extend(parameter.min + step * index for index in range(points))
+    if name in {"mod0_kpole1", "mod0_kpole2"}:
+        values.extend(
+            value
+            for value in (2, 3, 4, 5, 6)
+            if parameter.min <= value <= parameter.max
+        )
     deduped: list[float] = []
     seen: set[float | int] = set()
     for value in values:
@@ -475,17 +778,12 @@ def _parameter_step(parameter: SearchParameter, name: str) -> float:
 def _candidate_with(base: HardwarePidCandidate, name: str, value: float, phase: str) -> HardwarePidCandidate:
     values = {field: getattr(base, field) for field in HARDWARE_TUNING_FIELD_NAMES}
     typed_value = _typed_value(name, _range_value_for_base(base, name, value))
-    if name in {"mod0_kpole1", "mod0_kpole2"}:
-        kpole_value = _kpole_pair_value(float(typed_value))
-        values["mod0_kpole1"] = kpole_value
-        values["mod0_kpole2"] = kpole_value
-    else:
-        values[name] = typed_value
+    values[name] = typed_value
     return HardwarePidCandidate(**values, phase=phase)
 
 
-def _kpole_pair_value(value: float) -> int:
-    return 3 if abs(value - 3) <= abs(value - 6) else 6
+def _kpole_value(value: float) -> int:
+    return min((2, 3, 4, 5, 6), key=lambda option: abs(float(value) - option))
 
 
 def _range_value_for_base(base: HardwarePidCandidate, name: str, value: float) -> float:
@@ -497,11 +795,19 @@ def _range_value_for_base(base: HardwarePidCandidate, name: str, value: float) -
     if name in {"mod0_kpole1", "mod0_kpole2"}:
         return min(max(value, 0), 15)
     if name == "mod0_cm_gain":
+        return min(max(value, 0), 9)
+    if name == "mod0_ll_bw":
         return min(max(value, 0), 127)
     return value
 
 
 def _typed_value(name: str, value: float) -> int | float:
+    if name in {"mod0_kpole1", "mod0_kpole2"}:
+        return _kpole_value(value)
+    if name == "mod0_cm_gain":
+        return int(round(min(max(value, 0), 9)))
+    if name == "mod0_ll_bw":
+        return int(round(min(max(value, 0), 127)))
     if _is_int_field(name):
         return int(round(value))
     return float(value)
@@ -509,6 +815,24 @@ def _typed_value(name: str, value: float) -> int | float:
 
 def _is_int_field(name: str) -> bool:
     return name.startswith("mod0_")
+
+
+def _diversity_vector(candidate: HardwarePidCandidate) -> tuple[float, ...]:
+    return (
+        candidate.mod0_kp / 255.0,
+        candidate.mod0_ki / 255.0,
+        candidate.mod0_kd / 255.0,
+        (candidate.mod0_kpole1 - 2.0) / 4.0,
+        (candidate.mod0_kpole2 - 2.0) / 4.0,
+        candidate.mod0_cm_gain / 9.0,
+        (candidate.mod0_ll_bw - 47.0) / 32.0,
+        candidate.output_inductance_nh / 40.0,
+        candidate.effective_lc_inductance_nh / 150.0,
+    )
+
+
+def _euclidean_distance(first: tuple[float, ...], second: tuple[float, ...]) -> float:
+    return math.sqrt(sum((left - right) ** 2 for left, right in zip(first, second)))
 
 
 def _rank_coordinate_fields(history: list[IterationRecord]) -> list[str]:

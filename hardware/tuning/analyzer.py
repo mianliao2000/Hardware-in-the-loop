@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Any
 
 from .models import ResponseMetrics, TuningTargets, Waveform
 
 
 SETTLING_WEIGHT_PER_US = 10.0
+MAX_PENALTY = 300.0
+INVALID_TRANSIENT_PENALTY = MAX_PENALTY
+SUSTAINED_OSCILLATION_MIN_SIGN_CHANGES = 8
+SETTLING_ANALYSIS_VERSION = 15
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,16 @@ class _DynamicStepMetrics:
     oscillations: int
     low_load_steady_v: float | None
     high_load_steady_v: float | None
+    overshoot_settling_valid: bool
+    undershoot_settling_valid: bool
+    settling_diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _SettlingResult:
+    time_s: float
+    valid: bool
+    diagnostics: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -50,7 +65,7 @@ class _TrendBin:
 
 
 class ResponseAnalyzer:
-    RESPONSE_LOWPASS_CUTOFF_HZ = 5_000_000.0
+    RESPONSE_LOWPASS_CUTOFF_HZ = 600_000.0
 
     def __init__(self, targets: TuningTargets):
         self.targets = targets
@@ -66,6 +81,11 @@ class ResponseAnalyzer:
         analysis_waveform = self._lowpass_response_waveform(waveform)
         dynamic_metrics = self._dynamic_step_metrics(analysis_waveform)
         if dynamic_metrics is None:
+            # Without a debounced CH1 edge this remains the legacy whole-trace
+            # fallback.  Do not label it as V2, otherwise it could leak into
+            # the V2-only DRL training set despite never running the final-entry
+            # step analysis below.
+            settling_analysis_version = 1
             max_v = max(analysis_waveform.vout_v)
             min_v = min(analysis_waveform.vout_v)
             overshoot = max(0.0, (max_v - target) / target * 100.0)
@@ -76,7 +96,11 @@ class ResponseAnalyzer:
             oscillations = self._oscillation_count(analysis_waveform, target)
             low_load_steady_v = None
             high_load_steady_v = None
+            overshoot_settling_valid = True
+            undershoot_settling_valid = True
+            settling_diagnostics: dict[str, Any] = {}
         else:
+            settling_analysis_version = SETTLING_ANALYSIS_VERSION
             overshoot = dynamic_metrics.overshoot_pct
             undershoot = dynamic_metrics.undershoot_pct
             settling_time = dynamic_metrics.settling_time_s
@@ -85,31 +109,70 @@ class ResponseAnalyzer:
             oscillations = dynamic_metrics.oscillations
             low_load_steady_v = dynamic_metrics.low_load_steady_v
             high_load_steady_v = dynamic_metrics.high_load_steady_v
-        score = score_metrics(
-            overshoot,
-            undershoot,
-            oscillations,
-            overshoot_settling_time,
-            undershoot_settling_time,
-            self.targets,
+            overshoot_settling_valid = dynamic_metrics.overshoot_settling_valid
+            undershoot_settling_valid = dynamic_metrics.undershoot_settling_valid
+            settling_diagnostics = dynamic_metrics.settling_diagnostics
+        sustained_oscillation = (
+            dynamic_metrics is not None
+            and oscillations >= SUSTAINED_OSCILLATION_MIN_SIGN_CHANGES
+            and self._has_sustained_oscillation(analysis_waveform)
         )
-        passed = (
-            overshoot <= self.targets.overshoot_pct
-            and undershoot <= self.targets.undershoot_pct
-            and overshoot_settling_time <= self.targets.settling_time_s
-            and undershoot_settling_time <= self.targets.settling_time_s
-        )
+        if sustained_oscillation:
+            # Invalid responses have no meaningful settling time. Keep numeric
+            # zeros for backward-compatible serialization; pass_reasons marks
+            # both Ts values as unavailable to the plot and GUI.
+            settling_time = 0.0
+            overshoot_settling_time = 0.0
+            undershoot_settling_time = 0.0
+            score = INVALID_TRANSIENT_PENALTY
+            passed = False
+            overshoot_settling_valid = False
+            undershoot_settling_valid = False
+            pass_reasons = [f"invalid transient waveform: sustained oscillation ({oscillations} crossings)"]
+        elif not overshoot_settling_valid or not undershoot_settling_valid:
+            score = INVALID_TRANSIENT_PENALTY
+            passed = False
+            invalid_edges = []
+            if not overshoot_settling_valid:
+                invalid_edges.append("OS")
+            if not undershoot_settling_valid:
+                invalid_edges.append("US")
+            pass_reasons = [
+                "invalid transient waveform: no reliable final settling dwell "
+                f"for {'/'.join(invalid_edges)}"
+            ]
+        else:
+            score = score_metrics(
+                overshoot,
+                undershoot,
+                oscillations,
+                overshoot_settling_time,
+                undershoot_settling_time,
+                self.targets,
+            )
+            passed = (
+                overshoot <= self.targets.overshoot_pct
+                and undershoot <= self.targets.undershoot_pct
+                and overshoot_settling_time <= self.targets.settling_time_s
+                and undershoot_settling_time <= self.targets.settling_time_s
+            )
+            pass_reasons = []
         return ResponseMetrics(
             overshoot_pct=overshoot,
             undershoot_pct=undershoot,
             settling_time_s=settling_time,
             oscillations=oscillations,
-            score=score,
+            score=min(MAX_PENALTY, score),
             passed=passed,
             overshoot_settling_time_s=overshoot_settling_time,
             undershoot_settling_time_s=undershoot_settling_time,
             low_load_steady_v=low_load_steady_v,
             high_load_steady_v=high_load_steady_v,
+            settling_analysis_version=settling_analysis_version,
+            overshoot_settling_valid=overshoot_settling_valid,
+            undershoot_settling_valid=undershoot_settling_valid,
+            settling_diagnostics=settling_diagnostics,
+            pass_reasons=pass_reasons,
         )
 
     def _lowpass_response_waveform(self, waveform: Waveform) -> Waveform:
@@ -184,6 +247,9 @@ class ResponseAnalyzer:
         settling_time_s = 0.0
         overshoot_settling_time_s = 0.0
         undershoot_settling_time_s = 0.0
+        overshoot_settling_valid = True
+        undershoot_settling_valid = True
+        settling_diagnostics: dict[str, Any] = {}
         oscillations = 0
         low_load_steady_values, high_load_steady_values = self._load_steady_values(waveform, events)
         low_load_steady_v = _mean(low_load_steady_values)
@@ -198,7 +264,12 @@ class ResponseAnalyzer:
             segment = waveform.vout_v[event.index:next_index]
             if not segment:
                 continue
-            final_value = self._event_target_steady_value(
+            # Settling is relative to the steady value reached by this exact
+            # hardware step. OS/US magnitude intentionally continues to use
+            # the shared load-state values above so those percentages remain
+            # comparable across the capture.
+            final_value = self._local_step_steady_value(waveform, event.index, next_index)
+            shared_final_value = self._event_target_steady_value(
                 waveform,
                 event.index,
                 next_index,
@@ -206,12 +277,30 @@ class ResponseAnalyzer:
                 low_load_steady_v,
                 high_load_steady_v,
             )
-            event_settling_time = self._dynamic_settling_time(waveform, event.index, next_index, final_value, event.edge)
-            settling_time_s = max(settling_time_s, event_settling_time)
+            # An incomplete trailing generator transition can occur near the
+            # capture boundary without becoming a debounced analysis edge. Do
+            # not let that unrelated tail replace the known load-state target.
+            reference_locked = False
+            if abs(final_value - shared_final_value) > max(12e-3, abs(shared_final_value) * 0.015):
+                final_value = shared_final_value
+                reference_locked = True
+            settling = self._dynamic_settling_time(
+                waveform,
+                event.index,
+                next_index,
+                final_value,
+                event.edge,
+                reference_locked=reference_locked,
+            )
+            settling_time_s = max(settling_time_s, settling.time_s)
             if event.edge == "falling":
-                overshoot_settling_time_s = max(overshoot_settling_time_s, event_settling_time)
+                overshoot_settling_time_s = max(overshoot_settling_time_s, settling.time_s)
+                overshoot_settling_valid = overshoot_settling_valid and settling.valid
+                settling_diagnostics["overshoot"] = settling.diagnostics
             elif event.edge == "rising":
-                undershoot_settling_time_s = max(undershoot_settling_time_s, event_settling_time)
+                undershoot_settling_time_s = max(undershoot_settling_time_s, settling.time_s)
+                undershoot_settling_valid = undershoot_settling_valid and settling.valid
+                settling_diagnostics["undershoot"] = settling.diagnostics
             oscillations = max(oscillations, self._dynamic_oscillation_count(waveform, event.index, next_index, final_value))
 
         return _DynamicStepMetrics(
@@ -223,6 +312,9 @@ class ResponseAnalyzer:
             oscillations=oscillations,
             low_load_steady_v=low_load_steady_v,
             high_load_steady_v=high_load_steady_v,
+            overshoot_settling_valid=overshoot_settling_valid,
+            undershoot_settling_valid=undershoot_settling_valid,
+            settling_diagnostics=settling_diagnostics,
         )
 
     def _analysis_edges(self, events: list[_StepEvent]) -> list[_StepEvent]:
@@ -331,22 +423,45 @@ class ResponseAnalyzer:
     def _input_edges(self, input_v: list[float]) -> list[_StepEvent]:
         if len(input_v) < 2:
             return []
-        low = min(input_v)
-        high = max(input_v)
+        # Estimate CH1 plateaus robustly. A single acquisition spike must not
+        # move the switching threshold enough to create or hide a load edge.
+        stride = max(1, len(input_v) // 4096)
+        sampled = [float(value) for value in input_v[::stride] if math.isfinite(float(value))]
+        if len(sampled) < 2:
+            return []
+        sampled.sort()
+        low = _quantile(sampled, 0.10)
+        high = _quantile(sampled, 0.90)
         span = high - low
         if span <= 1e-9:
             return []
-        threshold = low + span * 0.5
+        low_threshold = low + span * 0.35
+        high_threshold = low + span * 0.65
         events: list[_StepEvent] = []
+        first = float(input_v[0])
+        if first >= high_threshold:
+            state = "high"
+        elif first <= low_threshold:
+            state = "low"
+        else:
+            state = "high" if first >= (low + high) * 0.5 else "low"
         for index in range(1, len(input_v)):
-            previous = input_v[index - 1]
-            current = input_v[index]
-            if previous <= threshold < current:
+            current = float(input_v[index])
+            if not math.isfinite(current):
+                continue
+            if state == "low" and current >= high_threshold:
                 events.append(_StepEvent(index=index, edge="rising"))
-            elif previous >= threshold > current:
+                state = "high"
+            elif state == "high" and current <= low_threshold:
                 events.append(_StepEvent(index=index, edge="falling"))
+                state = "low"
         events = self._debounce_edges(events, len(input_v))
         return events
+
+    def input_edge_indices(self, input_v: list[float]) -> list[tuple[int, str]]:
+        """Return the same debounced CH1 edges used by transient analysis."""
+
+        return [(event.index, event.edge) for event in self._input_edges(input_v)]
 
     def _debounce_edges(self, events: list[_StepEvent], sample_count: int) -> list[_StepEvent]:
         if len(events) < 2:
@@ -357,6 +472,11 @@ class ResponseAnalyzer:
         debounced: list[_StepEvent] = []
         for event in events:
             if debounced and event.index - debounced[-1].index <= min_separation:
+                continue
+            if debounced and event.edge == debounced[-1].edge:
+                # The earlier same-direction edge was a short spike whose
+                # return crossing was swallowed by the debounce window.
+                debounced[-1] = event
                 continue
             debounced.append(event)
         return debounced
@@ -389,6 +509,24 @@ class ResponseAnalyzer:
             values = waveform.vout_v[max(start_index, end_index - 5):end_index]
         return sum(values) / len(values)
 
+    def _local_step_steady_value(self, waveform: Waveform, start_index: int, end_index: int) -> float:
+        """Return a robust steady reference for one physical load step."""
+
+        segment_time = waveform.time_s[end_index - 1] - waveform.time_s[start_index]
+        window_s = max(0.0, min(10e-6, segment_time * 0.25))
+        end_time = waveform.time_s[end_index - 1]
+        values = sorted(
+            value
+            for time_s, value in zip(
+                waveform.time_s[start_index:end_index],
+                waveform.vout_v[start_index:end_index],
+            )
+            if time_s >= end_time - window_s
+        )
+        if not values:
+            values = sorted(waveform.vout_v[max(start_index, end_index - 5) : end_index])
+        return _quantile(values, 0.50)
+
     def _dynamic_settling_time(
         self,
         waveform: Waveform,
@@ -396,94 +534,461 @@ class ResponseAnalyzer:
         end_index: int,
         final_value: float,
         edge: str,
-    ) -> float:
+        *,
+        reference_locked: bool = False,
+    ) -> _SettlingResult:
         if end_index <= start_index:
-            return 0.0
-        if edge == "rising":
-            tolerance_pct = self.targets.undershoot_pct
-        elif edge == "falling":
-            tolerance_pct = self.targets.overshoot_pct
-        else:
-            tolerance_pct = max(self.targets.overshoot_pct, self.targets.undershoot_pct)
+            return _SettlingResult(0.0, False, {"valid": False, "reason": "empty step segment"})
         sample_dt = self._median_sample_dt(waveform.time_s[start_index:end_index])
         segment_time = waveform.time_s[end_index - 1] - waveform.time_s[start_index]
-        # Settling uses a tighter, ripple-aware band than the OS/US pass limit.
-        # A full 3% transient limit is too wide for settling: later load-line
-        # dips can hide inside that band even though the response is visibly not
-        # settled. The 0.65% cap keeps shallow sustained rollback visible while
-        # the ripple tolerance below still suppresses ordinary switching ripple.
-        settling_pct = min(max(tolerance_pct, 0.0), 0.65)
-        percentage_tolerance = max(abs(final_value) * settling_pct / 100.0, 1e-6)
         ripple_tolerance = self._steady_ripple_tolerance(waveform, start_index, end_index)
-        ripple_floor = max(6e-3, abs(final_value) * 0.005)
-        tolerance = max(percentage_tolerance, ripple_tolerance, ripple_floor)
-        envelopes = self._binned_envelope(waveform, start_index, end_index, bin_s=0.25e-6)
-        if not envelopes:
-            return max(sample_dt, 0.05e-6)
+        main_watch_s = min(segment_time, max(8e-6, min(15e-6, segment_time * 0.25)))
+        tail_window_s = min(10e-6, max(0.0, segment_time * 0.25))
+        origin_s = waveform.time_s[start_index]
+        tail_start_s = origin_s + max(0.0, segment_time - tail_window_s)
+        if reference_locked:
+            noise_stop_s = min(segment_time, max(main_watch_s + 5e-6, segment_time * 0.40)) + origin_s
+            tail_values = [
+                value
+                for time_s, value in zip(
+                    waveform.time_s[start_index:end_index],
+                    waveform.vout_v[start_index:end_index],
+                )
+                if origin_s + main_watch_s <= time_s <= noise_stop_s
+            ]
+        else:
+            tail_values = [
+                value
+                for time_s, value in zip(
+                    waveform.time_s[start_index:end_index],
+                    waveform.vout_v[start_index:end_index],
+                )
+                if time_s >= tail_start_s
+            ]
+        if not tail_values:
+            tail_values = waveform.vout_v[max(start_index, end_index - 8) : end_index]
+        sorted_tail = sorted(tail_values)
+        tail_center = _quantile(sorted_tail, 0.50)
+        # V15 makes the displayed 600 kHz zero-phase LPF the complete Ts decision
+        # signal. There is no 0.25 us binning and no second 5/9-bin median
+        # filter. This keeps a real post-entry dip visible to the settling
+        # detector and makes the plotted LPF directly explain the reported Ts.
+        if not reference_locked:
+            final_value = tail_center
+        # V15 uses a direction-aware asymmetric band. For a voltage-falling
+        # response (CH1 rising), the band is -5/+3 mV. For a voltage-rising
+        # response (CH1 falling), it is -3/+5 mV. The 600 kHz trace can
+        # graze this band because of normal switching ripple, so the temporal
+        # duration/depth qualification below remains responsible for rejecting
+        # non-physical threshold chatter.
+        if edge == "rising":
+            lower_tolerance = 5.0e-3
+            upper_tolerance = 3.0e-3
+            band_schedule = "voltage falling: -5/+3 mV"
+        else:
+            lower_tolerance = 3.0e-3
+            upper_tolerance = 5.0e-3
+            band_schedule = "voltage rising: -3/+5 mV"
 
-        # Settling is decided by the main transient after the edge. Looking all
-        # the way to the next load edge makes slow DC drift or switching ripple
-        # look like "not settled" and can stretch Ts to the whole segment. Still
-        # keep enough of the segment to catch the common overdamped rollback/dip
-        # after a first apparent recovery.
-        reset_watch_s = min(segment_time, max(12e-6, segment_time * 0.60))
-        watched_envelopes = [envelope for envelope in envelopes if envelope.start_s <= reset_watch_s]
-        if not watched_envelopes:
-            watched_envelopes = envelopes
+        def band_limits(elapsed_s: float) -> tuple[float, float]:
+            del elapsed_s
+            return lower_tolerance, upper_tolerance
 
-        # Use median/interquartile envelopes instead of raw or q10/q90 samples.
-        # q10/q90 is still too sensitive for the TPU load-step captures because
-        # normal switching ripple can live there for the entire steady state.
-        stable_tolerance = max(tolerance, ripple_tolerance * 0.85, 5.0e-3, abs(final_value) * 0.006)
-        reset_tolerance = max(stable_tolerance, ripple_tolerance * 1.10)
-        outside = [
-            abs(envelope.q50 - final_value) > reset_tolerance
-            or envelope.q75 < final_value - reset_tolerance
-            or envelope.q25 > final_value + reset_tolerance
-            for envelope in watched_envelopes
+        def outside_band(elapsed_s: float, value: float) -> bool:
+            lower, upper = band_limits(elapsed_s)
+            return value < final_value - lower or value > final_value + upper
+
+        def depth_beyond_band(elapsed_s: float, value: float) -> tuple[float, float]:
+            lower, upper = band_limits(elapsed_s)
+            if value >= final_value:
+                return max(0.0, value - final_value - upper), upper
+            return max(0.0, final_value - value - lower), lower
+
+        diagnostics: dict[str, Any] = {
+            "method": "six_hundred_khz_asymmetric_band_reentry_v15",
+            "edge": edge,
+            "valid": False,
+            "local_steady_v": float(final_value),
+            "outer_tolerance_mv": float(max(lower_tolerance, upper_tolerance) * 1e3),
+            "core_tolerance_mv": float(min(lower_tolerance, upper_tolerance) * 1e3),
+            "final_tolerance_mv": float(max(lower_tolerance, upper_tolerance) * 1e3),
+            "lower_tolerance_mv": float(lower_tolerance * 1e3),
+            "upper_tolerance_mv": float(upper_tolerance * 1e3),
+            "band_ramp_start_us": None,
+            "band_ramp_stop_us": None,
+            "band_schedule": band_schedule,
+            "measured_ripple_tolerance_mv": float(ripple_tolerance * 1e3),
+            "decision_filter_hz": float(self.RESPONSE_LOWPASS_CUTOFF_HZ),
+            "uses_time_bins": False,
+            "stable_dwell_us": 1.0,
+            "minimum_exit_duration_us": 0.08,
+            "minimum_exit_depth_mv": 0.5,
+            "exit_merge_gap_us": 0.05,
+            "prominent_reversal_count": 0,
+            "main_watch_us": float(main_watch_s * 1e6),
+            "first_entry_us": None,
+            "final_entry_us": None,
+            "secondary_excursion_count": 0,
+            "secondary_excursions": [],
+            "rejected_band_graze_count": 0,
+        }
+
+        watched: list[tuple[float, float]] = [
+            (time_s - origin_s, value)
+            for time_s, value in zip(
+                waveform.time_s[start_index:end_index],
+                waveform.vout_v[start_index:end_index],
+            )
+            if time_s - origin_s <= main_watch_s + 1.0e-6 + 1e-12
         ]
-        min_reset_duration_s = min(1.2e-6, max(0.45e-6, segment_time * 0.012))
-        last_significant_outside_stop = self._last_significant_outside_stop(
-            outside,
-            watched_envelopes,
-            min_duration_s=min_reset_duration_s,
-        )
-        # q05/q95 directional extrema are useful for OS/US magnitude, but they
-        # are too sensitive for settling because one late narrow spike can reset
-        # Ts. Settling uses the median/IQR sustained-outside checks below.
-        # The core settling answer should come from a stable dwell, not from
-        # "last outside until the next edge". This catches the common
-        # overdamped rollback shape: the waveform reaches the steady value,
-        # dips back out, then settles again. A two-microsecond dwell rejects
-        # that false first crossing while ignoring slow drift much later.
-        stable_window_stop = self._first_stable_window_start(
-            envelopes,
-            final_value,
-            tolerance=stable_tolerance,
-            stable_duration_s=min(2.0e-6, max(0.8e-6, segment_time * 0.025)),
-        )
-        # The trend median can miss a shallow but persistent rollback when the
-        # bin is partly settled and partly dipping. Use the interquartile band as
-        # a second, still spike-resistant guard. This is bidirectional on
-        # purpose: after a falling edge, a later dip below the low-load steady
-        # value must reset OS settling, and after a rising edge a later rebound
-        # above the high-load steady value must reset US settling.
-        iqr_stop = self._last_iqr_outside_stop(
-            watched_envelopes,
-            final_value,
-            tolerance=reset_tolerance,
-            min_duration_s=min_reset_duration_s,
-        )
-        candidates = [
-            value
-            for value in (last_significant_outside_stop, iqr_stop)
-            if value is not None
+        if not watched:
+            diagnostics["reason"] = "no 600 kHz LPF samples in the transient window"
+            return _SettlingResult(0.0, False, diagnostics)
+
+        # The first band crossing belongs to the primary transition. Every
+        # later exit is a real US/OS/dip candidate on the same 600 kHz trace. Ts
+        # is moved to the re-entry after the final such excursion.
+        saw_initial_outside = False
+        first_entry_index: int | None = None
+        for index, (elapsed_s, value) in enumerate(watched):
+            if outside_band(elapsed_s, value):
+                saw_initial_outside = True
+            elif saw_initial_outside:
+                first_entry_index = index
+                break
+        if first_entry_index is None:
+            diagnostics["reason"] = "600 kHz LPF never enters the steady band"
+            return _SettlingResult(0.0, False, diagnostics)
+
+        first_entry_s = watched[first_entry_index][0]
+        diagnostics["first_entry_us"] = float(first_entry_s * 1e6)
+        final_entry_index = first_entry_index
+        raw_excursions: list[tuple[int, int]] = []
+        index = first_entry_index + 1
+        while index < len(watched) and watched[index][0] <= main_watch_s + 1e-12:
+            if not outside_band(watched[index][0], watched[index][1]):
+                index += 1
+                continue
+            exit_index = index
+            while (
+                index < len(watched)
+                and outside_band(watched[index][0], watched[index][1])
+            ):
+                index += 1
+            if index >= len(watched):
+                reentry_index = len(watched) - 1
+            else:
+                reentry_index = index
+            raw_excursions.append((exit_index, reentry_index))
+
+        # A 600 kHz trace can graze a numeric band edge for a few nanoseconds.
+        # That is neither a physical second lobe nor a useful definition of
+        # settling. Merge threshold chatter, then require both meaningful time
+        # outside the band and meaningful depth beyond it. This is temporal
+        # qualification of the original 600 kHz samples, not binning/filtering.
+        merged_excursions: list[tuple[int, int]] = []
+        for exit_index, reentry_index in raw_excursions:
+            if (
+                merged_excursions
+                and watched[exit_index][0] - watched[merged_excursions[-1][1]][0]
+                <= 0.05e-6 + sample_dt
+            ):
+                merged_excursions[-1] = (merged_excursions[-1][0], reentry_index)
+            else:
+                merged_excursions.append((exit_index, reentry_index))
+
+        excursions: list[dict[str, Any]] = []
+        rejected_band_grazes = 0
+        for exit_index, reentry_index in merged_excursions:
+            cluster = watched[exit_index : reentry_index + 1]
+            extreme_offset = max(
+                range(len(cluster)),
+                key=lambda item: (
+                    depth_beyond_band(cluster[item][0], cluster[item][1])[0]
+                ),
+            )
+            extreme_time_s, extreme_value = cluster[extreme_offset]
+            duration_s = watched[reentry_index][0] - watched[exit_index][0]
+            depth_v, extreme_tolerance = depth_beyond_band(extreme_time_s, extreme_value)
+            qualified = duration_s + sample_dt >= 0.08e-6 and depth_v >= 0.5e-3 - 1e-12
+            detail = {
+                "exit_us": float(watched[exit_index][0] * 1e6),
+                "reentry_us": float(watched[reentry_index][0] * 1e6),
+                "duration_us": float(duration_s * 1e6),
+                "extreme_us": float(extreme_time_s * 1e6),
+                "extreme_mv_from_steady": float((extreme_value - final_value) * 1e3),
+                "depth_beyond_band_mv": float(depth_v * 1e3),
+                "band_tolerance_mv": float(extreme_tolerance * 1e3),
+                "direction": "high" if extreme_value > final_value else "low",
+            }
+            if not qualified:
+                rejected_band_grazes += 1
+                continue
+            if reentry_index >= len(watched) - 1:
+                diagnostics["reason"] = "qualified 600 kHz excursion has no steady-band re-entry"
+                diagnostics["secondary_excursion_count"] = len(excursions) + 1
+                diagnostics["secondary_excursions"] = (excursions + [detail])[-8:]
+                diagnostics["rejected_band_graze_count"] = rejected_band_grazes
+                return _SettlingResult(0.0, False, diagnostics)
+            excursions.append(detail)
+            final_entry_index = reentry_index
+
+        final_entry_s = watched[final_entry_index][0]
+        dwell_stop_s = final_entry_s + 1.0e-6
+        # Dwell means no *qualified* excursion for 1 us. Rejected nanosecond
+        # band grazes must not make an otherwise stable response invalid.
+        if watched[-1][0] + sample_dt < dwell_stop_s:
+            diagnostics["reason"] = "insufficient samples for 1.0 us final dwell"
+            diagnostics["secondary_excursion_count"] = len(excursions)
+            diagnostics["secondary_excursions"] = excursions[-8:]
+            diagnostics["rejected_band_graze_count"] = rejected_band_grazes
+            return _SettlingResult(0.0, False, diagnostics)
+
+        if edge == "rising":
+            primary_index = min(range(len(watched)), key=lambda item: watched[item][1])
+        else:
+            primary_index = max(range(len(watched)), key=lambda item: watched[item][1])
+        diagnostics["primary_extreme_us"] = float(watched[primary_index][0] * 1e6)
+        diagnostics["primary_extreme_v"] = float(watched[primary_index][1])
+        diagnostics["secondary_excursion_count"] = len(excursions)
+        diagnostics["prominent_reversal_count"] = len(excursions)
+        diagnostics["secondary_excursions"] = excursions[-8:]
+        diagnostics["rejected_band_graze_count"] = rejected_band_grazes
+        final_entry_s = max(sample_dt, final_entry_s)
+        diagnostics["valid"] = True
+        diagnostics["final_entry_us"] = float(final_entry_s * 1e6)
+        diagnostics["reason"] = "settled at final 600 kHz steady-band re-entry"
+        return _SettlingResult(final_entry_s, True, diagnostics)
+
+    def _settling_center_trend(
+        self,
+        envelopes: list[_EnvelopeBin],
+        *,
+        span_bins: int = 5,
+    ) -> list[_TrendBin]:
+        """Return an odd-span centered median trend used by settling V5."""
+
+        centers = [item.q50 for item in envelopes]
+        span_bins = max(1, int(span_bins))
+        if span_bins % 2 == 0:
+            span_bins += 1
+        radius = span_bins // 2
+        trend: list[_TrendBin] = []
+        for index, envelope in enumerate(envelopes):
+            window = sorted(
+                centers[
+                    max(0, index - radius) : min(len(centers), index + radius + 1)
+                ]
+            )
+            trend.append(
+                _TrendBin(
+                    start_s=envelope.start_s,
+                    stop_s=envelope.stop_s,
+                    center=_quantile(window, 0.50),
+                )
+            )
+        return trend
+
+    @staticmethod
+    def _merge_time_intervals(
+        intervals: list[tuple[float, float]],
+        *,
+        merge_gap_s: float,
+    ) -> list[tuple[float, float]]:
+        """Merge already-qualified time intervals without changing duration."""
+
+        merged: list[tuple[float, float]] = []
+        for start_s, stop_s in sorted(intervals):
+            if merged and start_s - merged[-1][1] <= merge_gap_s + 1e-15:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], stop_s))
+            else:
+                merged.append((start_s, stop_s))
+        return merged
+
+    def _prominent_reversal_clusters(
+        self,
+        trend: list[_TrendBin],
+        final_value: float,
+        *,
+        first_entry_s: float | None,
+        watch_stop_s: float,
+        prominence_swing: float,
+        min_duration_s: float,
+        reversal_confirmation: float,
+        recovery_tolerance: float,
+        recovery_trend: list[_TrendBin] | None = None,
+    ) -> list[tuple[float, float]]:
+        """Find coherent post-entry peak/valley swings missed by absolute bands.
+
+        A plain final-value threshold cannot see a response that moves from one
+        side of steady state to the other while both endpoints remain inside
+        the late core band.  This detector therefore measures peak-to-valley
+        prominence, but accepts an extremum only after the trend moves back by
+        ``reversal_confirmation``.  That confirmation prevents an ordinary
+        monotonic approach to steady state from being classified as rebound.
+        """
+
+        if first_entry_s is None:
+            return []
+        watched = [
+            item
+            for item in trend
+            if first_entry_s - 1e-12 <= item.start_s <= watch_stop_s + 1e-12
         ]
-        if stable_window_stop is not None:
-            candidates.append(stable_window_stop)
-        if not candidates:
-            return max(sample_dt, min(0.25e-6, max(segment_time, sample_dt)))
-        return max(sample_dt, max(candidates))
+        if len(watched) < 3:
+            return []
+
+        values = [item.center for item in watched]
+        # The nine-bin trend is spaced at 0.25 us. A two-bin local window and
+        # a 3 us look-ahead retain broad hardware lobes while rejecting single
+        # switching spikes and tiny median-filter plateaus.
+        local_radius = 2
+        confirmation_stop_s = 10.0e-6
+        anchor = 0
+        intervals: list[tuple[float, float]] = []
+        index = 1
+        while index < len(watched) - 1:
+            item = watched[index]
+            local = values[
+                max(anchor, index - local_radius) : min(len(values), index + local_radius + 1)
+            ]
+            if not local:
+                index += 1
+                continue
+            is_peak = values[index] >= max(local) - 1e-12
+            is_valley = values[index] <= min(local) + 1e-12
+            prior = values[anchor : index + 1]
+            prior_min_offset = min(range(len(prior)), key=prior.__getitem__)
+            prior_max_offset = max(range(len(prior)), key=prior.__getitem__)
+            prior_min_index = anchor + prior_min_offset
+            prior_max_index = anchor + prior_max_offset
+
+            future_stop = index + 1
+            while (
+                future_stop < len(watched)
+                and watched[future_stop].start_s - item.start_s <= confirmation_stop_s + 1e-12
+            ):
+                future_stop += 1
+            future = values[index + 1 : future_stop]
+            peak_retreat = (
+                max((values[index] - value for value in future), default=0.0)
+                >= reversal_confirmation
+            )
+            valley_retreat = (
+                max((value - values[index] for value in future), default=0.0)
+                >= reversal_confirmation
+            )
+
+            start_index: int | None = None
+            if (
+                is_peak
+                and peak_retreat
+                and values[index] - values[prior_min_index] >= prominence_swing
+                and item.start_s - watched[prior_min_index].start_s >= min_duration_s - 1e-12
+            ):
+                start_index = prior_min_index
+            elif (
+                is_valley
+                and valley_retreat
+                and values[prior_max_index] - values[index] >= prominence_swing
+                and item.start_s - watched[prior_max_index].start_s >= min_duration_s - 1e-12
+            ):
+                start_index = prior_max_index
+
+            if start_index is None:
+                index += 1
+                continue
+
+            # Include the confirmed turn and, when the extremum itself is
+            # outside the stricter early band, extend through its return to
+            # that band. The normal 1 us final-dwell check still runs after
+            # this interval and determines the reported Ts start.
+            confirmation_index = index
+            for candidate in range(index + 1, future_stop):
+                if (
+                    abs(values[candidate] - values[index]) >= reversal_confirmation
+                    and (values[candidate] - values[index]) * (values[index] - values[start_index]) < 0
+                ):
+                    confirmation_index = candidate
+                    break
+            # The look-ahead only proves that this extremum is a real reversal;
+            # it must not be added to Ts. Back-date the excursion end to the
+            # extremum itself, or to the first subsequent return inside the
+            # stricter recovery band when the extremum is outside that band.
+            stop_s = item.stop_s
+            if abs(values[index] - final_value) > recovery_tolerance:
+                recovery_bins = recovery_trend or watched
+                recovery_stop_s = stop_s
+                for candidate in recovery_bins:
+                    if candidate.start_s < item.start_s - 1e-12:
+                        continue
+                    recovery_stop_s = candidate.stop_s
+                    if abs(candidate.center - final_value) <= recovery_tolerance:
+                        break
+                stop_s = recovery_stop_s
+            intervals.append(
+                (watched[start_index].start_s, stop_s)
+            )
+            anchor = index
+            index = max(index + 1, confirmation_index)
+
+        return self._merge_time_intervals(intervals, merge_gap_s=0.50e-6)
+
+    def _merged_outside_clusters(
+        self,
+        outside: list[bool],
+        bins: list[_TrendBin],
+        *,
+        merge_gap_s: float,
+        min_duration_s: float,
+    ) -> list[tuple[float, float]]:
+        primitive: list[tuple[int, int]] = []
+        index = 0
+        while index < len(outside):
+            if not outside[index]:
+                index += 1
+                continue
+            start = index
+            while index + 1 < len(outside) and outside[index + 1]:
+                index += 1
+            primitive.append((start, index))
+            index += 1
+
+        merged: list[tuple[int, int]] = []
+        for start, stop in primitive:
+            if merged and bins[start].start_s - bins[merged[-1][1]].stop_s <= merge_gap_s:
+                merged[-1] = (merged[-1][0], stop)
+            else:
+                merged.append((start, stop))
+        return [
+            (bins[start].start_s, bins[stop].stop_s)
+            for start, stop in merged
+            if bins[stop].stop_s - bins[start].start_s + 1e-12 >= min_duration_s
+        ]
+
+    def _first_stable_trend_start(
+        self,
+        trend: list[_TrendBin],
+        final_value: float,
+        *,
+        tolerance: float,
+        stable_duration_s: float,
+        not_before_s: float,
+    ) -> float | None:
+        index = 0
+        while index < len(trend):
+            item = trend[index]
+            if item.start_s + 1e-12 < not_before_s or abs(item.center - final_value) > tolerance:
+                index += 1
+                continue
+            start = index
+            while index < len(trend) and abs(trend[index].center - final_value) <= tolerance:
+                index += 1
+            stop = index
+            duration_s = trend[stop - 1].stop_s - trend[start].start_s
+            if duration_s + 1e-12 >= stable_duration_s:
+                return trend[start].start_s
+        return None
 
     def _first_stable_window_start(
         self,
@@ -784,25 +1289,80 @@ class ResponseAnalyzer:
                 signs.append(sign)
         return max(0, len(signs) - 1)
 
+    def _has_sustained_oscillation(self, waveform: Waveform) -> bool:
+        """Return whether a large oscillation persists late in a load segment."""
+
+        if not waveform.input_v or len(waveform.input_v) != len(waveform.time_s):
+            return False
+        events = self._input_edges(waveform.input_v)
+        for event in self._analysis_edges(events):
+            next_event = next((candidate for candidate in events if candidate.index > event.index), None)
+            end_index = next_event.index if next_event is not None else len(waveform.time_s)
+            if end_index - event.index < 8:
+                continue
+            start_time = waveform.time_s[event.index]
+            stop_time = waveform.time_s[end_index - 1]
+            segment_duration = max(0.0, stop_time - start_time)
+            tail_start_time = start_time + segment_duration * 0.55
+            tail = [
+                value
+                for time_s, value in zip(
+                    waveform.time_s[event.index:end_index],
+                    waveform.vout_v[event.index:end_index],
+                )
+                if time_s >= tail_start_time
+            ]
+            if len(tail) < 8:
+                continue
+
+            ordered = sorted(tail)
+            center = _quantile(ordered, 0.50)
+            robust_span = _quantile(ordered, 0.95) - _quantile(ordered, 0.05)
+            minimum_span = max(25e-3, abs(center) * 0.04)
+            if robust_span < minimum_span:
+                continue
+
+            tolerance = max(4e-3, abs(center) * 0.01)
+            signs: list[int] = []
+            for value in tail:
+                delta = value - center
+                if abs(delta) <= tolerance:
+                    continue
+                sign = 1 if delta > 0 else -1
+                if not signs or signs[-1] != sign:
+                    signs.append(sign)
+            if len(signs) - 1 >= SUSTAINED_OSCILLATION_MIN_SIGN_CHANGES:
+                return True
+        return False
+
     def analyze_hardware(
         self,
         waveform: Waveform | None,
         bode_margins: dict | None,
         enable_transient: bool = True,
         enable_bode: bool = True,
+        precomputed_transient: ResponseMetrics | None = None,
     ) -> ResponseMetrics:
         if not enable_transient and not enable_bode:
             raise ValueError("At least one analysis mode must be enabled.")
 
-        transient = self.analyze(waveform) if enable_transient and waveform is not None else None
+        transient = precomputed_transient if enable_transient else None
+        if transient is None and enable_transient and waveform is not None:
+            transient = self.analyze(waveform)
         margins = bode_margins or {}
         phase_margin = _optional_float(margins.get("phase_margin_deg"))
         crossover = _optional_float(margins.get("phase_crossover_hz"))
         gain_margin = _optional_float(margins.get("gain_margin_db"))
+        gain_rebound_db = _optional_float(margins.get("gain_rebound_db"))
+        gain_flat_span_decades = _optional_float(margins.get("gain_flat_span_decades"))
+        gain_slope_p90 = _optional_float(margins.get("gain_slope_p90_db_per_decade"))
+        gain_shape_penalty = max(0.0, _optional_float(margins.get("gain_shape_penalty")) or 0.0)
+        gain_shape_valid = margins.get("gain_shape_valid")
         gain_crossover_count = _optional_int(margins.get("gain_crossover_count")) or 0
         duplicate_gain_crossover = bool(margins.get("duplicate_gain_crossover")) or gain_crossover_count > 1
 
-        reasons: list[str] = []
+        reasons: list[str] = list(transient.pass_reasons) if transient is not None else []
+        transient_invalid = any("invalid transient waveform" in str(reason).lower() for reason in reasons)
         score = transient.score if transient is not None else 0.0
         phase_error: float | None = None
         crossover_error_pct: float | None = None
@@ -817,6 +1377,18 @@ class ResponseAnalyzer:
                     reasons.append(f"invalid bode: second 0 dB crossover at {second:.3g} Hz")
                 else:
                     reasons.append("invalid bode: duplicate 0 dB crossover")
+
+            score += gain_shape_penalty
+            gain_shape_ok = gain_shape_valid is not False
+            if not gain_shape_ok:
+                shape_parts: list[str] = []
+                if gain_rebound_db is not None:
+                    shape_parts.append(f"gain rebound {gain_rebound_db:.2f} dB")
+                if gain_flat_span_decades is not None:
+                    shape_parts.append(f"flat span {gain_flat_span_decades:.2f} decade")
+                reasons.append(
+                    "bode gain shape failed: " + (", ".join(shape_parts) if shape_parts else "non-descending gain")
+                )
 
             if phase_margin is None:
                 score += 100.0
@@ -847,7 +1419,7 @@ class ResponseAnalyzer:
                 if not crossover_ok:
                     reasons.append(f"crossover above upper limit by {crossover_error_pct:.1f}%")
 
-            gain_ok = True
+            gain_ok = gain_shape_ok
         else:
             phase_ok = True
             crossover_ok = True
@@ -857,7 +1429,10 @@ class ResponseAnalyzer:
         if enable_transient and not transient_ok:
             reasons.append("transient limits not met")
         passed = transient_ok and phase_ok and crossover_ok and gain_ok
-        if bode_invalid:
+        if transient_invalid:
+            score = INVALID_TRANSIENT_PENALTY
+            passed = False
+        elif bode_invalid:
             score = 250.0
             passed = False
         if passed:
@@ -871,7 +1446,7 @@ class ResponseAnalyzer:
                 enable_bode=enable_bode,
             )
             if reward > 0:
-                score = max(-3.0, score - reward)
+                score -= reward
                 reasons.append(f"passed reward {reward:.3f}")
             reasons.append("passed")
 
@@ -880,7 +1455,7 @@ class ResponseAnalyzer:
             undershoot_pct=transient.undershoot_pct if transient is not None else 0.0,
             settling_time_s=transient.settling_time_s if transient is not None else 0.0,
             oscillations=transient.oscillations if transient is not None else 0,
-            score=score,
+            score=min(MAX_PENALTY, score),
             passed=passed,
             overshoot_settling_time_s=transient.overshoot_settling_time_s if transient is not None else 0.0,
             undershoot_settling_time_s=transient.undershoot_settling_time_s if transient is not None else 0.0,
@@ -889,6 +1464,20 @@ class ResponseAnalyzer:
             phase_margin_deg=phase_margin,
             crossover_frequency_hz=crossover,
             gain_margin_db=gain_margin,
+            bode_gain_rebound_db=gain_rebound_db,
+            bode_gain_flat_span_decades=gain_flat_span_decades,
+            bode_gain_slope_p90_db_per_decade=gain_slope_p90,
+            bode_gain_shape_penalty=gain_shape_penalty,
+            settling_analysis_version=(
+                transient.settling_analysis_version if transient is not None else SETTLING_ANALYSIS_VERSION
+            ),
+            overshoot_settling_valid=(
+                transient.overshoot_settling_valid if transient is not None else True
+            ),
+            undershoot_settling_valid=(
+                transient.undershoot_settling_valid if transient is not None else True
+            ),
+            settling_diagnostics=(transient.settling_diagnostics if transient is not None else {}),
             pass_reasons=reasons,
         )
 
@@ -905,7 +1494,8 @@ def score_metrics(
     excess_us = max(0.0, undershoot_pct - targets.undershoot_pct)
     excess_os_settling_us = max(0.0, (overshoot_settling_time_s - targets.settling_time_s) * 1e6)
     excess_us_settling_us = max(0.0, (undershoot_settling_time_s - targets.settling_time_s) * 1e6)
-    return (
+    return min(
+        MAX_PENALTY,
         excess_os
         + excess_us
         + SETTLING_WEIGHT_PER_US * excess_os_settling_us

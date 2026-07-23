@@ -1,13 +1,15 @@
 """Recompute saved auto-tune metrics from captured waveform files.
 
-This intentionally overwrites the run files in place. It does not create backup
-copies of old metrics/results.
+This intentionally rewrites the run files in place after creating a one-time,
+versioned backup of the previous metrics/results.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -19,11 +21,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from hardware.tuning.analyzer import ResponseAnalyzer
+from hardware.tuning.analyzer import (
+    SETTLING_ANALYSIS_VERSION,
+    ResponseAnalyzer,
+    score_metrics,
+)
 from hardware.instruments.bode_analyzer import calculate_stability_margins
-from hardware.tuning.models import ResponseMetrics, Waveform, to_jsonable
+from hardware.tuning.models import ResponseMetrics, Waveform, bandwidth_objective, to_jsonable
 from hardware.tuning.runner import _config_from_payload, _record_from_payload
-from hardware.tuning.search import select_best_result
+from hardware.tuning.search import select_best_result, select_diverse_results
 
 
 def main() -> int:
@@ -31,6 +37,13 @@ def main() -> int:
     parser.add_argument("--root", default="results/autotune_runs")
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--run", action="append", default=[])
+    parser.add_argument(
+        "--iteration",
+        action="append",
+        type=int,
+        default=[],
+        help="Recompute only this iteration number; repeat for multiple records.",
+    )
     parser.add_argument("--all", action="store_true", help="Recompute every run below --root.")
     parser.add_argument(
         "--images-only",
@@ -40,9 +53,34 @@ def main() -> int:
     parser.add_argument(
         "--rebuild-images",
         action="store_true",
-        help="Force-regenerate every stored scope and Bode PNG with the current plotters.",
+        help="Force-regenerate stored scope and Bode PNGs (implied when metrics are recomputed).",
+    )
+    parser.add_argument(
+        "--scope-images-only",
+        action="store_true",
+        help="When rebuilding images, regenerate Scope PNGs only and preserve existing Bode PNGs.",
+    )
+    parser.add_argument(
+        "--no-image-status-write",
+        action="store_true",
+        help="Do not rewrite run metadata after image generation; useful for disjoint image workers.",
+    )
+    parser.add_argument(
+        "--skip-images",
+        action="store_true",
+        help="Recompute metrics without rebuilding PNGs; annotations may then be stale.",
+    )
+    parser.add_argument(
+        "--bode-shape-only",
+        action="store_true",
+        help=(
+            "Recompute Bode margins/shape and the combined score while reusing stored transient "
+            "metrics. This avoids loading large scope captures."
+        ),
     )
     args = parser.parse_args()
+    if args.images_only and args.skip_images:
+        parser.error("--images-only and --skip-images cannot be used together")
 
     root = Path(args.root).resolve()
     runs = (
@@ -59,12 +97,25 @@ def main() -> int:
     for run_dir in runs:
         if not args.images_only:
             print(f"recomputing metrics: {run_dir}", flush=True)
-            count = _recompute_run(run_dir)
+            count = _recompute_run(
+                run_dir,
+                bode_shape_only=bool(args.bode_shape_only),
+                selected_iterations=set(args.iteration) or None,
+                create_backup=True,
+            )
             updated += count
             print(f"updated {count:3d} iterations: {run_dir}", flush=True)
-        if args.rebuild_images:
+        rebuild_images = args.images_only or args.rebuild_images or (
+            not args.images_only and not args.skip_images
+        )
+        if rebuild_images:
             print(f"rebuilding images:   {run_dir}", flush=True)
-            images, errors = _rebuild_run_images(run_dir)
+            images, errors = _rebuild_run_images(
+                run_dir,
+                selected_iterations=set(args.iteration) or None,
+                scope_only=bool(args.scope_images_only),
+                persist_status=not bool(args.no_image_status_write),
+            )
             print(f"rebuilt {images:3d} images:     {run_dir}", flush=True)
             for error in errors:
                 print(f"  warning: {error}")
@@ -93,8 +144,16 @@ def _find_runs(root: Path, iteration_count: int | None) -> list[Path]:
     return runs
 
 
-def _recompute_run(run_dir: Path) -> int:
+def _recompute_run(
+    run_dir: Path,
+    *,
+    bode_shape_only: bool = False,
+    selected_iterations: set[int] | None = None,
+    create_backup: bool = False,
+) -> int:
     status_path = run_dir / "run_status.json"
+    if create_backup:
+        _backup_run_files(run_dir)
     status = json.loads(status_path.read_text(encoding="utf-8"))
     history = status.get("history")
     if not isinstance(history, list):
@@ -108,12 +167,28 @@ def _recompute_run(run_dir: Path) -> int:
     analyzer = ResponseAnalyzer(config.targets)
     new_history: list[dict[str, Any]] = []
     total = len(history)
+    updated = 0
+    found_iterations: set[int] = set()
     for index, record in enumerate(history, start=1):
         if not isinstance(record, dict):
             continue
-        waveform = _waveform_from_scope_files(record, run_dir)
+        iteration = int(record.get("iteration") or 0)
+        if selected_iterations is not None and iteration not in selected_iterations:
+            new_history.append(record)
+            continue
+        found_iterations.add(iteration)
+        waveform = None if bode_shape_only else _waveform_from_scope_files(record, run_dir)
         margins = _bode_margins(record, run_dir)
-        if enable_transient and not _waveform_is_valid(waveform):
+        if bode_shape_only and enable_transient:
+            transient = _stored_transient_metrics(record, config.targets)
+            metrics = analyzer.analyze_hardware(
+                None,
+                margins,
+                enable_transient=True,
+                enable_bode=enable_bode,
+                precomputed_transient=transient,
+            )
+        elif enable_transient and not _waveform_is_valid(waveform):
             metrics = _invalid_transient_metrics(record, margins)
         else:
             metrics = analyzer.analyze_hardware(
@@ -124,12 +199,28 @@ def _recompute_run(run_dir: Path) -> int:
             )
         next_record = dict(record)
         next_record["metrics"] = to_jsonable(metrics)
+        parsed_record = _record_from_payload(next_record)
+        both_analyses = enable_transient and enable_bode
+        objective, bonus = bandwidth_objective(
+            metrics.score,
+            parsed_record.candidate,
+            passed=metrics.passed,
+            both_analyses_enabled=both_analyses,
+        )
+        next_record["objective_score"] = objective
+        next_record["bandwidth_bonus"] = bonus
         if margins and isinstance(next_record.get("bode_result"), dict):
             next_record["bode_result"] = dict(next_record["bode_result"])
             next_record["bode_result"]["margins"] = margins
         new_history.append(next_record)
+        updated += 1
         if index == total or index % 10 == 0:
             print(f"  metrics {index:4d}/{total}", flush=True)
+
+    if selected_iterations is not None:
+        missing = sorted(selected_iterations - found_iterations)
+        if missing:
+            raise RuntimeError(f"Iterations not found in {run_dir}: {missing}")
 
     status["history"] = new_history
     if new_history:
@@ -137,11 +228,58 @@ def _recompute_run(run_dir: Path) -> int:
         records = [_record_from_payload(item) for item in new_history]
         best = select_best_result(records)
         status["best"] = _record_by_iteration(new_history, best.iteration) if best else None
+        status["recommendations"] = [
+            _record_by_iteration(new_history, record.iteration)
+            for record in select_diverse_results(records, 5)
+            if _record_by_iteration(new_history, record.iteration) is not None
+        ]
 
     _write_json(status_path, status)
     _write_iterations_jsonl(run_dir / "iterations.jsonl", new_history)
     _update_summary(run_dir, status)
-    return len(new_history)
+    return updated
+
+
+def _stored_transient_metrics(record: dict[str, Any], targets: Any) -> ResponseMetrics:
+    """Rebuild the transient-only portion from stored scalar measurements."""
+
+    payload = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+    reasons = [str(item) for item in (payload.get("pass_reasons") or [])]
+    invalid_reasons = [item for item in reasons if "invalid transient waveform" in item.lower()]
+    overshoot = float(payload.get("overshoot_pct") or 0.0)
+    undershoot = float(payload.get("undershoot_pct") or 0.0)
+    overshoot_ts = float(payload.get("overshoot_settling_time_s") or 0.0)
+    undershoot_ts = float(payload.get("undershoot_settling_time_s") or 0.0)
+    oscillations = int(payload.get("oscillations") or 0)
+    invalid = bool(invalid_reasons)
+    score = 300.0 if invalid else score_metrics(
+        overshoot,
+        undershoot,
+        oscillations,
+        overshoot_ts,
+        undershoot_ts,
+        targets,
+    )
+    passed = bool(
+        not invalid
+        and overshoot <= targets.overshoot_pct
+        and undershoot <= targets.undershoot_pct
+        and overshoot_ts <= targets.settling_time_s
+        and undershoot_ts <= targets.settling_time_s
+    )
+    return ResponseMetrics(
+        overshoot_pct=overshoot,
+        undershoot_pct=undershoot,
+        settling_time_s=max(overshoot_ts, undershoot_ts),
+        oscillations=oscillations,
+        score=score,
+        passed=passed,
+        overshoot_settling_time_s=overshoot_ts,
+        undershoot_settling_time_s=undershoot_ts,
+        low_load_steady_v=_optional_float(payload.get("low_load_steady_v")),
+        high_load_steady_v=_optional_float(payload.get("high_load_steady_v")),
+        pass_reasons=invalid_reasons,
+    )
 
 
 def _waveform_from_scope_files(record: dict[str, Any], run_dir: Path) -> Waveform:
@@ -252,7 +390,13 @@ def _bode_margins(record: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     return dict(margins)
 
 
-def _rebuild_run_images(run_dir: Path) -> tuple[int, list[str]]:
+def _rebuild_run_images(
+    run_dir: Path,
+    selected_iterations: set[int] | None = None,
+    *,
+    scope_only: bool = False,
+    persist_status: bool = True,
+) -> tuple[int, list[str]]:
     # Importing the GUI plotters here keeps metrics-only use of this script light.
     from gui.server import AutotuneRunStore, _scope_axis_settings_from_status
 
@@ -272,16 +416,39 @@ def _rebuild_run_images(run_dir: Path) -> tuple[int, list[str]]:
         if not isinstance(record, dict):
             continue
         iteration = int(record.get("iteration") or 0)
+        if selected_iterations is not None and iteration not in selected_iterations:
+            continue
         try:
-            store._copy_record_assets(
-                record,
-                run_dir,
-                scope_axis_settings=axis_settings,
-                force_rebuild=True,
-            )
+            if scope_only:
+                scope_result = (
+                    record.get("scope_result")
+                    if isinstance(record.get("scope_result"), dict)
+                    else None
+                )
+                if scope_result is not None:
+                    files_dir = run_dir / "files"
+                    files_dir.mkdir(parents=True, exist_ok=True)
+                    store._copy_scope_channel_data_files(scope_result, files_dir, iteration)
+                    store._rebuild_scope_png_from_record(
+                        scope_result,
+                        files_dir / f"iteration_{iteration:03d}_scope.png",
+                        iteration,
+                        axis_settings,
+                        record.get("metrics") if isinstance(record.get("metrics"), dict) else None,
+                    )
+                    record["scope_result"] = scope_result
+            else:
+                store._copy_record_assets(
+                    record,
+                    run_dir,
+                    scope_axis_settings=axis_settings,
+                    force_rebuild=True,
+                )
             scope_result = record.get("scope_result") if isinstance(record.get("scope_result"), dict) else {}
             bode_result = record.get("bode_result") if isinstance(record.get("bode_result"), dict) else {}
-            rebuilt += int(bool(scope_result.get("scope_png"))) + int(bool(bode_result.get("bode_png")))
+            rebuilt += int(bool(scope_result.get("scope_png")))
+            if not scope_only:
+                rebuilt += int(bool(bode_result.get("bode_png")))
         except Exception as exc:
             errors.append(f"iteration {iteration}: {exc}")
         if index == total or index % 10 == 0:
@@ -298,8 +465,13 @@ def _rebuild_run_images(run_dir: Path) -> tuple[int, list[str]]:
             replacement = by_iteration.get(int(record.get("iteration") or 0))
             if replacement is not None:
                 status[key] = replacement
-    _write_json(status_path, status)
-    store._write_summary(run_dir, status)
+    if persist_status:
+        _write_json(status_path, status)
+        # Keep the append-log representation consistent with run_status. Without
+        # this write, a later repair/load path could resurrect pre-rebuild PNG
+        # references even though the visible status had already been updated.
+        _write_iterations_jsonl(run_dir / "iterations.jsonl", history)
+        store._write_summary(run_dir, status)
     return rebuilt, errors
 
 
@@ -338,7 +510,7 @@ def _record_by_iteration(history: list[dict[str, Any]], iteration: int) -> dict[
 
 def _write_iterations_jsonl(path: Path, history: list[dict[str, Any]]) -> None:
     lines = [json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in history]
-    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    _atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
 
 
 def _update_summary(run_dir: Path, status: dict[str, Any]) -> None:
@@ -366,7 +538,34 @@ def _update_summary(run_dir: Path, status: dict[str, Any]) -> None:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _backup_run_files(run_dir: Path) -> None:
+    suffix = f"pre_settling_v{SETTLING_ANALYSIS_VERSION}"
+    for source_name, backup_name in (
+        ("run_status.json", f"run_status.{suffix}.json"),
+        ("iterations.jsonl", f"iterations.{suffix}.jsonl"),
+        ("summary.json", f"summary.{suffix}.json"),
+    ):
+        source = run_dir / source_name
+        backup = run_dir / backup_name
+        if source.is_file() and not backup.exists():
+            shutil.copy2(source, backup)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _is_number(value: Any) -> bool:

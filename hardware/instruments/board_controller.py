@@ -54,6 +54,11 @@ XDPE_MOD0_CURRENT_MODE_FIELDS = {
     "mod0_cm_pole_fatr": (19, 5),
 }
 XDPE_MOD0_CURRENT_MODE_WRITABLE_FIELDS = {"mod0_cm_gain"}
+XDPE_MOD0_LL_BW_ADDRESS = 0x70000C14
+XDPE_MOD0_LL_BW_FIELDS = {
+    "mod0_ll_ls_bw": (0, 7),
+    "mod0_ll_lr_bw": (7, 7),
+}
 XDPE_XV_EN_ADDRESS = 0x2005D8E0
 XDPE_XV_EN_VREN_START = 4
 XDPE_XV_EN_VREN_LENGTH = 2
@@ -391,6 +396,69 @@ class BoardController:
         return {
             "name": "modulator.mod0_current_mode",
             "memory_address": f"0x{XDPE_MOD0_CM_GAIN_ADDRESS:08X}",
+            "word_before": f"0x{before:08X}",
+            "word_after": f"0x{after:08X}",
+            "changed": before != after,
+            "writes": writes,
+            "readback": readback,
+        }
+
+    def read_mod0_ll_bandwidth(self, page: int = 0) -> dict:
+        """Read the two Loop-A low-load AVP bandwidth fields from one word."""
+
+        self._require_loop_a_register(page, "mod0 low-load AVP bandwidth")
+        word = self._read_xdpe_ahb_word(XDPE_MOD0_LL_BW_ADDRESS)
+        fields = {
+            name: _xdp_register_field_result(
+                name=name,
+                address=XDPE_MOD0_LL_BW_ADDRESS,
+                start=start,
+                length=length,
+                word=word,
+                raw=_extract_bits(word, start, length),
+            )
+            for name, (start, length) in XDPE_MOD0_LL_BW_FIELDS.items()
+        }
+        ls_value = int(fields["mod0_ll_ls_bw"]["raw"])
+        lr_value = int(fields["mod0_ll_lr_bw"]["raw"])
+        return {
+            "name": "loop_a.mod0_ll_bandwidth",
+            "memory_address": f"0x{XDPE_MOD0_LL_BW_ADDRESS:08X}",
+            "word": f"0x{word:08X}",
+            "fields": fields,
+            "equal": ls_value == lr_value,
+            "value": ls_value if ls_value == lr_value else None,
+        }
+
+    def set_mod0_ll_bandwidth(self, value: int, page: int = 0) -> dict:
+        """Atomically set Loop-A LS and LR bandwidth to the same 7-bit value."""
+
+        self._require_loop_a_register(page, "mod0 low-load AVP bandwidth")
+        raw = int(value)
+        if not 0 <= raw <= 0x7F:
+            raise ValueError("mod0_ll_bw must be an integer from 0 through 127.")
+        before = self._read_xdpe_ahb_word(XDPE_MOD0_LL_BW_ADDRESS)
+        after = before
+        writes = {}
+        for name, (start, length) in XDPE_MOD0_LL_BW_FIELDS.items():
+            mask = ((1 << length) - 1) << start
+            after = (after & ~mask) | (raw << start)
+            writes[name] = _xdp_register_field_result(
+                name=name,
+                address=XDPE_MOD0_LL_BW_ADDRESS,
+                start=start,
+                length=length,
+                word=after,
+                raw=raw,
+            )
+        if after != before:
+            self._write_xdpe_ahb_word(XDPE_MOD0_LL_BW_ADDRESS, after)
+        readback = self.read_mod0_ll_bandwidth(page)
+        if not readback["equal"] or readback["value"] != raw:
+            raise RuntimeError("Loop-A LS/LR bandwidth readback does not match the requested shared value.")
+        return {
+            "name": "loop_a.mod0_ll_bandwidth",
+            "memory_address": f"0x{XDPE_MOD0_LL_BW_ADDRESS:08X}",
             "word_before": f"0x{before:08X}",
             "word_after": f"0x{after:08X}",
             "changed": before != after,

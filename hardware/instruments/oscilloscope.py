@@ -6,7 +6,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 import time
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -180,6 +180,130 @@ class TektronixOscilloscope(VisaInstrument):
             except Exception as exc:
                 last_error = exc
         raise RuntimeError(f"Could not set oscilloscope trigger position: {last_error}")
+
+    def acquisition_history_enabled(self) -> bool | None:
+        """Return the 4/5/6 Series acquisition-history state when supported."""
+
+        try:
+            response = self.query("HORIZONTAL:HISTORY:STATE?").strip().strip('"')
+        except Exception:
+            return None
+        if " " in response:
+            response = response.split()[-1].strip('"')
+        normalized = response.upper()
+        if normalized in {"1", "ON", "TRUE"}:
+            return True
+        if normalized in {"0", "OFF", "FALSE"}:
+            return False
+        return None
+
+    def set_acquisition_history(self, enabled: bool) -> bool | None:
+        """Enable or disable the on-scope acquisition-history buffer."""
+
+        self.write(f"HORIZONTAL:HISTORY:STATE {'ON' if enabled else 'OFF'}")
+        return self.acquisition_history_enabled()
+
+    def set_record_length(self, points: int) -> int:
+        """Set manual-mode record length and return the instrument readback."""
+
+        requested = max(10_000, int(points))
+        last_error: Exception | None = None
+        for write_command, query_command in (
+            ("HORIZONTAL:MODE:RECORDLENGTH", "HORIZONTAL:MODE:RECORDLENGTH?"),
+            ("HORIZONTAL:RECORDLENGTH", "HORIZONTAL:RECORDLENGTH?"),
+        ):
+            try:
+                self.write(f"{write_command} {requested}")
+                return max(1, int(round(self._parse_numeric_response(self.query(query_command)))))
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"Could not set oscilloscope record length: {last_error}")
+
+    def prepare_autotune_acquisition(
+        self,
+        *,
+        max_record_length: int = 250_000,
+        maintenance_interval: int = 100,
+        force_flush: bool = False,
+    ) -> dict[str, Any]:
+        """Put an MSO4/5/6 into a bounded-memory acquisition configuration.
+
+        Acquisition History stores every Single/Sequence acquisition on these
+        scopes.  A long hardware loop can therefore exhaust the instrument's
+        own RAM even though the Python process releases each waveform.  Auto
+        tune only needs the current CH1/response record, so history is always
+        disabled and record length is capped.  A forced flush changes the
+        record length briefly; Tektronix documents that a horizontal or
+        acquisition change flushes existing History acquisitions.
+        """
+
+        target_max = max(10_000, int(max_record_length))
+        interval = max(1, int(maintenance_interval))
+        acquisition_count = max(0, int(getattr(self, "_autotune_acquisition_count", 0)))
+        maintenance_due = acquisition_count == 0 or acquisition_count % interval == 0
+
+        try:
+            self.stop_acquisition()
+        except Exception:
+            pass
+
+        history_before = self.acquisition_history_enabled()
+        history_after: bool | None = None
+        try:
+            history_after = self.set_acquisition_history(False)
+        except Exception:
+            # Older Tek firmware may not implement History. Continue with the
+            # record-length guard instead of making that optional feature fatal.
+            history_after = None
+
+        record_length_before: int | None = None
+        try:
+            record_length_before = self.waveform_record_points("CH1")
+        except Exception:
+            record_length_before = None
+        desired_length = (
+            min(record_length_before, target_max)
+            if record_length_before is not None and record_length_before > 0
+            else target_max
+        )
+
+        record_length_after = record_length_before
+        record_length_changed = False
+        if force_flush:
+            temporary_length = max(10_000, min(100_000, desired_length // 2))
+            if temporary_length < desired_length:
+                self.set_record_length(temporary_length)
+            record_length_after = self.set_record_length(desired_length)
+            record_length_changed = True
+        elif record_length_before is None or record_length_before > target_max:
+            record_length_after = self.set_record_length(desired_length)
+            record_length_changed = True
+
+        if maintenance_due or force_flush:
+            # Sample mode avoids retaining analysis-heavy acquisition modes.
+            # Re-applying it is also a documented acquisition-parameter change
+            # that clears stale History data when recovery is requested.
+            try:
+                self.write("ACQUIRE:MODE SAMPLE")
+            except Exception:
+                pass
+        try:
+            self.clear_status()
+        except Exception:
+            pass
+
+        self._autotune_acquisition_count = acquisition_count + 1
+        return {
+            "history_before": history_before,
+            "history_after": history_after,
+            "record_length_before": record_length_before,
+            "record_length_after": record_length_after,
+            "record_length_cap": target_max,
+            "record_length_changed": record_length_changed,
+            "maintenance_due": maintenance_due,
+            "force_flush": bool(force_flush),
+            "acquisition_count": acquisition_count + 1,
+        }
 
     def single_acquisition(
         self,

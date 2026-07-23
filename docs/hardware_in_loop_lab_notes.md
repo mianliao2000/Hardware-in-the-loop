@@ -53,6 +53,25 @@ This keeps the full waveform available for future analysis while avoiding repeat
 python scripts/compact_scope_npz.py results/autotune_runs/recent/Recent_YYYY-MM-DD_NN
 ```
 
+### MSO58 long-run memory guard
+
+The MSO58 Acquisition History feature stores Single/Sequence acquisitions in
+the oscilloscope's own RAM. In a multi-thousand-iteration run this can trigger
+the front-panel `SEVERE: The system is low on memory` warning even when Python
+and the browser remain healthy. Auto-Tune therefore:
+
+- forces `HORIZONTAL:HISTORY:STATE OFF` before acquisition;
+- caps the on-scope record length at 250,000 points (the 105 us transient
+  window still has far more sampling resolution than the 0.25 us Ts bins);
+- reapplies Sample mode and clears status every 100 acquisitions;
+- on a timeout, changes record length to flush stale History data, reconnects
+  VISA, and retries the same capture up to three times;
+- if all recovery attempts fail, pauses without adding a false Penalty=300
+  training label, so the operator can dismiss the scope warning and Resume.
+
+The returned Scope diagnostics contain `scope_memory_guard` and
+`scope_recovery_attempts` for post-run verification.
+
 ## XDP / PMBus Board Control
 
 The board is controlled through PMBus over the XDP dongle. The active controller address used during testing was:

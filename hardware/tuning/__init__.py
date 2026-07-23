@@ -8,6 +8,9 @@ from .models import (
     HARDWARE_TUNING_FIELD_NAMES,
     HardwarePidCandidate,
     IterationRecord,
+    LL_BANDWIDTH_MAX,
+    LL_BANDWIDTH_MAX_BONUS,
+    LL_BANDWIDTH_MIN,
     PID_FIELD_NAMES,
     PidParameters,
     PlantParams,
@@ -18,10 +21,19 @@ from .models import (
     TuningRunSnapshot,
     TuningTargets,
     Waveform,
+    automatic_search_parameter,
+    bandwidth_bonus,
+    bandwidth_objective,
 )
 from .pid_programmer import PidProgrammer, StubPidProgrammer
 from .runner import AutotuneExperimentRunner, PidAutotuneSession, PlaceholderExperimentRunner
-from .search import GridRefinePidTuner, HardwareGridHeuristicTuner, TuningCandidate, select_best_result
+from .search import (
+    GridRefinePidTuner,
+    HardwareGridHeuristicTuner,
+    TuningCandidate,
+    select_best_result,
+    select_diverse_results,
+)
 
 __all__ = [
     "AutotuneExperimentConfig",
@@ -33,6 +45,9 @@ __all__ = [
     "HardwareGridHeuristicTuner",
     "HardwarePidCandidate",
     "IterationRecord",
+    "LL_BANDWIDTH_MAX",
+    "LL_BANDWIDTH_MAX_BONUS",
+    "LL_BANDWIDTH_MIN",
     "PID_FIELD_NAMES",
     "PidAutotuneSession",
     "PidParameters",
@@ -49,6 +64,10 @@ __all__ = [
     "TuningRunSnapshot",
     "TuningTargets",
     "Waveform",
+    "automatic_search_parameter",
+    "bandwidth_bonus",
+    "bandwidth_objective",
     "score_metrics",
     "select_best_result",
+    "select_diverse_results",
 ]

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import math
+from pathlib import Path
 import time
 import unittest
+
+import numpy as np
 
 from hardware.tuning import (
     CompensatorDesign,
     ExperimentResult,
+    HardwarePidCandidate,
     HardwareGridHeuristicTuner,
     IterationRecord,
     PidAutotuneSession,
@@ -20,7 +25,7 @@ from hardware.tuning import (
     TuningTargets,
     Waveform,
 )
-from hardware.tuning.search import hardware_candidate_key
+from hardware.tuning.search import hardware_candidate_key, select_best_result, select_diverse_results
 from hardware.tuning.analyzer import _passed_reward, score_metrics
 
 
@@ -42,6 +47,65 @@ class TuningFrameworkTest(unittest.TestCase):
         )
         reward = _passed_reward(targets, transient, None, None, None, True, False)
         self.assertAlmostEqual(reward, 1.0)
+
+    def test_penalty_is_capped_at_three_hundred(self) -> None:
+        targets = TuningTargets(settling_time_s=2e-6)
+        penalty = score_metrics(100.0, 100.0, 50, 100e-6, 100e-6, targets)
+        self.assertEqual(penalty, 300.0)
+
+    def test_passing_reward_has_no_hard_minimum(self) -> None:
+        targets = TuningTargets(settling_time_s=2e-6)
+        analyzer = ResponseAnalyzer(targets)
+        transient = ResponseMetrics(
+            overshoot_pct=0.0,
+            undershoot_pct=0.0,
+            settling_time_s=0.0,
+            oscillations=0,
+            score=0.0,
+            passed=True,
+            overshoot_settling_time_s=0.0,
+            undershoot_settling_time_s=0.0,
+        )
+        analyzer.analyze = lambda waveform: transient
+
+        metrics = analyzer.analyze_hardware(
+            Waveform(time_s=[], vout_v=[]),
+            {"phase_margin_deg": 90.0, "phase_crossover_hz": 100_000.0},
+        )
+
+        self.assertTrue(metrics.passed)
+        self.assertLess(metrics.score, -3.0)
+
+    def test_bode_gain_shape_failure_adds_penalty_and_blocks_pass(self) -> None:
+        analyzer = ResponseAnalyzer(TuningTargets())
+        transient = ResponseMetrics(
+            overshoot_pct=0.5,
+            undershoot_pct=0.5,
+            settling_time_s=1e-6,
+            oscillations=0,
+            score=0.0,
+            passed=True,
+            overshoot_settling_time_s=1e-6,
+            undershoot_settling_time_s=1e-6,
+        )
+
+        metrics = analyzer.analyze_hardware(
+            None,
+            {
+                "phase_margin_deg": 80.0,
+                "phase_crossover_hz": 120_000.0,
+                "gain_shape_valid": False,
+                "gain_rebound_db": 5.0,
+                "gain_flat_span_decades": 0.38,
+                "gain_shape_penalty": 60.0,
+            },
+            precomputed_transient=transient,
+        )
+
+        self.assertFalse(metrics.passed)
+        self.assertEqual(metrics.score, 60.0)
+        self.assertEqual(metrics.bode_gain_shape_penalty, 60.0)
+        self.assertTrue(any("bode gain shape failed" in reason for reason in metrics.pass_reasons))
 
     def test_compensator_generates_positive_pid_terms(self) -> None:
         pid = CompensatorDesign(PlantParams()).compute(157_080.0, 60.0)
@@ -85,7 +149,7 @@ class TuningFrameworkTest(unittest.TestCase):
 
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.mod0_kp, 255)
-        self.assertEqual(candidate.mod0_kpole1, 0)
+        self.assertEqual(candidate.mod0_kpole1, 2)
 
     def test_hardware_search_does_not_repeat_baseline(self) -> None:
         search = SearchSpace(max_iterations=10)
@@ -109,7 +173,7 @@ class TuningFrameworkTest(unittest.TestCase):
             seen.add(key)
 
     def test_hardware_search_continues_local_refine_to_max_iterations(self) -> None:
-        search = SearchSpace(max_iterations=100)
+        search = SearchSpace(max_iterations=100, max_coarse_iterations=80, max_refined_iterations=20)
         tuner = HardwareGridHeuristicTuner(search)
         history: list[IterationRecord] = []
         best: IterationRecord | None = None
@@ -224,9 +288,202 @@ class TuningFrameworkTest(unittest.TestCase):
         self.assertEqual({candidate.mod0_kp for candidate in coordinates} & {100, 255}, {100, 255})
         self.assertEqual({candidate.mod0_ki for candidate in coordinates} & {150, 255}, {150, 255})
         self.assertEqual({candidate.mod0_kd for candidate in coordinates} & {100, 200}, {100, 200})
-        self.assertEqual({candidate.mod0_kpole1 for candidate in coordinates}, {3, 6})
-        self.assertTrue(all(candidate.mod0_kpole1 == candidate.mod0_kpole2 for candidate in coordinates))
+        self.assertEqual({candidate.mod0_kpole1 for candidate in coordinates}, {2, 3, 4, 5, 6})
+        self.assertEqual({candidate.mod0_kpole2 for candidate in coordinates}, {2, 3, 4, 5, 6})
+        self.assertTrue(any(candidate.mod0_kpole1 != candidate.mod0_kpole2 for candidate in coordinates))
         self.assertEqual(len({hardware_candidate_key(candidate) for candidate in coordinates}), len(coordinates))
+
+    def test_recommendations_return_five_distinct_valid_basins(self) -> None:
+        candidates = [
+            HardwarePidCandidate(mod0_kp=100, mod0_ki=150, mod0_kd=100, mod0_kpole1=3, mod0_kpole2=3),
+            HardwarePidCandidate(mod0_kp=255, mod0_ki=255, mod0_kd=200, mod0_kpole1=6, mod0_kpole2=6),
+            HardwarePidCandidate(mod0_kp=100, mod0_ki=255, mod0_kd=200, mod0_kpole1=3, mod0_kpole2=6),
+            HardwarePidCandidate(mod0_kp=255, mod0_ki=150, mod0_kd=100, mod0_kpole1=6, mod0_kpole2=3),
+            HardwarePidCandidate(mod0_kp=178, mod0_ki=202, mod0_kd=150, mod0_kpole1=4, mod0_kpole2=5),
+        ]
+
+        def record(iteration: int, candidate: HardwarePidCandidate, score: float) -> IterationRecord:
+            return IterationRecord(
+                iteration=iteration,
+                phase="drl_policy",
+                wc_rad_s=0.0,
+                phi_deg=0.0,
+                pid=PidParameters(kp=0.0, ki=0.0, kd=0.0, kf=0.0),
+                metrics=ResponseMetrics(
+                    overshoot_pct=1.0,
+                    undershoot_pct=1.0,
+                    settling_time_s=1e-6,
+                    oscillations=0,
+                    score=score,
+                    passed=False,
+                ),
+                waveform=Waveform(time_s=[], vout_v=[]),
+                timestamp=float(iteration),
+                candidate=candidate,
+            )
+
+        records = [record(index + 1, candidate, float(index + 1)) for index, candidate in enumerate(candidates)]
+        records.append(record(6, candidates[0], 0.5))
+        records.append(record(7, HardwarePidCandidate(mod0_kp=220), 300.0))
+        records.append(record(8, HardwarePidCandidate(mod0_kp=221), float("inf")))
+        selected = select_diverse_results(records, 5)
+        self.assertEqual(len(selected), 5)
+        self.assertEqual(len({hardware_candidate_key(item.candidate) for item in selected}), 5)
+        self.assertNotIn(7, {item.iteration for item in selected})
+        self.assertNotIn(8, {item.iteration for item in selected})
+        self.assertIn(6, {item.iteration for item in selected})
+
+    def test_recommendations_prefer_low_penalty_across_distinct_basins(self) -> None:
+        candidates = [
+            HardwarePidCandidate(mod0_kp=100, mod0_ki=150, mod0_kd=100, mod0_kpole1=3, mod0_kpole2=3),
+            HardwarePidCandidate(mod0_kp=255, mod0_ki=255, mod0_kd=200, mod0_kpole1=6, mod0_kpole2=6),
+            HardwarePidCandidate(mod0_kp=100, mod0_ki=255, mod0_kd=200, mod0_kpole1=3, mod0_kpole2=6),
+            HardwarePidCandidate(mod0_kp=255, mod0_ki=150, mod0_kd=100, mod0_kpole1=6, mod0_kpole2=3),
+            HardwarePidCandidate(mod0_kp=178, mod0_ki=202, mod0_kd=150, mod0_kpole1=4, mod0_kpole2=5),
+            HardwarePidCandidate(mod0_kp=178, mod0_ki=202, mod0_kd=150, mod0_kpole1=5, mod0_kpole2=4),
+        ]
+
+        records = []
+        for index, candidate in enumerate(candidates, start=1):
+            high_penalty = index == len(candidates)
+            records.append(IterationRecord(
+                iteration=index,
+                phase="drl_policy",
+                wc_rad_s=0.0,
+                phi_deg=0.0,
+                pid=PidParameters(kp=0.0, ki=0.0, kd=0.0, kf=0.0),
+                metrics=ResponseMetrics(
+                    overshoot_pct=0.1 if high_penalty else 1.0,
+                    undershoot_pct=0.1 if high_penalty else 1.0,
+                    settling_time_s=1e-6,
+                    oscillations=0,
+                    score=80.0 if high_penalty else float(index),
+                    passed=True,
+                ),
+                waveform=Waveform(time_s=[], vout_v=[]),
+                timestamp=float(index),
+                candidate=candidate,
+            ))
+
+        selected = select_diverse_results(records, 5)
+
+        self.assertEqual([record.metrics.score for record in selected], [1.0, 2.0, 3.0, 4.0, 5.0])
+        self.assertNotIn(6, {record.iteration for record in selected})
+
+    def test_best_prefers_confirmed_and_basins_fill_after_confirmed(self) -> None:
+        lucky = HardwarePidCandidate(mod0_kp=200)
+        stable = HardwarePidCandidate(mod0_kp=150)
+        second_stable = HardwarePidCandidate(mod0_kp=160)
+
+        def record(iteration: int, candidate: HardwarePidCandidate, score: float, passed: bool = True) -> IterationRecord:
+            return IterationRecord(
+                iteration=iteration,
+                phase="drl_confirm",
+                wc_rad_s=0.0,
+                phi_deg=0.0,
+                pid=PidParameters(kp=0.0, ki=0.0, kd=0.0, kf=0.0),
+                metrics=ResponseMetrics(0.5, 0.5, 1e-6, 0, score, passed),
+                waveform=Waveform(time_s=[], vout_v=[]),
+                timestamp=float(iteration),
+                candidate=candidate,
+            )
+
+        records = [record(1, lucky, -100.0)]
+        records.extend(record(index, stable, score) for index, score in zip((2, 3, 4), (-10.0, -12.0, -11.0)))
+        records.extend(record(index, second_stable, score) for index, score in zip((5, 6, 7), (-8.0, -9.0, -10.0)))
+
+        best = select_best_result(records)
+        basins = select_diverse_results(records, 5)
+
+        self.assertIsNotNone(best)
+        self.assertEqual(hardware_candidate_key(best.candidate), hardware_candidate_key(stable))
+        self.assertEqual(
+            [hardware_candidate_key(item.candidate) for item in basins],
+            [
+                hardware_candidate_key(stable),
+                hardware_candidate_key(second_stable),
+                hardware_candidate_key(lucky),
+            ],
+        )
+
+    def test_completed_run_restores_confirmed_best(self) -> None:
+        candidate = HardwarePidCandidate(mod0_kp=151, mod0_ki=199, mod0_kd=112)
+
+        class RepeatingTuner:
+            def next_candidate(self, history, best):
+                return candidate if len(history) < 3 else None
+
+        class RestoringRunner:
+            def __init__(self):
+                self.restored = None
+
+            def evaluate(self, proposed, config, experiment):
+                return ExperimentResult(
+                    waveform=Waveform(time_s=[0.0], vout_v=[config.targets.vout_target_v]),
+                    metrics=ResponseMetrics(0.5, 0.5, 1e-6, 0, -10.0, True),
+                )
+
+            def restore_candidate(self, restored, config, experiment):
+                self.restored = restored
+                return {"ok": True}
+
+        runner = RestoringRunner()
+        config = TuningConfig(
+            search=SearchSpace(max_iterations=3, max_coarse_iterations=3, max_refined_iterations=0)
+        )
+        session = PidAutotuneSession(
+            config=config,
+            experiment_runner=runner,
+            tuner_factory=lambda config, experiment, history: RepeatingTuner(),
+        )
+
+        session.step()
+        session.step()
+        status = session.step()
+
+        self.assertEqual(status["state"], "complete")
+        self.assertEqual(runner.restored, candidate)
+        self.assertIn("Restored confirmed Best", status["message"])
+
+    def test_no_fresh_candidate_completion_restores_confirmed_best(self) -> None:
+        candidate = HardwarePidCandidate(mod0_kp=151, mod0_ki=199, mod0_kd=112, mod0_ll_bw=76)
+
+        class ExhaustedTuner:
+            def next_candidate(self, history, best):
+                return candidate if len(history) < 3 else None
+
+        class RestoringRunner:
+            def __init__(self):
+                self.restored = None
+
+            def evaluate(self, proposed, config, experiment):
+                return ExperimentResult(
+                    waveform=Waveform(time_s=[0.0], vout_v=[config.targets.vout_target_v]),
+                    metrics=ResponseMetrics(0.5, 0.5, 1e-6, 0, -10.0, True),
+                )
+
+            def restore_candidate(self, restored, config, experiment):
+                self.restored = restored
+                return {"ok": True}
+
+        runner = RestoringRunner()
+        config = TuningConfig(
+            search=SearchSpace(max_iterations=10, max_coarse_iterations=10, max_refined_iterations=0)
+        )
+        session = PidAutotuneSession(
+            config=config,
+            experiment_runner=runner,
+            tuner_factory=lambda config, experiment, history: ExhaustedTuner(),
+        )
+
+        session.step()
+        session.step()
+        session.step()
+        status = session.step()
+
+        self.assertEqual(status["state"], "complete")
+        self.assertEqual(runner.restored, candidate)
+        self.assertIn("Restored confirmed Best", status["message"])
 
     def test_session_stops_when_local_refine_penalty_saturates(self) -> None:
         class FlatRunner:
@@ -441,7 +698,8 @@ class TuningFrameworkTest(unittest.TestCase):
 
         metrics = ResponseAnalyzer(TuningTargets()).analyze(Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v))
 
-        self.assertGreater(metrics.undershoot_settling_time_s, 10e-6)
+        self.assertFalse(metrics.undershoot_settling_valid)
+        self.assertEqual(metrics.score, 300.0)
 
     def test_overshoot_settling_includes_later_dip_after_falling_edge(self) -> None:
         dt = 0.1e-6
@@ -464,7 +722,8 @@ class TuningFrameworkTest(unittest.TestCase):
 
         metrics = ResponseAnalyzer(TuningTargets()).analyze(Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v))
 
-        self.assertGreater(metrics.overshoot_settling_time_s, 10e-6)
+        self.assertFalse(metrics.overshoot_settling_valid)
+        self.assertEqual(metrics.score, 300.0)
 
     def test_overshoot_settling_catches_shallow_dip_after_first_recovery(self) -> None:
         dt = 0.05e-6
@@ -535,6 +794,329 @@ class TuningFrameworkTest(unittest.TestCase):
         metrics = ResponseAnalyzer(TuningTargets()).analyze(Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v))
 
         self.assertLess(metrics.undershoot_settling_time_s, 8e-6)
+
+    def test_settling_v15_uses_direction_aware_asymmetric_band(self) -> None:
+        dt = 0.05e-6
+        time_s = [(index - 40) * dt for index in range(2140)]
+        input_v: list[float] = []
+        vout_v: list[float] = []
+        for time_value in time_s:
+            t_us = time_value * 1e6
+            input_v.append(2.0 if 0.0 <= t_us < 50.0 or t_us >= 100.0 else 0.0)
+            if t_us < 0.0:
+                value = 0.92
+            elif t_us < 0.8:
+                value = 0.92 - t_us / 0.8 * 0.10
+            elif t_us < 1.8:
+                value = 0.82
+            elif t_us < 2.8:
+                value = 0.82 + (t_us - 1.8) * 0.006
+            elif t_us < 4.0:
+                value = 0.826 - (t_us - 2.8) / 1.2 * 0.006
+            elif t_us < 50.0:
+                value = 0.82
+            elif t_us < 50.8:
+                value = 0.82 + (t_us - 50.0) / 0.8 * 0.10
+            elif t_us < 52.0:
+                value = 0.92
+            elif t_us < 56.0:
+                value = 0.92 + (t_us - 52.0) / 4.0 * 0.006
+            elif t_us < 60.0:
+                value = 0.926 - (t_us - 56.0) / 4.0 * 0.006
+            elif t_us < 100.0:
+                value = 0.92
+            else:
+                value = 0.82
+            vout_v.append(value)
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(
+            Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v)
+        )
+
+        self.assertEqual(metrics.settling_analysis_version, 15)
+        self.assertGreater(metrics.undershoot_settling_time_s, 3.3e-6)
+        self.assertLess(metrics.undershoot_settling_time_s, 3.5e-6)
+        self.assertGreater(metrics.overshoot_settling_time_s, 6.4e-6)
+        self.assertLess(metrics.overshoot_settling_time_s, 6.8e-6)
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["lower_tolerance_mv"], 5.0)
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["upper_tolerance_mv"], 3.0)
+        self.assertEqual(metrics.settling_diagnostics["overshoot"]["lower_tolerance_mv"], 3.0)
+        self.assertEqual(metrics.settling_diagnostics["overshoot"]["upper_tolerance_mv"], 5.0)
+        self.assertIsNone(metrics.settling_diagnostics["undershoot"]["band_ramp_start_us"])
+        self.assertIsNone(metrics.settling_diagnostics["undershoot"]["band_ramp_stop_us"])
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["decision_filter_hz"], 600_000.0)
+        self.assertEqual(metrics.settling_diagnostics["undershoot"]["band_schedule"], "voltage falling: -5/+3 mV")
+        self.assertEqual(metrics.settling_diagnostics["overshoot"]["band_schedule"], "voltage rising: -3/+5 mV")
+
+    def test_iteration_1728_uses_final_entry_not_first_entry(self) -> None:
+        artifact = Path(
+            "results/autotune_runs/saved/Permanent_2026-07-21_02/files/iteration_1728_scope.npz"
+        )
+        if not artifact.is_file():
+            self.skipTest("iteration 1728 scope artifact is not available")
+        with np.load(artifact, allow_pickle=False) as payload:
+            points = int(payload["points"])
+            time_s = (
+                float(payload["x_start"])
+                + np.arange(points, dtype=np.float64) * float(payload["x_increment"])
+            )
+            waveform = Waveform(
+                time_s=time_s.tolist(),
+                vout_v=np.asarray(payload["y_CH3"], dtype=np.float64).tolist(),
+                input_v=np.asarray(payload["y_CH1"], dtype=np.float64).tolist(),
+            )
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(waveform)
+
+        self.assertTrue(metrics.undershoot_settling_valid)
+        self.assertTrue(metrics.overshoot_settling_valid)
+        self.assertGreater(metrics.undershoot_settling_time_s, 2.6e-6)
+        self.assertLess(metrics.undershoot_settling_time_s, 2.8e-6)
+        self.assertGreater(metrics.overshoot_settling_time_s, 7.3e-6)
+        self.assertLess(metrics.overshoot_settling_time_s, 7.6e-6)
+
+    def test_iteration_298_uses_six_hundred_khz_asymmetric_band(self) -> None:
+        artifact = Path(
+            "results/autotune_runs/saved/Permanent_2026-07-21_02/files/iteration_298_scope.npz"
+        )
+        if not artifact.is_file():
+            self.skipTest("iteration 298 scope artifact is not available")
+        with np.load(artifact, allow_pickle=False) as payload:
+            points = int(payload["points"])
+            time_s = (
+                float(payload["x_start"])
+                + np.arange(points, dtype=np.float64) * float(payload["x_increment"])
+            )
+            waveform = Waveform(
+                time_s=time_s.tolist(),
+                vout_v=np.asarray(payload["y_CH3"], dtype=np.float64).tolist(),
+                input_v=np.asarray(payload["y_CH1"], dtype=np.float64).tolist(),
+            )
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(waveform)
+
+        self.assertTrue(metrics.undershoot_settling_valid)
+        self.assertTrue(metrics.overshoot_settling_valid)
+        self.assertGreater(metrics.undershoot_settling_time_s, 1.0e-6)
+        self.assertLess(metrics.undershoot_settling_time_s, 1.2e-6)
+        self.assertGreater(metrics.overshoot_settling_time_s, 1.0e-6)
+        self.assertLess(metrics.overshoot_settling_time_s, 1.3e-6)
+
+    def test_iteration_124_respects_five_mv_rising_upper_band(self) -> None:
+        artifact = Path(
+            "results/autotune_runs/saved/Permanent_2026-07-21_02/files/iteration_124_scope.npz"
+        )
+        if not artifact.is_file():
+            self.skipTest("iteration 124 scope artifact is not available")
+        with np.load(artifact, allow_pickle=False) as payload:
+            points = int(payload["points"])
+            time_s = (
+                float(payload["x_start"])
+                + np.arange(points, dtype=np.float64) * float(payload["x_increment"])
+            )
+            waveform = Waveform(
+                time_s=time_s.tolist(),
+                vout_v=np.asarray(payload["y_CH3"], dtype=np.float64).tolist(),
+                input_v=np.asarray(payload["y_CH1"], dtype=np.float64).tolist(),
+            )
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(waveform)
+        diagnostics = metrics.settling_diagnostics["overshoot"]
+
+        self.assertTrue(metrics.overshoot_settling_valid)
+        self.assertGreater(metrics.overshoot_settling_time_s, 1.1e-6)
+        self.assertLess(metrics.overshoot_settling_time_s, 1.4e-6)
+        self.assertEqual(diagnostics["secondary_excursion_count"], 0)
+
+    def test_iteration_1511_uses_six_hundred_khz_asymmetric_band(self) -> None:
+        artifact = Path(
+            "results/autotune_runs/saved/Permanent_2026-07-21_02/files/iteration_1511_scope.npz"
+        )
+        if not artifact.is_file():
+            self.skipTest("iteration 1511 scope artifact is not available")
+        with np.load(artifact, allow_pickle=False) as payload:
+            points = int(payload["points"])
+            time_s = (
+                float(payload["x_start"])
+                + np.arange(points, dtype=np.float64) * float(payload["x_increment"])
+            )
+            waveform = Waveform(
+                time_s=time_s.tolist(),
+                vout_v=np.asarray(payload["y_CH3"], dtype=np.float64).tolist(),
+                input_v=np.asarray(payload["y_CH1"], dtype=np.float64).tolist(),
+            )
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(waveform)
+        diagnostics = metrics.settling_diagnostics["undershoot"]
+
+        self.assertTrue(metrics.undershoot_settling_valid)
+        self.assertGreater(metrics.undershoot_settling_time_s, 1.0e-6)
+        self.assertLess(metrics.undershoot_settling_time_s, 1.2e-6)
+        self.assertGreater(metrics.overshoot_settling_time_s, 1.0e-6)
+        self.assertLess(metrics.overshoot_settling_time_s, 1.2e-6)
+        self.assertGreater(diagnostics["first_entry_us"], 1.0)
+        self.assertLess(diagnostics["first_entry_us"], 1.2)
+        self.assertFalse(diagnostics["uses_time_bins"])
+        self.assertEqual(diagnostics["lower_tolerance_mv"], 5.0)
+        self.assertEqual(diagnostics["upper_tolerance_mv"], 3.0)
+        self.assertEqual(diagnostics["prominent_reversal_count"], 0)
+        self.assertEqual(diagnostics["secondary_excursion_count"], 0)
+
+    def test_settling_v15_filters_high_frequency_tail_without_false_invalid(self) -> None:
+        dt = 0.1e-6
+        time_s = [(index - 20) * dt for index in range(1070)]
+        input_v: list[float] = []
+        vout_v: list[float] = []
+        for time_value in time_s:
+            t_us = time_value * 1e6
+            high_load = 0.0 <= t_us < 50.0 or t_us >= 100.0
+            input_v.append(2.0 if high_load else 0.0)
+            target = 0.82 if high_load else 0.92
+            if t_us < 0.0:
+                target = 0.92
+            ripple = 0.006 if int(max(t_us, 0.0) / 0.6) % 2 else -0.006
+            vout_v.append(target + ripple)
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(
+            Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v)
+        )
+
+        self.assertTrue(metrics.passed)
+        self.assertLess(metrics.score, 300.0)
+        self.assertTrue(metrics.undershoot_settling_valid)
+        self.assertTrue(metrics.overshoot_settling_valid)
+
+    def test_settling_does_not_turn_slow_steady_drift_into_watch_window_limit(self) -> None:
+        dt = 0.1e-6
+        count = 1070
+        time_s = [(index - 20) * dt for index in range(count)]
+        input_v = []
+        vout_v = []
+        for time_value in time_s:
+            t_us = time_value * 1e6
+            input_v.append(2.0 if 0.0 <= t_us < 50.0 or t_us >= 100.0 else 0.0)
+            if t_us < 0.0:
+                vout_v.append(0.935)
+            elif t_us < 50.0:
+                elapsed = t_us
+                vout_v.append(0.837 - 0.020 * math.exp(-elapsed / 0.7))
+            elif t_us < 58.0:
+                elapsed = t_us - 50.0
+                vout_v.append(0.935 - 0.095 * math.exp(-elapsed / 1.2))
+            elif t_us < 100.0:
+                # A few millivolts of slow steady-state drift is not another
+                # transient and must not pin Ts to the 30 us reset-watch cap.
+                vout_v.append(0.938 - 0.003 * (t_us - 58.0) / 42.0)
+            else:
+                vout_v.append(0.84)
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(
+            Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v)
+        )
+
+        self.assertLess(metrics.overshoot_settling_time_s, 15e-6)
+        self.assertNotAlmostEqual(metrics.overshoot_settling_time_s, 30e-6, places=7)
+
+    def test_ch1_spike_and_threshold_chatter_do_not_create_extra_edges(self) -> None:
+        input_v = [0.0] * 100 + [2.0] * 100 + [0.0] * 100
+        input_v[20] = 20.0
+        input_v[99] = 0.95
+        input_v[100] = 1.05
+        input_v[101] = 0.98
+        input_v[102] = 2.0
+
+        edges = ResponseAnalyzer(TuningTargets()).input_edge_indices(input_v)
+
+        self.assertEqual([kind for _, kind in edges], ["rising", "falling"])
+        self.assertGreaterEqual(edges[0][0], 100)
+
+    def test_sustained_large_oscillation_has_no_settling_time_and_max_penalty(self) -> None:
+        dt = 0.05e-6
+        count = 2200
+        time_s = [(index - 40) * dt for index in range(count)]
+        input_v = []
+        vout_v = []
+        for time_value in time_s:
+            t_us = time_value * 1e6
+            high_load = 0.0 <= t_us < 50.0 or t_us >= 100.0
+            input_v.append(2.0 if high_load else 0.0)
+            if t_us < 0.0:
+                vout_v.append(0.935)
+            else:
+                center = 0.837 if high_load else 0.935
+                vout_v.append(center + 0.055 * math.sin(2.0 * math.pi * t_us / 2.0))
+
+        waveform = Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v)
+        analyzer = ResponseAnalyzer(TuningTargets())
+        transient = analyzer.analyze(waveform)
+        metrics = analyzer.analyze_hardware(
+            waveform,
+            {
+                "phase_margin_deg": 60.0,
+                "phase_crossover_hz": 150_000.0,
+                "gain_margin_db": 10.0,
+            },
+            precomputed_transient=transient,
+        )
+
+        self.assertFalse(metrics.passed)
+        self.assertEqual(metrics.score, 300.0)
+        self.assertEqual(metrics.overshoot_settling_time_s, 0.0)
+        self.assertEqual(metrics.undershoot_settling_time_s, 0.0)
+        self.assertGreaterEqual(metrics.oscillations, 8)
+        self.assertTrue(any("sustained oscillation" in reason for reason in metrics.pass_reasons))
+
+    def test_damped_ringing_is_not_classified_as_sustained_oscillation(self) -> None:
+        dt = 0.05e-6
+        count = 2200
+        time_s = [(index - 40) * dt for index in range(count)]
+        input_v = []
+        vout_v = []
+        for time_value in time_s:
+            t_us = time_value * 1e6
+            high_load = 0.0 <= t_us < 50.0 or t_us >= 100.0
+            input_v.append(2.0 if high_load else 0.0)
+            if t_us < 0.0:
+                vout_v.append(0.935)
+                continue
+            edge_time = 100.0 if t_us >= 100.0 else 50.0 if t_us >= 50.0 else 0.0
+            elapsed = t_us - edge_time
+            center = 0.837 if high_load else 0.935
+            vout_v.append(center + 0.055 * math.exp(-elapsed / 1.5) * math.sin(2.0 * math.pi * elapsed / 1.2))
+
+        metrics = ResponseAnalyzer(TuningTargets()).analyze(
+            Waveform(time_s=time_s, vout_v=vout_v, input_v=input_v)
+        )
+
+        self.assertLess(metrics.score, 300.0)
+        self.assertFalse(any("invalid transient waveform" in reason for reason in metrics.pass_reasons))
+
+    def test_hardware_analysis_can_reuse_synchronous_transient_snapshot(self) -> None:
+        analyzer = ResponseAnalyzer(TuningTargets())
+        transient = ResponseMetrics(
+            overshoot_pct=0.4,
+            undershoot_pct=0.5,
+            settling_time_s=3.2e-6,
+            oscillations=0,
+            score=12.0,
+            passed=False,
+            overshoot_settling_time_s=3.2e-6,
+            undershoot_settling_time_s=2.8e-6,
+        )
+
+        metrics = analyzer.analyze_hardware(
+            waveform=None,
+            bode_margins={
+                "phase_margin_deg": 60.0,
+                "phase_crossover_hz": 150_000.0,
+                "gain_margin_db": 10.0,
+            },
+            precomputed_transient=transient,
+        )
+
+        self.assertEqual(metrics.overshoot_settling_time_s, 3.2e-6)
+        self.assertEqual(metrics.undershoot_settling_time_s, 2.8e-6)
+        self.assertIn("transient limits not met", metrics.pass_reasons)
 
     def test_steady_voltage_fields_are_none_without_input_edges(self) -> None:
         waveform = Waveform(time_s=[0, 1e-6, 2e-6], vout_v=[0.9, 0.91, 0.9])
@@ -731,6 +1313,25 @@ class TuningFrameworkTest(unittest.TestCase):
         skipped = [record for record in status["history"] if record["write_results"].get("skipped")]
         self.assertEqual(len(skipped), 1)
         self.assertEqual(skipped[0]["phase"], "coordinate")
+
+    def test_scope_timeout_pauses_run_without_recording_a_false_penalty(self) -> None:
+        class Runner:
+            def evaluate(self, candidate, config, experiment):
+                raise RuntimeError(
+                    "Scope capture failed: Scope single acquisition did not complete within 8.0 s."
+                )
+
+        session = PidAutotuneSession(
+            config=TuningConfig(search=SearchSpace(max_coarse_iterations=4, max_refined_iterations=0)),
+            experiment_runner=Runner(),
+        )
+
+        status = session.step()
+
+        self.assertEqual(status["state"], "paused")
+        self.assertEqual(status["history"], [])
+        self.assertIn("Scope recovery exhausted", status["message"])
+        self.assertIn("Resume", status["message"])
 
 
 if __name__ == "__main__":

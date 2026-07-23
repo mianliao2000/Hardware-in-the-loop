@@ -24,6 +24,30 @@ export type ResponseMetrics = {
   phase_margin_deg?: number | null;
   crossover_frequency_hz?: number | null;
   gain_margin_db?: number | null;
+  bode_gain_rebound_db?: number | null;
+  bode_gain_flat_span_decades?: number | null;
+  bode_gain_slope_p90_db_per_decade?: number | null;
+  bode_gain_shape_penalty?: number;
+  settling_analysis_version?: number;
+  overshoot_settling_valid?: boolean;
+  undershoot_settling_valid?: boolean;
+  settling_diagnostics?: Record<
+    "overshoot" | "undershoot" | string,
+    {
+      method?: string;
+      edge?: string;
+      valid?: boolean;
+      local_steady_v?: number;
+      outer_tolerance_mv?: number;
+      core_tolerance_mv?: number;
+      excursion_tolerance_mv?: number;
+      main_watch_us?: number;
+      first_entry_us?: number | null;
+      final_entry_us?: number | null;
+      secondary_excursion_count?: number;
+      reason?: string;
+    }
+  >;
   pass_reasons?: string[];
 };
 
@@ -34,6 +58,7 @@ export type HardwarePidCandidate = {
   mod0_kpole1: number;
   mod0_kpole2: number;
   mod0_cm_gain: number;
+  mod0_ll_bw: number;
   output_inductance_nh: number;
   effective_lc_inductance_nh: number;
   phase: string;
@@ -53,6 +78,8 @@ export type IterationRecord = {
   bode_result?: Record<string, unknown>;
   scope_result?: Record<string, unknown>;
   duration_s?: number;
+  objective_score?: number | null;
+  bandwidth_bonus?: number | null;
   optimizer_metadata?: Record<string, unknown>;
 };
 
@@ -100,6 +127,7 @@ export type TuningConfig = {
     mod0_kpole1: SearchParameter;
     mod0_kpole2: SearchParameter;
     mod0_cm_gain: SearchParameter;
+    mod0_ll_bw: SearchParameter;
     output_inductance_nh: SearchParameter;
     effective_lc_inductance_nh: SearchParameter;
   };
@@ -174,7 +202,13 @@ export type TuningStatus = {
   experiment?: AutotuneExperimentConfig;
   current: IterationRecord | null;
   best: IterationRecord | null;
+  recommendations?: IterationRecord[];
   history: IterationRecord[];
+  history_delta?: boolean;
+  history_token?: string;
+  history_after_iteration?: number | null;
+  history_total?: number;
+  history_last_iteration?: number;
   pid_programming: {
     available: boolean;
     mode: string;
@@ -196,6 +230,7 @@ export type AutotuneRunInfo = {
 export type AutotuneRunSummary = {
   run_id: string;
   display_name?: string;
+  algorithm?: "DRL" | "Grid" | string;
   kind: "recent" | "saved" | string;
   path?: string;
   created_at?: number;
@@ -244,6 +279,13 @@ export type LlmChatResponse = {
   ok: boolean;
   reply?: string;
   model?: string;
+  completion?: {
+    complete: boolean;
+    completion_protocol: string;
+    continuations: number;
+    finish_reason: string;
+    max_tokens: number;
+  };
   error?: string;
 };
 

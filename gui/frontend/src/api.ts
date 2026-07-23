@@ -19,8 +19,14 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-export function getTuningStatus(): Promise<TuningStatus> {
-  return requestJson<TuningStatus>("/api/tuning/status");
+export function getTuningStatus(afterIteration?: number, historyToken?: string): Promise<TuningStatus> {
+  const params = new URLSearchParams();
+  if (afterIteration !== undefined && historyToken) {
+    params.set("after_iteration", String(Math.max(0, Math.round(afterIteration))));
+    params.set("history_token", historyToken);
+  }
+  const query = params.toString();
+  return requestJson<TuningStatus>(`/api/tuning/status${query ? `?${query}` : ""}`);
 }
 
 export function getDrlWorkflowStatus(): Promise<DrlWorkflowStatus> {

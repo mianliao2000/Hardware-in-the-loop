@@ -9,7 +9,21 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+import math
 from pathlib import Path
+import statistics
+
+
+GAIN_SHAPE_START_HZ = 2_000.0
+GAIN_SHAPE_STOP_HZ = 900_000.0
+GAIN_SHAPE_WINDOW_DECADES = 0.12
+GAIN_SHAPE_FLAT_SLOPE_DB_PER_DECADE = -4.0
+GAIN_SHAPE_ALLOWED_REBOUND_DB = 0.25
+GAIN_SHAPE_ALLOWED_FLAT_SPAN_DECADES = 0.12
+GAIN_SHAPE_MAX_REBOUND_DB = 1.00
+GAIN_SHAPE_MAX_FLAT_SPAN_DECADES = 0.18
+GAIN_SHAPE_REBOUND_PENALTY_PER_DB = 12.0
+GAIN_SHAPE_FLAT_PENALTY_PER_DECADE = 60.0
 
 from .visa_resource import VisaInstrument
 
@@ -23,6 +37,13 @@ class BodeStabilityMargins:
     gain_crossover_count: int = 0
     duplicate_gain_crossover: bool = False
     second_phase_crossover_hz: float | None = None
+    gain_rebound_db: float | None = None
+    gain_rebound_start_hz: float | None = None
+    gain_rebound_stop_hz: float | None = None
+    gain_flat_span_decades: float | None = None
+    gain_slope_p90_db_per_decade: float | None = None
+    gain_shape_penalty: float = 0.0
+    gain_shape_valid: bool | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -33,6 +54,13 @@ class BodeStabilityMargins:
             "gain_crossover_count": self.gain_crossover_count,
             "duplicate_gain_crossover": self.duplicate_gain_crossover,
             "second_phase_crossover_hz": self.second_phase_crossover_hz,
+            "gain_rebound_db": self.gain_rebound_db,
+            "gain_rebound_start_hz": self.gain_rebound_start_hz,
+            "gain_rebound_stop_hz": self.gain_rebound_stop_hz,
+            "gain_flat_span_decades": self.gain_flat_span_decades,
+            "gain_slope_p90_db_per_decade": self.gain_slope_p90_db_per_decade,
+            "gain_shape_penalty": self.gain_shape_penalty,
+            "gain_shape_valid": self.gain_shape_valid,
         }
 
 
@@ -235,6 +263,7 @@ def calculate_stability_margins(
         else None
     )
     gain_margin = -gain_at_phase_crossover if gain_at_phase_crossover is not None else None
+    gain_shape = calculate_gain_shape(frequency_hz, magnitude_db)
     return BodeStabilityMargins(
         phase_margin_deg=phase_margin,
         phase_crossover_hz=gain_crossover_hz,
@@ -243,13 +272,136 @@ def calculate_stability_margins(
         gain_crossover_count=len(gain_crossovers),
         duplicate_gain_crossover=len(gain_crossovers) > 1,
         second_phase_crossover_hz=gain_crossovers[1][0] if len(gain_crossovers) > 1 else None,
+        **gain_shape,
     )
 
 
+def calculate_gain_shape(
+    frequency_hz: list[float],
+    magnitude_db: list[float],
+) -> dict[str, float | bool | None]:
+    """Measure sustained gain rebound and flat spans on a logarithmic axis.
+
+    A seven-point median followed by a three-point mean suppresses isolated
+    Bode100 noise without hiding the broad 150--500 kHz rebound seen on the
+    bench. Slopes use 0.12-decade windows, so a single sample can neither fail
+    nor rescue the shape test.
+    """
+
+    points = sorted(
+        (float(frequency), float(gain))
+        for frequency, gain in zip(frequency_hz, magnitude_db)
+        if math.isfinite(float(frequency))
+        and math.isfinite(float(gain))
+        and GAIN_SHAPE_START_HZ <= float(frequency) <= GAIN_SHAPE_STOP_HZ
+    )
+    if len(points) < 20:
+        return {
+            "gain_rebound_db": None,
+            "gain_rebound_start_hz": None,
+            "gain_rebound_stop_hz": None,
+            "gain_flat_span_decades": None,
+            "gain_slope_p90_db_per_decade": None,
+            "gain_shape_penalty": 0.0,
+            "gain_shape_valid": None,
+        }
+    log_frequency = [math.log10(frequency) for frequency, _ in points]
+    gain = [value for _, value in points]
+    median_gain: list[float] = []
+    half_window = 3
+    for index in range(len(gain)):
+        start = max(0, index - half_window)
+        stop = min(len(gain), index + half_window + 1)
+        median_gain.append(float(statistics.median(gain[start:stop])))
+    smoothed_gain = [
+        sum(median_gain[max(0, index - 1) : min(len(median_gain), index + 2)])
+        / len(median_gain[max(0, index - 1) : min(len(median_gain), index + 2)])
+        for index in range(len(median_gain))
+    ]
+
+    running_minimum = smoothed_gain[0]
+    running_minimum_index = 0
+    rebound_db = 0.0
+    rebound_start_index = 0
+    rebound_stop_index = 0
+    for index, value in enumerate(smoothed_gain):
+        if value < running_minimum:
+            running_minimum = value
+            running_minimum_index = index
+        drawup = value - running_minimum
+        if drawup > rebound_db:
+            rebound_db = drawup
+            rebound_start_index = running_minimum_index
+            rebound_stop_index = index
+
+    slopes: list[tuple[float, float, float]] = []
+    for start_index, start_log_frequency in enumerate(log_frequency):
+        stop_index = start_index + 1
+        while (
+            stop_index < len(log_frequency)
+            and log_frequency[stop_index] - start_log_frequency < GAIN_SHAPE_WINDOW_DECADES
+        ):
+            stop_index += 1
+        if stop_index >= len(log_frequency):
+            break
+        width = log_frequency[stop_index] - start_log_frequency
+        slopes.append(
+            (
+                start_log_frequency,
+                log_frequency[stop_index],
+                (smoothed_gain[stop_index] - smoothed_gain[start_index]) / max(width, 1e-12),
+            )
+        )
+
+    flat_span_decades = 0.0
+    flat_start: float | None = None
+    for start_log_frequency, stop_log_frequency, slope in slopes:
+        if slope > GAIN_SHAPE_FLAT_SLOPE_DB_PER_DECADE:
+            if flat_start is None:
+                flat_start = start_log_frequency
+        elif flat_start is not None:
+            flat_span_decades = max(flat_span_decades, start_log_frequency - flat_start)
+            flat_start = None
+    if flat_start is not None and slopes:
+        flat_span_decades = max(flat_span_decades, slopes[-1][1] - flat_start)
+    sorted_slopes = sorted(slope for _, _, slope in slopes)
+    if sorted_slopes:
+        percentile_index = min(len(sorted_slopes) - 1, int(math.ceil(0.90 * len(sorted_slopes))) - 1)
+        slope_p90 = sorted_slopes[percentile_index]
+    else:
+        slope_p90 = None
+
+    shape_penalty = (
+        GAIN_SHAPE_REBOUND_PENALTY_PER_DB
+        * max(0.0, rebound_db - GAIN_SHAPE_ALLOWED_REBOUND_DB)
+        + GAIN_SHAPE_FLAT_PENALTY_PER_DECADE
+        * max(0.0, flat_span_decades - GAIN_SHAPE_ALLOWED_FLAT_SPAN_DECADES)
+    )
+    shape_valid = bool(
+        rebound_db <= GAIN_SHAPE_MAX_REBOUND_DB
+        and flat_span_decades <= GAIN_SHAPE_MAX_FLAT_SPAN_DECADES
+    )
+    return {
+        "gain_rebound_db": float(rebound_db),
+        "gain_rebound_start_hz": float(points[rebound_start_index][0]),
+        "gain_rebound_stop_hz": float(points[rebound_stop_index][0]),
+        "gain_flat_span_decades": float(flat_span_decades),
+        "gain_slope_p90_db_per_decade": float(slope_p90) if slope_p90 is not None else None,
+        "gain_shape_penalty": float(shape_penalty),
+        "gain_shape_valid": shape_valid,
+    }
+
+
 def _phase_margin_from_gain_crossover_phase(phase_deg: float) -> float:
-    if phase_deg >= 0.0:
-        return phase_deg
-    return 180.0 + phase_deg
+    # A single low-SNR point near the start of a sweep can make sequential
+    # unwrapping choose a branch offset by one or more full turns. Phase
+    # margin is periodic in 360 degrees, so canonicalize the interpolated
+    # crossover phase before distinguishing Bode100's positive margin-style
+    # phase from a classical negative loop phase.
+    canonical = (float(phase_deg) + 180.0) % 360.0 - 180.0
+    if canonical >= 0.0:
+        return canonical
+    return 180.0 + canonical
 
 
 def _unwrap_phase_deg(values: list[float]) -> list[float]:

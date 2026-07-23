@@ -56,6 +56,22 @@ class Bode100Driver:
         return self.visa_resource or BodeScpiClient.tcpip_resource(self.host, self.port)
 
     def is_scpi_server_running(self) -> bool:
+        # ScpiRunner's RAW server accepts a single client. A conventional TCP
+        # connect/close "port probe" is therefore destructive: the runner
+        # accepts the probe as its client and exits when it immediately sees
+        # EOF. Inspect the local listener table without opening a socket.
+        if str(self.host).strip().lower() in {"127.0.0.1", "localhost", "::1"}:
+            try:
+                import psutil
+
+                return any(
+                    connection.status == psutil.CONN_LISTEN
+                    and connection.laddr
+                    and int(connection.laddr.port) == int(self.port)
+                    for connection in psutil.net_connections(kind="tcp")
+                )
+            except Exception:
+                pass
         try:
             with socket.create_connection((self.host, int(self.port)), timeout=0.5):
                 return True
@@ -68,7 +84,15 @@ class Bode100Driver:
                 "Bode 100 serial number is required to start ScpiRunner. "
                 "Pass --serial or set BODE100_SERIAL."
             )
-        return [self.scpi_runner_path, "-s", self.serial_number]
+        return [
+            self.scpi_runner_path,
+            "-s",
+            self.serial_number,
+            "-i",
+            str(self.host),
+            "-p",
+            str(int(self.port)),
+        ]
 
     def ensure_scpi_server(self) -> None:
         if self.is_scpi_server_running():
@@ -94,6 +118,11 @@ class Bode100Driver:
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self._process = subprocess.Popen(
                 command,
+                # ScpiRunner is a console application whose "press enter to
+                # stop" loop exits immediately when stdin is inherited from a
+                # detached/closed server process. Keep an owned pipe open for
+                # the lifetime of the driver so the TCP listener persists.
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
@@ -143,6 +172,26 @@ class Bode100Driver:
         if self._client is not None:
             self._client.close()
             self._client = None
+
+    def stop_scpi_server(self) -> None:
+        """Stop only the ScpiRunner process started by this driver."""
+
+        process = self._process
+        self._process = None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.write(b"\n")
+                process.stdin.flush()
+                process.stdin.close()
+            process.wait(timeout=3.0)
+        except Exception:
+            try:
+                process.terminate()
+                process.wait(timeout=3.0)
+            except Exception:
+                pass
 
 
 def bode100_from_environment(**overrides) -> Bode100Driver:

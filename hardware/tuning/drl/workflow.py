@@ -21,17 +21,36 @@ from .common import (
     read_json,
     signatures_compatible,
 )
-from .dataset import build_collection_plan, load_autotune_dataset, save_collection_plan
+from .dataset import (
+    build_bootstrap_collection_plan,
+    build_collection_plan,
+    build_targeted_collection_plan,
+    load_autotune_dataset,
+    save_collection_plan,
+)
 from .model import SurrogateEnsemble, dependency_status, require_ml_dependencies, train_surrogate_ensemble
 from .policy import SafeSacTuner, train_safe_sac_policy, validation_start_candidates
 from .tuner import PlannedCandidateTuner
 
 
 COLLECTION_BUDGET = 240
+TARGETED_COLLECTION_BUDGET = 100
 VALIDATION_BUDGET = 60
 VALIDATION_EPISODES = 4
 VALIDATION_EPISODE_BUDGET = 15
 VALIDATION_CONFIRMATIONS = 3
+
+
+def _hardware_episode_budget(
+    config: TuningConfig,
+    experiment: AutotuneExperimentConfig,
+    *,
+    is_validation: bool,
+) -> int:
+    configured = max(1, int(experiment.drl_episode_budget))
+    if is_validation or not experiment.ignore_pass_until_max_iterations:
+        return configured
+    return max(configured, config.search.total_iteration_budget())
 
 
 class WorkflowStopped(RuntimeError):
@@ -104,7 +123,7 @@ class DrlWorkflowManager:
             expected_hash = (plan_manifest.get("files_sha256") or {}).get("plan.json")
             if not expected_hash or _sha256(plan_path) != expected_hash:
                 raise RuntimeError("DRL collection plan failed its persisted SHA-256 integrity check.")
-            return PlannedCandidateTuner(plan_path, history)
+            return PlannedCandidateTuner(plan_path, history, search=config.search)
         if algorithm not in {"deep-reinforcement", "safe-sac"}:
             raise RuntimeError(f"Unsupported optimization algorithm: {experiment.optimization_algorithm}")
 
@@ -141,27 +160,47 @@ class DrlWorkflowManager:
             for item in starts_payload.get("candidates", [])
             if isinstance(item, dict)
         ]
+        exploration_payload = read_json(model_dir / "exploration_starts.json") or {}
+        exploration_starts = [
+            _candidate_from_payload(item)
+            for item in exploration_payload.get("candidates", [])
+            if isinstance(item, dict)
+        ]
         required_starts = VALIDATION_EPISODES if is_validation else 1
         if len(starts) < required_starts:
             raise RuntimeError(
                 f"Safe SAC model '{model_id}' is missing its {required_starts} persisted validation start(s)."
             )
+        run_full_budget = bool(experiment.ignore_pass_until_max_iterations)
+        # A normal DRL run has one continuing hardware episode.  Previously
+        # its 15-step policy horizon was also used as the candidate-source
+        # lifetime, so a requested 500-iteration run stopped after 15 points
+        # with "no fresh candidates remain".  Keep the short horizon for
+        # validation/early-stop runs, but let full-budget hardware learning
+        # span the outer tuning budget.
+        episode_budget = _hardware_episode_budget(
+            config,
+            experiment,
+            is_validation=is_validation,
+        )
         return SafeSacTuner(
             ensemble=ensemble,
             policy_path=model_dir / "safe_sac_policy.zip",
             config=config,
             history=history,
             validation_starts=starts,
-            episode_budget=experiment.drl_episode_budget,
+            exploration_starts=exploration_starts,
+            episode_budget=episode_budget,
             confirmation_count=experiment.drl_confirmation_count,
             validation_episodes=VALIDATION_EPISODES if is_validation else 1,
             hardware_protection_mode=hardware_protection_mode,
-            run_full_budget=bool(experiment.ignore_pass_until_max_iterations),
+            run_full_budget=run_full_budget,
         )
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             self._reconcile_hardware_locked()
+            self._reconcile_model_compatibility_locked()
             return {"ok": True, **self._state}
 
     def assert_tuning_available(self) -> None:
@@ -182,8 +221,9 @@ class DrlWorkflowManager:
         with self._lock:
             self._ensure_can_start_locked("collection")
             if self._can_resume_locked("collection", signature):
+                collection_total = int(self._state.get("collection_total") or COLLECTION_BUDGET)
                 self._set_locked(state="collecting", busy=True, message="Resuming DRL hardware collection.")
-                self._spawn_locked(self._resume_and_monitor, "collection", COLLECTION_BUDGET, None)
+                self._spawn_locked(self._resume_and_monitor, "collection", collection_total, None)
                 return {"ok": True, **self._state}
             self._set_locked(
                 state="preparing_collection",
@@ -218,7 +258,10 @@ class DrlWorkflowManager:
                 or not bool(self._state.get("collection_finished"))
             ):
                 raise RuntimeError("Complete and persist the guarded 240-point collection before training Safe SAC.")
-            if not signatures_compatible(self._state.get("operating_signature") or {}, signature):
+            if not _collection_signature_covers(
+                self._state.get("operating_signature") or {},
+                signature,
+            ):
                 raise RuntimeError("The completed collection is incompatible with the current configuration.")
             self._set_locked(
                 state="training",
@@ -233,6 +276,160 @@ class DrlWorkflowManager:
                 resume_available=False,
             )
             self._spawn_locked(self._train, config, experiment, signature)
+            return {"ok": True, **self._state}
+
+    def start_targeted_collection(
+        self,
+        config: TuningConfig,
+        experiment: AutotuneExperimentConfig,
+        source_run_ids: list[str],
+    ) -> dict[str, Any]:
+        """Retrain a focused surrogate and launch the persisted 100-point plan."""
+
+        require_ml_dependencies()
+        _validate_fixed_condition(config, experiment)
+        signature = operating_signature(config, experiment)
+        selected_runs = sorted({_safe_artifact_name(value, "source run") for value in source_run_ids})
+        if len(selected_runs) < 2:
+            raise RuntimeError("Targeted collection requires both the bootstrap run and the 500-point run.")
+        with self._lock:
+            self._ensure_can_start_locked("collection")
+            reusable_surrogate_id = self._state.get("targeted_surrogate_model_id")
+            self._set_locked(
+                state="preparing_collection",
+                workflow="collection",
+                busy=True,
+                message="Retraining the surrogate from the selected bootstrap and 500-point runs.",
+                error=None,
+                progress=0.0,
+                operating_signature=signature,
+                collection_completed=0,
+                collection_total=TARGETED_COLLECTION_BUDGET,
+                collection_finished=False,
+                resume_available=False,
+                run_id=None,
+                run_kind=None,
+                targeted_source_run_ids=selected_runs,
+                targeted_surrogate_model_id=reusable_surrogate_id,
+            )
+            self._spawn_locked(
+                self._prepare_targeted_collection,
+                config,
+                experiment,
+                signature,
+                selected_runs,
+            )
+            return {"ok": True, **self._state}
+
+    def start_targeted_recovery(
+        self,
+        config: TuningConfig,
+        experiment: AutotuneExperimentConfig,
+        source_plan_id: str,
+        source_plan_indexes: list[int],
+    ) -> dict[str, Any]:
+        """Run selected base proposals that were invalid or truncated by dynamic confirmations."""
+
+        require_ml_dependencies()
+        _validate_fixed_condition(config, experiment)
+        signature = operating_signature(config, experiment)
+        source_plan_id = _safe_artifact_name(source_plan_id, "collection plan")
+        source_plan = read_json(self.plan_root / source_plan_id / "plan.json")
+        if not isinstance(source_plan, dict):
+            raise RuntimeError(f"Targeted source plan '{source_plan_id}' is missing.")
+        requested = sorted({int(value) for value in source_plan_indexes if int(value) > 0})
+        source_items = source_plan.get("candidates")
+        if not requested or not isinstance(source_items, list):
+            raise RuntimeError("Targeted recovery requires at least one valid source plan index.")
+        by_index = {
+            int(item.get("index") or position): item
+            for position, item in enumerate(source_items, 1)
+            if isinstance(item, dict)
+        }
+        missing = [index for index in requested if index not in by_index]
+        if missing:
+            raise RuntimeError(f"Targeted recovery plan indexes are missing: {missing}")
+
+        recovery_id = artifact_id("targeted_recovery")
+        recovery_items: list[dict[str, Any]] = []
+        for recovery_index, source_index in enumerate(requested, 1):
+            source_item = by_index[source_index]
+            item = dict(source_item)
+            item["candidate"] = dict(source_item.get("candidate") or {})
+            metadata = dict(source_item.get("optimizer_metadata") or {})
+            metadata.update(
+                {
+                    "recovery_source_plan_id": source_plan_id,
+                    "recovery_source_plan_index": source_index,
+                }
+            )
+            item["optimizer_metadata"] = metadata
+            item["index"] = recovery_index
+            recovery_items.append(item)
+        recovery_plan = {
+            **{key: value for key, value in source_plan.items() if key != "candidates"},
+            "plan_id": recovery_id,
+            "recovery": True,
+            "source_plan_id": source_plan_id,
+            "source_plan_indexes": requested,
+            "budget": len(recovery_items),
+            "candidates": recovery_items,
+            **_artifact_context(signature),
+        }
+        plan_path = save_collection_plan(recovery_plan, self.plan_root)
+        atomic_write_json(
+            plan_path.parent / "manifest.json",
+            {
+                "plan_id": recovery_id,
+                "source_plan_id": source_plan_id,
+                "operating_signature": signature,
+                "files_sha256": {"plan.json": _sha256(plan_path)},
+            },
+        )
+        # Confirmation and BW-climb measurements are deliberately overhead,
+        # not replacements for the selected base proposals. This cap lets the
+        # tuner exhaust the recovery plan naturally while still bounding a
+        # pathological sequence of successful climbs.
+        measurement_cap = max(len(recovery_items), len(recovery_items) * 4)
+        model_id = str(source_plan.get("provisional_model_id") or experiment.drl_model_id or "")
+        with self._lock:
+            self._ensure_can_start_locked("collection")
+            self._set_locked(
+                state="collecting",
+                workflow="collection",
+                busy=True,
+                message=f"Running {len(recovery_items)} targeted recovery proposals plus confirmation overhead.",
+                error=None,
+                progress=0.0,
+                operating_signature=signature,
+                collection_completed=0,
+                collection_total=measurement_cap,
+                collection_finished=False,
+                resume_available=False,
+                run_id=None,
+                run_kind=None,
+                collection_plan_id=recovery_id,
+                targeted_recovery_base_count=len(recovery_items),
+                targeted_recovery_source_plan_id=source_plan_id,
+            )
+            recovery_config = _with_budget(config, measurement_cap)
+            recovery_experiment = replace(
+                experiment,
+                optimization_algorithm="drl-collection",
+                drl_workflow_mode="collect",
+                drl_model_id=model_id,
+                drl_collection_plan_id=recovery_id,
+                drl_confirmation_count=3,
+                ignore_pass_until_max_iterations=True,
+            )
+            self._spawn_locked(
+                self._start_and_monitor,
+                recovery_config,
+                recovery_experiment,
+                "collection",
+                measurement_cap,
+                None,
+            )
             return {"ok": True, **self._state}
 
     def start_validation(
@@ -263,7 +460,12 @@ class DrlWorkflowManager:
                 raise RuntimeError("Train and accept a Safe SAC model before hardware validation.")
             if not signatures_compatible(model_manifest.get("operating_signature") or {}, signature):
                 raise RuntimeError(f"Safe SAC model '{model_id}' is incompatible with the current configuration.")
-            if not bool(model_manifest.get("ready")):
+            protection_candidate = bool(
+                experiment.drl_hardware_protection_mode
+                and model_manifest.get("hardware_protection_policy")
+                and model_manifest.get("policy_file")
+            )
+            if not bool(model_manifest.get("ready")) and not protection_candidate:
                 raise RuntimeError(f"Safe SAC model '{model_id}' did not pass synthetic acceptance gates.")
 
             validation_config = _with_budget(config, VALIDATION_BUDGET)
@@ -280,7 +482,11 @@ class DrlWorkflowManager:
                 state="validating",
                 workflow="validation",
                 busy=True,
-                message="Starting four guarded Safe SAC hardware episodes.",
+                message=(
+                    "Starting four guarded hardware-protection Safe SAC episodes."
+                    if protection_candidate and not bool(model_manifest.get("ready"))
+                    else "Starting four guarded Safe SAC hardware episodes."
+                ),
                 error=None,
                 progress=0.0,
                 model_id=model_id,
@@ -338,28 +544,36 @@ class DrlWorkflowManager:
                 dataset_id=dataset_id,
             )
 
-            provisional_id = artifact_id("surrogate_precollect")
-            ensemble = train_surrogate_ensemble(
-                dataset=dataset,
-                config=config,
-                artifact_dir=self.model_root / provisional_id,
-                operating_signature=signature,
-                members=5,
-                epochs=_env_int("DRL_SURROGATE_EPOCHS", 300),
-                progress=lambda value, message: self._progress(0.05 + value * 0.70, message),
-            )
-            provisional_manifest = dict(ensemble.manifest)
-            provisional_manifest.update(_artifact_context(signature))
-            atomic_write_json(ensemble.artifact_dir / "manifest.json", provisional_manifest)
-            ensemble.manifest = provisional_manifest
-            self._raise_if_stopped()
-            plan = build_collection_plan(dataset, config, ensemble)
+            provisional_id = ""
+            if dataset.size >= 20:
+                provisional_id = artifact_id("surrogate_precollect")
+                ensemble = train_surrogate_ensemble(
+                    dataset=dataset,
+                    config=config,
+                    artifact_dir=self.model_root / provisional_id,
+                    operating_signature=signature,
+                    members=5,
+                    epochs=_env_int("DRL_SURROGATE_EPOCHS", 300),
+                    progress=lambda value, message: self._progress(0.05 + value * 0.70, message),
+                )
+                provisional_manifest = dict(ensemble.manifest)
+                provisional_manifest.update(_artifact_context(signature))
+                atomic_write_json(ensemble.artifact_dir / "manifest.json", provisional_manifest)
+                ensemble.manifest = provisional_manifest
+                self._raise_if_stopped()
+                plan = build_collection_plan(dataset, config, ensemble)
+            else:
+                self._progress(
+                    0.20,
+                    "No compatible 9-D seed data; building the hardware-protected bootstrap Sobol plan.",
+                )
+                plan = build_bootstrap_collection_plan(config)
             plan.update(_artifact_context(signature))
-            plan["provisional_model_id"] = provisional_id
+            plan["provisional_model_id"] = provisional_id or None
             for item in plan.get("candidates", []):
                 if isinstance(item, dict):
                     metadata = item.setdefault("optimizer_metadata", {})
-                    if isinstance(metadata, dict):
+                    if isinstance(metadata, dict) and provisional_id:
                         metadata["model_id"] = provisional_id
             plan_path = save_collection_plan(plan, self.plan_root)
             atomic_write_json(
@@ -375,7 +589,11 @@ class DrlWorkflowManager:
                     state="collecting",
                     busy=True,
                     progress=0.80,
-                    message="Collection plan passed model safety screening; starting hardware collection.",
+                    message=(
+                        "Collection plan passed model safety screening; starting hardware collection."
+                        if provisional_id
+                        else "Starting the hardware-protected 9-D bootstrap collection."
+                    ),
                     collection_plan_id=plan["plan_id"],
                 )
 
@@ -393,6 +611,140 @@ class DrlWorkflowManager:
                 collection_experiment,
                 "collection",
                 COLLECTION_BUDGET,
+                None,
+            )
+        except WorkflowStopped:
+            return
+        except Exception as exc:
+            self._fail(exc)
+
+    def _prepare_targeted_collection(
+        self,
+        config: TuningConfig,
+        experiment: AutotuneExperimentConfig,
+        signature: dict[str, Any],
+        source_run_ids: list[str],
+    ) -> None:
+        try:
+            dataset, dataset_manifest = load_autotune_dataset(
+                self.run_roots,
+                config,
+                experiment,
+                allow_legacy_inferred=False,
+                include_run_ids=set(source_run_ids),
+            )
+            self._raise_if_stopped()
+            dataset_manifest.update(
+                {
+                    **_artifact_context(signature),
+                    "purpose": "targeted_100_point_followup",
+                    "source_run_ids": source_run_ids,
+                }
+            )
+            dataset_id = str(dataset_manifest["dataset_id"])
+            dataset.save(self.dataset_root / dataset_id, dataset_manifest)
+            self._progress(
+                0.05,
+                f"Loaded {dataset.size} compatible samples from the selected runs; retraining [96,64,32].",
+                dataset_count=dataset.size,
+                dataset_source_count=int(dataset_manifest.get("source_record_count", dataset.size)),
+                dataset_id=dataset_id,
+            )
+
+            with self._lock:
+                reusable_surrogate_id = str(self._state.get("targeted_surrogate_model_id") or "")
+            reusable_dir = self.model_root / reusable_surrogate_id
+            reusable_manifest = read_json(reusable_dir / "manifest.json") if reusable_surrogate_id else None
+            can_reuse = bool(
+                reusable_manifest
+                and reusable_manifest.get("purpose") == "targeted_100_point_proposal_surrogate"
+                and sorted(reusable_manifest.get("source_run_ids") or []) == sorted(source_run_ids)
+                and signatures_compatible(reusable_manifest.get("operating_signature") or {}, signature)
+            )
+            if can_reuse:
+                surrogate_id = reusable_surrogate_id
+                model_dir = reusable_dir
+                ensemble = SurrogateEnsemble.load(model_dir)
+                self._progress(0.70, f"Reusing completed targeted surrogate {surrogate_id}.")
+            else:
+                surrogate_id = artifact_id("surrogate_targeted")
+                model_dir = self.model_root / surrogate_id
+                ensemble = train_surrogate_ensemble(
+                    dataset=dataset,
+                    config=config,
+                    artifact_dir=model_dir,
+                    operating_signature=signature,
+                    members=_env_int("DRL_TARGETED_SURROGATE_MEMBERS", 5),
+                    epochs=_env_int("DRL_TARGETED_SURROGATE_EPOCHS", 120),
+                    hidden_sizes=(96, 64, 32),
+                    progress=lambda value, message: self._progress(0.05 + value * 0.65, message),
+                )
+                self._raise_if_stopped()
+                surrogate_manifest = dict(ensemble.manifest)
+                surrogate_manifest.update(
+                    {
+                        **_artifact_context(signature),
+                        "purpose": "targeted_100_point_proposal_surrogate",
+                        "dataset_id": dataset_id,
+                        "source_run_ids": source_run_ids,
+                        "hardware_ready": False,
+                        "offline_only": True,
+                        "files_sha256": _directory_hashes(model_dir),
+                    }
+                )
+                atomic_write_json(model_dir / "manifest.json", surrogate_manifest)
+                ensemble.manifest = surrogate_manifest
+            self._progress(
+                0.72,
+                "Surrogate retraining complete; building the 15/56/19/10 mixed proposal pool.",
+                targeted_surrogate_model_id=surrogate_id,
+            )
+
+            plan = build_targeted_collection_plan(dataset, config, ensemble)
+            plan.update(_artifact_context(signature))
+            plan["provisional_model_id"] = surrogate_id
+            plan["source_run_ids"] = source_run_ids
+            for item in plan.get("candidates", []):
+                if isinstance(item, dict):
+                    metadata = item.setdefault("optimizer_metadata", {})
+                    if isinstance(metadata, dict):
+                        metadata["model_id"] = surrogate_id
+            plan_path = save_collection_plan(plan, self.plan_root)
+            atomic_write_json(
+                plan_path.parent / "manifest.json",
+                {
+                    "plan_id": plan["plan_id"],
+                    "operating_signature": signature,
+                    "files_sha256": {"plan.json": _sha256(plan_path)},
+                },
+            )
+            with self._lock:
+                self._set_locked(
+                    state="collecting",
+                    busy=True,
+                    progress=0.80,
+                    message="Starting the guarded targeted 100-point hardware experiment.",
+                    collection_plan_id=plan["plan_id"],
+                    collection_total=TARGETED_COLLECTION_BUDGET,
+                    targeted_surrogate_model_id=surrogate_id,
+                    targeted_plan_allocation=plan.get("allocation"),
+                )
+
+            collection_config = _with_budget(config, TARGETED_COLLECTION_BUDGET)
+            collection_experiment = replace(
+                experiment,
+                optimization_algorithm="drl-collection",
+                drl_workflow_mode="collect",
+                drl_model_id=surrogate_id,
+                drl_collection_plan_id=str(plan["plan_id"]),
+                drl_confirmation_count=3,
+                ignore_pass_until_max_iterations=True,
+            )
+            self._start_and_monitor(
+                collection_config,
+                collection_experiment,
+                "collection",
+                TARGETED_COLLECTION_BUDGET,
                 None,
             )
         except WorkflowStopped:
@@ -458,8 +810,12 @@ class DrlWorkflowManager:
                 ensemble=ensemble,
                 dataset=dataset,
                 config=config,
-                total_steps=_env_int("DRL_SAC_STEPS", 1_000_000),
-                evaluation_episodes=_env_int("DRL_EVAL_EPISODES", 10_000),
+                # Bootstrap training is intentionally short: the first policy only
+                # needs to be useful enough to begin guarded hardware learning.
+                # Long 1M-step studies remain available through the environment
+                # overrides used by the offline sweep.
+                total_steps=_env_int("DRL_SAC_STEPS", 75_000),
+                evaluation_episodes=_env_int("DRL_EVAL_EPISODES", 1_000),
                 max_episode_steps=VALIDATION_EPISODE_BUDGET,
                 progress=lambda value, message: self._progress(0.42 + value * 0.58, message),
                 allow_unaccepted_surrogate=hardware_protection_mode,
@@ -619,6 +975,9 @@ class DrlWorkflowManager:
         if manifest is not None:
             manifest["hardware_validation"] = result
             manifest["hardware_ready"] = accepted
+            if accepted:
+                manifest["offline_only"] = False
+                manifest["hardware_validated_at"] = time.time()
             manifest["files_sha256"] = _directory_hashes(model_dir)
             atomic_write_json(model_dir / "manifest.json", manifest)
         with self._lock:
@@ -728,7 +1087,11 @@ class DrlWorkflowManager:
             return
         history = status.get("history") if isinstance(status.get("history"), list) else []
         field = "collection_completed" if self._state.get("workflow") == "collection" else "validation_completed"
-        total = COLLECTION_BUDGET if self._state.get("workflow") == "collection" else VALIDATION_BUDGET
+        total = (
+            int(self._state.get("collection_total") or COLLECTION_BUDGET)
+            if self._state.get("workflow") == "collection"
+            else VALIDATION_BUDGET
+        )
         previous_completed = int(self._state.get(field) or 0)
         if len(history) != previous_completed and self._persist_hardware is not None:
             status = self._persist_hardware(status)
@@ -768,6 +1131,60 @@ class DrlWorkflowManager:
             )
         self._write_state_locked()
 
+    def _reconcile_model_compatibility_locked(self) -> None:
+        """Report compatibility against the session's current live settings.
+
+        Compatibility used to be copied from the last workflow transition and
+        could remain ``true`` after the action schema or GUI search space had
+        changed. Recompute it when the session exposes complete config and
+        experiment payloads, but leave synthetic/test bindings without those
+        payloads untouched.
+        """
+
+        if self._session_status is None:
+            return
+        session = self._session_status()
+        config_payload = session.get("config")
+        experiment_payload = session.get("experiment")
+        if not isinstance(config_payload, dict) or not isinstance(experiment_payload, dict):
+            return
+
+        raw_model_id = str(self._state.get("model_id") or "").strip()
+        model_id = _safe_artifact_name(raw_model_id, "model") if raw_model_id else ""
+        manifest = read_json(self.model_root / model_id / "manifest.json") if model_id else None
+        compatible = False
+        reason = "No persisted DRL model is selected."
+        expected_signature: dict[str, Any] | None = None
+        actual_signature: dict[str, Any] | None = None
+        if manifest is not None:
+            expected_signature = manifest.get("operating_signature") or {}
+            try:
+                # Runtime import avoids a module cycle during runner startup.
+                from ..runner import _config_from_payload, _experiment_from_payload
+
+                actual_signature = operating_signature(
+                    _config_from_payload(config_payload),
+                    _experiment_from_payload(experiment_payload),
+                )
+                compatible = signatures_compatible(expected_signature, actual_signature)
+                if compatible:
+                    reason = "The selected model matches the current 9-dimensional operating schema."
+                else:
+                    reason = "The selected model does not match the current operating/action schema. Retraining is required."
+            except Exception as exc:
+                reason = f"Could not verify model compatibility: {exc}"
+
+        updates = {
+            "model_compatible": compatible,
+            "model_compatibility_reason": reason,
+            "model_expected_signature": expected_signature,
+            "model_actual_signature": actual_signature,
+        }
+        if any(self._state.get(key) != value for key, value in updates.items()):
+            self._state.update(updates)
+            self._state["updated_at"] = time.time()
+            self._write_state_locked()
+
     def _set_locked(self, **updates: Any) -> None:
         self._state.update(updates)
         self._state["updated_at"] = time.time()
@@ -806,6 +1223,44 @@ def _with_budget(config: TuningConfig, budget: int) -> TuningConfig:
     return replace(config, search=search)
 
 
+def _collection_signature_covers(
+    collected: dict[str, Any],
+    requested: dict[str, Any],
+) -> bool:
+    """Allow training on a strict search-space subset of a completed run."""
+
+    if signatures_compatible(collected, requested):
+        return True
+    collected_core = {
+        key: value
+        for key, value in collected.items()
+        if key not in {"signature", "search"}
+    }
+    requested_core = {
+        key: value
+        for key, value in requested.items()
+        if key not in {"signature", "search"}
+    }
+    if not collected_core or collected_core != requested_core:
+        return False
+    collected_search = collected.get("search")
+    requested_search = requested.get("search")
+    if not isinstance(collected_search, dict) or not isinstance(requested_search, dict):
+        return False
+    for name, requested_range in requested_search.items():
+        collected_range = collected_search.get(name)
+        if not isinstance(requested_range, dict) or not isinstance(collected_range, dict):
+            return False
+        try:
+            if float(requested_range["min"]) < float(collected_range["min"]):
+                return False
+            if float(requested_range["max"]) > float(collected_range["max"]):
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+    return True
+
+
 def _validate_fixed_condition(config: TuningConfig, experiment: AutotuneExperimentConfig) -> None:
     if not experiment.enable_transient_analysis or not experiment.enable_bode_analysis:
         raise RuntimeError("Fixed-condition Safe SAC requires both transient and Bode analysis.")
@@ -831,10 +1286,10 @@ def _validate_fixed_condition(config: TuningConfig, experiment: AutotuneExperime
     if (
         not all(math.isfinite(value) for value in (frequency, low_v, high_v))
         or abs(frequency - 10_000.0) > 1.0
-        or abs(low_v) > 1e-6
-        or abs(high_v - 1.0) > 1e-6
+        or abs(low_v - 0.1) > 1e-6
+        or abs(high_v - 1.1) > 1e-6
     ):
-        raise RuntimeError("Fixed-condition Safe SAC requires the 10 kHz, 0-1 V load step.")
+        raise RuntimeError("Fixed-condition Safe SAC requires the 10 kHz, 0.1-1.1 V load step.")
     if str(fg.get("mode", "square")).strip().lower() != "square":
         raise RuntimeError("Fixed-condition Safe SAC requires square-wave load excitation.")
     bode = experiment.bode_config or {}
@@ -854,18 +1309,23 @@ def _validate_fixed_condition(config: TuningConfig, experiment: AutotuneExperime
     ):
         raise RuntimeError("Fixed-condition Safe SAC requires the current 1 kHz-1 MHz, 201-point Bode setup.")
     cm_gain = config.search.mod0_cm_gain
-    if any(abs(float(value) - 2.0) > 1e-9 for value in (cm_gain.center, cm_gain.min, cm_gain.max)):
-        raise RuntimeError("Fixed-condition Safe SAC keeps mod0_cm_gain fixed at 2.")
+    if (
+        abs(float(cm_gain.min)) > 1e-9
+        or abs(float(cm_gain.max) - 9.0) > 1e-9
+        or not 0.0 <= float(cm_gain.center) <= 9.0
+    ):
+        raise RuntimeError("Fixed-condition Safe SAC requires mod0_cm_gain integer search range 0-9.")
+    ll_bw = config.search.mod0_ll_bw
+    if (
+        abs(float(ll_bw.min) - 47.0) > 1e-9
+        or abs(float(ll_bw.max) - 79.0) > 1e-9
+        or not 47.0 <= float(ll_bw.center) <= 79.0
+    ):
+        raise RuntimeError("Fixed-condition Safe SAC requires the capped Loop-A LS/LR bandwidth range 47-79.")
     for name in ("mod0_kpole1", "mod0_kpole2"):
         parameter = getattr(config.search, name)
-        if abs(float(parameter.min) - 3.0) > 1e-9 or abs(float(parameter.max) - 6.0) > 1e-9:
-            raise RuntimeError("Fixed-condition Safe SAC quantizes both kpole fields to the configured {3, 6} set.")
-    kpole_centers = [
-        3 if abs(float(getattr(config.search, name).center) - 3) <= abs(float(getattr(config.search, name).center) - 6) else 6
-        for name in ("mod0_kpole1", "mod0_kpole2")
-    ]
-    if kpole_centers[0] != kpole_centers[1]:
-        raise RuntimeError("Fixed-condition Safe SAC requires a shared kpole baseline for both hardware fields.")
+        if abs(float(parameter.min) - 2.0) > 1e-9 or abs(float(parameter.max) - 6.0) > 1e-9:
+            raise RuntimeError("Fixed-condition Safe SAC quantizes each kpole field independently to {2, 3, 4, 5, 6}.")
 
 
 def _artifact_context(signature: dict[str, Any]) -> dict[str, Any]:
@@ -890,6 +1350,7 @@ def _episode_has_confirmation(records: list[dict[str, Any]], required: int) -> b
             "mod0_kpole1",
             "mod0_kpole2",
             "mod0_cm_gain",
+            "mod0_ll_bw",
             "output_inductance_nh",
             "effective_lc_inductance_nh",
         ))

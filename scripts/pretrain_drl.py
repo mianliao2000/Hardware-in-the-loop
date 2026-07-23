@@ -10,13 +10,15 @@ import sys
 import time
 from typing import Any
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from hardware.tuning.drl.common import artifact_id, atomic_write_json, operating_signature
-from hardware.tuning.drl.dataset import load_autotune_dataset
+from hardware.tuning.drl.common import artifact_id, atomic_write_json, candidate_key, operating_signature
+from hardware.tuning.drl.dataset import DrlDataset, load_autotune_dataset
 from hardware.tuning.drl.model import dependency_status, train_surrogate_ensemble
 from hardware.tuning.drl.policy import train_safe_sac_policy
 from hardware.tuning.models import AutotuneExperimentConfig, TuningConfig
@@ -33,8 +35,8 @@ def fixed_condition_experiment() -> AutotuneExperimentConfig:
         function_generator_config={
             "mode": "square",
             "frequency_hz": 10_000.0,
-            "low_v": 0.0,
-            "high_v": 1.0,
+            "low_v": 0.1,
+            "high_v": 1.1,
         },
         bode_config={
             "start_hz": 1_000.0,
@@ -66,11 +68,29 @@ def _parser() -> argparse.ArgumentParser:
         help="Also include non-permanent recent runs.",
     )
     parser.add_argument(
+        "--include-run-id",
+        action="append",
+        default=None,
+        help=(
+            "Restrict loading to these exact run IDs. Repeat the option for a frozen run set; "
+            "useful for auditable bootstrap + follow-up retraining."
+        ),
+    )
+    parser.add_argument(
         "--exact-only",
         action="store_true",
         help=(
             "Use only runs with complete fixed-condition metadata. By default, compatible legacy runs "
             "whose condition can be inferred are included to improve operating-point coverage."
+        ),
+    )
+    parser.add_argument(
+        "--validation-run-id",
+        action="append",
+        default=None,
+        help=(
+            "Use these complete run IDs as the explicit validation/evaluation partition. "
+            "Candidate keys present in validation are purged from training."
         ),
     )
     parser.add_argument(
@@ -122,9 +142,21 @@ def main() -> int:
         config,
         experiment,
         allow_legacy_inferred=not args.exact_only,
+        include_run_ids=set(args.include_run_id) if args.include_run_id else None,
     )
     if dataset.size < 20:
         raise SystemExit(f"Only {dataset.size} compatible in-range samples were found; at least 20 are required.")
+    train_indexes: np.ndarray | None = None
+    validation_indexes: np.ndarray | None = None
+    evaluation_indexes: np.ndarray | None = None
+    if args.validation_run_id:
+        train_indexes, validation_indexes = _explicit_validation_split(
+            dataset,
+            set(args.validation_run_id),
+        )
+        # Omit an explicit evaluation partition so the training API reuses the
+        # complete validation runs, matching the default grouped workflow.
+        evaluation_indexes = None
 
     run_id = artifact_id("offline_pretrain")
     artifact_dir = args.output_root.resolve() / run_id
@@ -155,6 +187,9 @@ def main() -> int:
         batch_size=max(8, args.batch_size),
         seed=args.seed,
         progress=progress,
+        train_indexes=train_indexes,
+        validation_indexes=validation_indexes,
+        evaluation_indexes=evaluation_indexes,
     )
     policy_manifest: dict[str, Any] | None = None
     policy_message = "not requested"
@@ -183,6 +218,8 @@ def main() -> int:
         "dataset": {
             "sample_count": dataset.size,
             "exact_only": bool(args.exact_only),
+            "included_run_ids": sorted(args.include_run_id or []),
+            "explicit_validation_run_ids": sorted(args.validation_run_id or []),
             "source_record_count": dataset_manifest.get("source_record_count"),
             "excluded_incompatible_action_count": dataset_manifest.get("excluded_incompatible_action_count"),
             "excluded_out_of_search_space_count": dataset_manifest.get("excluded_out_of_search_space_count"),
@@ -211,6 +248,44 @@ def main() -> int:
     atomic_write_json(artifact_dir / "pretrain_report.json", report)
     print(json.dumps(report, indent=2))
     return 0 if ensemble.accepted or args.hardware_protection_mode else 2
+
+
+def _explicit_validation_split(
+    dataset: DrlDataset,
+    validation_run_ids: set[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a run-isolated split and purge repeated hardware raw keys."""
+
+    validation_ids = {str(value) for value in validation_run_ids if str(value)}
+    validation = np.asarray(
+        [
+            index
+            for index, group in enumerate(dataset.groups.tolist())
+            if str(group).split(":", 1)[-1] in validation_ids
+        ],
+        dtype=int,
+    )
+    if validation.size == 0:
+        available = sorted({str(group).split(":", 1)[-1] for group in dataset.groups.tolist()})
+        raise SystemExit(
+            f"No rows matched --validation-run-id {sorted(validation_ids)}; available runs: {available}."
+        )
+    validation_keys = {candidate_key(dataset.candidates[index]) for index in validation}
+    training = np.asarray(
+        [
+            index
+            for index, group in enumerate(dataset.groups.tolist())
+            if str(group).split(":", 1)[-1] not in validation_ids
+            and candidate_key(dataset.candidates[index]) not in validation_keys
+        ],
+        dtype=int,
+    )
+    if training.size < 20 or validation.size < 5:
+        raise SystemExit(
+            "Explicit grouped split is too small after candidate-key purge: "
+            f"training={training.size}, validation={validation.size}."
+        )
+    return training, validation
 
 
 if __name__ == "__main__":

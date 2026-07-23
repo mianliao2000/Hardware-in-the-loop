@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import ReactECharts from "echarts-for-react";
+import type { ECharts } from "echarts";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -47,6 +48,35 @@ const searchParameter = (center: number, min: number, max: number, points: numbe
 
 const AI_COPILOT_HISTORY_KEY = "power-auto-tuner.ai-copilot.messages";
 const AI_COPILOT_MODEL_KEY = "power-auto-tuner.ai-copilot.model";
+const PANEL_OPEN_STATE_KEY = "power-auto-tuner.panel-open-state.v1";
+
+function readPersistedPanelOpen(key: string, defaultOpen: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(PANEL_OPEN_STATE_KEY);
+    const saved = raw ? JSON.parse(raw) : null;
+    return saved && typeof saved[key] === "boolean" ? saved[key] : defaultOpen;
+  } catch {
+    return defaultOpen;
+  }
+}
+
+function writePersistedPanelOpen(key: string, open: boolean): void {
+  try {
+    const raw = localStorage.getItem(PANEL_OPEN_STATE_KEY);
+    const saved = raw ? JSON.parse(raw) : {};
+    const next = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+    localStorage.setItem(PANEL_OPEN_STATE_KEY, JSON.stringify({ ...next, [key]: open }));
+  } catch {
+    // Storage may be disabled or full; panel toggles still work for this session.
+  }
+}
+
+function usePersistentPanelOpen(key: string, defaultOpen: boolean) {
+  const [open, setOpen] = useState(() => readPersistedPanelOpen(key, defaultOpen));
+  useEffect(() => writePersistedPanelOpen(key, open), [key, open]);
+  return [open, setOpen] as const;
+}
+
 const LLM_MODEL_OPTIONS = [
   { value: "minimax-m3", label: "Minimax 3" },
   { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash" }
@@ -56,6 +86,8 @@ const OPTIMIZATION_ALGORITHM_OPTIONS = [
   { value: "heuristic", label: "Grid Search + Heuristic Algorithm" },
   { value: "deep-reinforcement", label: "Deep Reinforcement Learning" }
 ];
+
+const BASIN_QUALITY_POOL_MULTIPLIER = 6;
 
 const optimizationAlgorithmLabel = (value: string | null | undefined) =>
   OPTIMIZATION_ALGORITHM_OPTIONS.find((option) => option.value === value)?.label
@@ -95,9 +127,10 @@ const defaultConfig: TuningConfig = {
     mod0_kp: searchParameter(165, 100, 255, 9),
     mod0_ki: searchParameter(220, 150, 255, 9),
     mod0_kd: searchParameter(175, 100, 200, 9),
-    mod0_kpole1: searchParameter(3, 3, 6, 2),
-    mod0_kpole2: searchParameter(3, 3, 6, 2),
-    mod0_cm_gain: searchParameter(2, 2, 2, 1),
+    mod0_kpole1: searchParameter(3, 2, 6, 5),
+    mod0_kpole2: searchParameter(3, 2, 6, 5),
+    mod0_cm_gain: searchParameter(2, 0, 9, 10),
+    mod0_ll_bw: searchParameter(66, 47, 79, 33),
     output_inductance_nh: searchParameter(100.024, 80.019, 120.029, 5),
     effective_lc_inductance_nh: searchParameter(369.276, 295.421, 443.131, 5)
   }
@@ -161,7 +194,7 @@ const defaultXdpPidLimits: Record<(typeof xdpPidFieldNames)[number], { min: numb
   mod0_kd: { min: 0, max: 255 },
   mod0_kpole1: { min: 0, max: 15 },
   mod0_kpole2: { min: 0, max: 15 },
-  mod0_cm_gain: { min: 0, max: 127 }
+  mod0_cm_gain: { min: 0, max: 9 }
 };
 type HardwareSearchKey =
   | "mod0_kp"
@@ -170,15 +203,17 @@ type HardwareSearchKey =
   | "mod0_kpole1"
   | "mod0_kpole2"
   | "mod0_cm_gain"
+  | "mod0_ll_bw"
   | "output_inductance_nh"
   | "effective_lc_inductance_nh";
 const hardwareSearchFields: Array<{ key: HardwareSearchKey; label: string; limit: string }> = [
   { key: "mod0_kp", label: "mod0_kp", limit: "0-255" },
   { key: "mod0_ki", label: "mod0_ki", limit: "0-255" },
   { key: "mod0_kd", label: "mod0_kd", limit: "0-255" },
-  { key: "mod0_kpole1", label: "mod0_kpole1", limit: "0-15" },
-  { key: "mod0_kpole2", label: "mod0_kpole2", limit: "0-15" },
-  { key: "mod0_cm_gain", label: "Current Mode Gain", limit: "0-127" },
+  { key: "mod0_kpole1", label: "mod0_kpole1", limit: "2-6" },
+  { key: "mod0_kpole2", label: "mod0_kpole2", limit: "2-6" },
+  { key: "mod0_cm_gain", label: "Current Mode Gain", limit: "0-9" },
+  { key: "mod0_ll_bw", label: "mod0_ll_ls_bw = mod0_ll_lr_bw", limit: "47-79" },
   { key: "output_inductance_nh", label: "Output Inductance (nH)", limit: "14.29-117028.57 nH" },
   { key: "effective_lc_inductance_nh", label: "Effective Lc Inductance (nH)", limit: "229.02-117028.57 nH" }
 ];
@@ -227,12 +262,12 @@ const defaultFunctionGeneratorConfig = {
   mode: "square",
   voltage_unit: "VPP",
   frequency_hz: 10000,
-  low_v: 0,
-  high_v: 1,
+  low_v: 0.1,
+  high_v: 1.1,
   pulse_width_s: 5e-6,
   dc_level_v: 0,
   amplitude_vpp: 1,
-  offset_v: 0,
+  offset_v: 0.6,
   phase_deg: 0
 };
 type AppTab = "autotune" | "manual" | "selftest";
@@ -493,7 +528,9 @@ function voutRegisterStepFromExponent(exponent: number) {
 
 function xdpPidLimitLabel(name: (typeof xdpPidFieldNames)[number], xdpPid: XdpPidReadback | null) {
   const field = xdpPid?.pid_registers?.fields[name] ?? xdpPid?.current_mode_registers?.fields[name];
-  const limits = field ? { min: field.min, max: field.max } : defaultXdpPidLimits[name];
+  const limits = name === "mod0_cm_gain"
+    ? defaultXdpPidLimits[name]
+    : field ? { min: field.min, max: field.max } : defaultXdpPidLimits[name];
   const label = name === "mod0_cm_gain" ? "Current Mode Gain" : name;
   return `${label} (${limits.min}-${limits.max})`;
 }
@@ -522,7 +559,12 @@ function withManualSearchCenters(
       mod0_kd: searchParameterWithCenter(config.search.mod0_kd, Math.round(xdpPidRequest.mod0_kd ?? defaultManualXdpPidRequest.mod0_kd)),
       mod0_kpole1: searchParameterWithCenter(config.search.mod0_kpole1, Math.round(xdpPidRequest.mod0_kpole1 ?? defaultManualXdpPidRequest.mod0_kpole1)),
       mod0_kpole2: searchParameterWithCenter(config.search.mod0_kpole2, Math.round(xdpPidRequest.mod0_kpole2 ?? defaultManualXdpPidRequest.mod0_kpole2)),
-      mod0_cm_gain: searchParameterWithCenter(config.search.mod0_cm_gain, Math.round(xdpPidRequest.mod0_cm_gain ?? defaultManualXdpPidRequest.mod0_cm_gain)),
+      mod0_cm_gain: searchParameterWithCenter(
+        config.search.mod0_cm_gain,
+        Math.min(9, Math.max(0, Math.round(xdpPidRequest.mod0_cm_gain ?? defaultManualXdpPidRequest.mod0_cm_gain)))
+      ),
+      // This search-only value intentionally has no independent LS/LR manual controls.
+      mod0_ll_bw: config.search.mod0_ll_bw,
       output_inductance_nh: searchParameterWithCenter(config.search.output_inductance_nh, inductanceRequest.output_nh),
       effective_lc_inductance_nh: searchParameterWithCenter(config.search.effective_lc_inductance_nh, inductanceRequest.effective_lc_nh)
     }
@@ -565,9 +607,81 @@ function buildAutotuneExperiment(
   };
 }
 
+function lastHistoryIteration(history: IterationRecord[]) {
+  return history.reduce((latest, record) => Math.max(latest, Number(record.iteration) || 0), 0);
+}
+
+function recordRenderSignature(record: IterationRecord | null | undefined) {
+  if (!record) return null;
+  const scope = record.scope_result as Record<string, unknown> | null | undefined;
+  const bode = record.bode_result as Record<string, unknown> | null | undefined;
+  const compactAssetSignature = (value: unknown) => {
+    if (typeof value !== "string") return value;
+    return `${value.length}:${value.slice(0, 24)}:${value.slice(-24)}`;
+  };
+  return [
+    record.iteration,
+    record.phase,
+    displayPenaltyScore(record),
+    displayObjectiveScore(record),
+    record.bandwidth_bonus,
+    record.metrics.passed,
+    record.duration_s,
+    scope?.capture_id,
+    compactAssetSignature(scope?.scope_png),
+    bode?.sweep_id,
+    compactAssetSignature(bode?.bode_png)
+  ];
+}
+
+function tuningStatusRenderSignature(status: TuningStatus) {
+  return JSON.stringify({
+    state: status.state,
+    message: status.message,
+    historyToken: status.history_token,
+    historyTotal: status.history_total ?? status.history.length,
+    historyLast: status.history_last_iteration ?? lastHistoryIteration(status.history),
+    current: recordRenderSignature(status.current),
+    best: recordRenderSignature(status.best),
+    recommendations: (status.recommendations ?? []).map(recordRenderSignature),
+    config: status.config,
+    experiment: status.experiment,
+    pidProgramming: status.pid_programming,
+    run: status.run
+  });
+}
+
+function drlStatusRenderSignature(status: DrlWorkflowStatus) {
+  return JSON.stringify(status);
+}
+
+function mergeIncrementalTuningStatus(previous: TuningStatus | null, next: TuningStatus): TuningStatus | null {
+  if (!next.history_delta) return next;
+  if (!previous || !next.history_token || previous.history_token !== next.history_token) return null;
+  const previousLast = lastHistoryIteration(previous.history ?? []);
+  if (next.history_after_iteration !== previousLast) return null;
+
+  if ((next.history ?? []).length === 0) {
+    const merged = { ...next, history: previous.history, history_delta: false };
+    return tuningStatusRenderSignature(previous) === tuningStatusRenderSignature(merged)
+      ? previous
+      : merged;
+  }
+
+  const byIteration = new Map<number, IterationRecord>();
+  for (const record of previous.history ?? []) byIteration.set(record.iteration, record);
+  for (const record of next.history ?? []) byIteration.set(record.iteration, record);
+  const history = [...byIteration.values()].sort((left, right) => left.iteration - right.iteration);
+  const expectedTotal = next.history_total ?? history.length;
+  const expectedLast = next.history_last_iteration ?? lastHistoryIteration(history);
+  if (history.length !== expectedTotal || lastHistoryIteration(history) !== expectedLast) return null;
+  return { ...next, history, history_delta: false };
+}
+
 function App() {
   const [config, setConfig] = useState<TuningConfig>(() => cloneDefaultConfig());
   const [status, setStatus] = useState<TuningStatus | null>(null);
+  const statusRef = useRef<TuningStatus | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>(getInitialTab);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialTheme);
   const [error, setError] = useState("");
@@ -590,6 +704,7 @@ function App() {
   const [autotuneAnalysisSelection, setAutotuneAnalysisSelection] = useState({ transient: true, bode: true });
   const [optimizationAlgorithm, setOptimizationAlgorithm] = useState("heuristic");
   const [drlStatus, setDrlStatus] = useState<DrlWorkflowStatus | null>(null);
+  const drlStatusRef = useRef<DrlWorkflowStatus | null>(null);
   const [autotuneRuns, setAutotuneRuns] = useState<AutotuneRunsResponse | null>(null);
   const [selectedAutotuneRun, setSelectedAutotuneRun] = useState("");
   const [autotuneArchiveStatus, setAutotuneArchiveStatus] = useState("");
@@ -620,6 +735,19 @@ function App() {
   const [selfTestRunning, setSelfTestRunning] = useState(false);
   const [activeSelfTestKey, setActiveSelfTestKey] = useState<InstrumentKey | null>(null);
   const t = copy;
+
+  const commitStatus = (next: TuningStatus) => {
+    if (statusRef.current === next) return;
+    statusRef.current = next;
+    setStatus(next);
+  };
+
+  const commitDrlStatus = (next: DrlWorkflowStatus) => {
+    const previous = drlStatusRef.current;
+    if (previous && drlStatusRenderSignature(previous) === drlStatusRenderSignature(next)) return;
+    drlStatusRef.current = next;
+    setDrlStatus(next);
+  };
 
   const flushTelemetryDisplay = () => {
     telemetryPublishTimer.current = null;
@@ -652,11 +780,24 @@ function App() {
   const refresh = async () => {
     if (viewingLoadedRun.current) return;
     try {
-      const next = await getTuningStatus();
+      const current = statusRef.current;
+      const afterIteration = current ? lastHistoryIteration(current.history ?? []) : undefined;
+      let next = await getTuningStatus(afterIteration, current?.history_token);
       if (viewingLoadedRun.current) return;
-      setStatus(next);
-      if (["drl-collection", "deep-reinforcement", "safe-sac"].includes(next.experiment?.optimization_algorithm ?? "")) {
-        setConfig(normalizeTuningConfig(next.config));
+      let merged = mergeIncrementalTuningStatus(current, next);
+      if (merged === null) {
+        next = await getTuningStatus();
+        if (viewingLoadedRun.current) return;
+        merged = next;
+      }
+      if (merged === current) {
+        statusRefreshFailures.current = 0;
+        setConnectionError("");
+        return;
+      }
+      commitStatus(merged);
+      if (["drl-collection", "deep-reinforcement", "safe-sac"].includes(merged.experiment?.optimization_algorithm ?? "")) {
+        setConfig(normalizeTuningConfig(merged.config));
       }
       statusRefreshFailures.current = 0;
       setConnectionError("");
@@ -685,27 +826,50 @@ function App() {
 
   const refreshDrlStatus = async () => {
     try {
-      setDrlStatus(await getDrlWorkflowStatus());
+      const next = await getDrlWorkflowStatus();
+      commitDrlStatus(next);
     } catch (exc) {
       console.warn("Could not refresh the DRL workflow status:", exc);
     }
   };
 
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    let statusTimer: number | null = null;
+    const pollStatus = async () => {
+      await refresh();
+      if (cancelled) return;
+      const delayMs = statusRef.current?.state === "running" ? 4000 : 5000;
+      statusTimer = window.setTimeout(pollStatus, delayMs);
+    };
+    pollStatus();
     refreshAutotuneRuns();
-    refreshDrlStatus();
-    const timer = window.setInterval(refresh, 1000);
-    const drlTimer = window.setInterval(refreshDrlStatus, 1000);
     return () => {
-      window.clearInterval(timer);
-      window.clearInterval(drlTimer);
+      cancelled = true;
+      if (statusTimer !== null) window.clearTimeout(statusTimer);
       if (telemetryPublishTimer.current !== null) {
         window.clearTimeout(telemetryPublishTimer.current);
         telemetryPublishTimer.current = null;
       }
     };
   }, []);
+
+  const drlPollingActive = Boolean(drlStatus?.busy)
+    || ["collecting", "training", "validating"].includes(drlStatus?.state ?? "");
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      await refreshDrlStatus();
+      if (!cancelled) timer = window.setTimeout(poll, drlPollingActive ? 4000 : 10000);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [drlPollingActive]);
 
   useEffect(() => {
     if (["collecting", "collection_complete", "validating", "hardware_ready", "validation_failed"].includes(drlStatus?.state ?? "")) {
@@ -782,7 +946,7 @@ function App() {
         const next = action === "pause"
           ? await pauseTuning()
           : await resumeTuning(resumeRun?.run_id, resumeRun?.kind);
-        setStatus(next);
+        commitStatus(next);
         setConfig(normalizeTuningConfig(next.config));
         refreshAutotuneRuns();
         setError("");
@@ -806,11 +970,11 @@ function App() {
         autotuneAnalysisSelection,
         optimizationAlgorithm,
         drlStatus?.model_id ?? "",
-        configuredMaxCoarseIterations(runConfig.search) + configuredMaxRefinedIterations(runConfig.search)
+        searchIterationBudget(runConfig.search)
       );
       const next =
         action === "start" ? await startTuning(runConfig, experiment) : await stepTuning(runConfig, experiment);
-      setStatus(next);
+      commitStatus(next);
       setConfig(normalizeTuningConfig(next.config));
       refreshAutotuneRuns();
       setError("");
@@ -822,7 +986,7 @@ function App() {
   const runDrlAction = async (action: "collect" | "train" | "validate" | "stop") => {
     try {
       if (action === "stop") {
-        setDrlStatus(await stopDrlWorkflow());
+        commitDrlStatus(await stopDrlWorkflow());
         await refresh();
         await refreshAutotuneRuns();
         setError("");
@@ -850,10 +1014,10 @@ function App() {
         { transient: true, bode: true },
         "deep-reinforcement",
         drlStatus?.model_id ?? "",
-        configuredMaxCoarseIterations(runConfig.search) + configuredMaxRefinedIterations(runConfig.search)
+        searchIterationBudget(runConfig.search)
       );
       const next = await runDrlWorkflowAction(action, runConfig, experiment);
-      setDrlStatus(next);
+      commitDrlStatus(next);
       setError("");
       await refreshAutotuneRuns();
     } catch (exc) {
@@ -867,7 +1031,7 @@ function App() {
       viewingLoadedRun.current = false;
       const next = await resetTuning(defaults);
       setConfig(normalizeTuningConfig(next.config));
-      setStatus(next);
+      commitStatus(next);
       refreshAutotuneRuns();
       setError("");
     } catch (exc) {
@@ -1301,7 +1465,7 @@ function App() {
       const loaded = await loadTuningRun(runId, kind);
       viewingLoadedRun.current = true;
       setSelectedAutotuneRun(`${kind}:${runId}`);
-      setStatus(loaded);
+      commitStatus(loaded);
       setConfig(normalizeTuningConfig(loaded.config));
       setAutotuneArchiveStatus(`Loaded ${formatLoadedRunLabel(autotuneRuns, kind, runId)}`);
       setError("");
@@ -1599,6 +1763,11 @@ function LlmAssistantWidget({
     setSending(true);
     try {
       const response = await sendLlmChat(nextMessages, context, modelChoice);
+      if (!response.completion?.complete) {
+        throw new Error(
+          "The backend returned an unverified response. Restart gui/server.py to enable the complete-response protocol."
+        );
+      }
       setMessages([...nextMessages, { role: "assistant", content: response.reply ?? "No reply." }]);
     } catch (exc) {
       setMessages([...nextMessages, { role: "assistant", content: `LLM API error: ${String(exc)}` }]);
@@ -2056,7 +2225,7 @@ function AutotuneWorkbench({
   runDrlAction: (action: "collect" | "train" | "validate" | "stop") => Promise<void>;
   experimentSettings: ManualExperimentSettings;
   setExperimentSettings: React.Dispatch<React.SetStateAction<ManualExperimentSettings>>;
-  runAction: (action: "start" | "pause" | "resume" | "stop" | "step") => Promise<void>;
+  runAction: (action: "start" | "pause" | "resume" | "step") => Promise<void>;
   resetAutotuneDefaults: () => Promise<void>;
   readBoardInductance: () => Promise<void>;
   writeOutputInductance: () => Promise<void>;
@@ -2081,15 +2250,41 @@ function AutotuneWorkbench({
   const canRunAnalysis = analysisSelection.transient || analysisSelection.bode;
   const [selectedIteration, setSelectedIteration] = useState<number | null>(null);
   const [livePlayback, setLivePlayback] = useState(false);
+  const historyPreviewTimerRef = useRef<number | null>(null);
   const selectedRecord = selectedIteration === null ? null : history.find((item) => item.iteration === selectedIteration) ?? null;
   const visibleRecord = selectedRecord ?? current;
+  const recommendedRecords = useMemo(
+    () => selectRecommendedRecords(status?.recommendations, history, 5),
+    [history, status?.recommendations]
+  );
+  const selectIterationForPreview = useCallback((iteration: number | null) => {
+    if (historyPreviewTimerRef.current !== null) {
+      window.clearTimeout(historyPreviewTimerRef.current);
+      historyPreviewTimerRef.current = null;
+    }
+    setSelectedIteration(iteration);
+    if (iteration !== null && status?.state === "running") {
+      historyPreviewTimerRef.current = window.setTimeout(() => {
+        setSelectedIteration((currentIteration) => currentIteration === iteration ? null : currentIteration);
+        historyPreviewTimerRef.current = null;
+      }, 5000);
+    }
+  }, [status?.state]);
   useEffect(() => {
-    if (status?.state === "running") {
-      setSelectedIteration(null);
-    } else if (selectedIteration !== null && !history.some((item) => item.iteration === selectedIteration)) {
+    if (selectedIteration !== null && !history.some((item) => item.iteration === selectedIteration)) {
       setSelectedIteration(null);
     }
-  }, [status?.state, history, selectedIteration]);
+  }, [history, selectedIteration]);
+  useEffect(() => {
+    if (status?.state === "running" || historyPreviewTimerRef.current === null) return;
+    window.clearTimeout(historyPreviewTimerRef.current);
+    historyPreviewTimerRef.current = null;
+  }, [status?.state]);
+  useEffect(() => () => {
+    if (historyPreviewTimerRef.current !== null) {
+      window.clearTimeout(historyPreviewTimerRef.current);
+    }
+  }, []);
   useEffect(() => {
     if (selectedIteration === null || history.length === 0) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2103,11 +2298,11 @@ function AutotuneWorkbench({
       const direction = event.key === "ArrowUp" ? -1 : 1;
       const nextIndex = Math.max(0, Math.min(ordered.length - 1, currentIndex + direction));
       if (nextIndex === currentIndex) return;
-      setSelectedIteration(ordered[nextIndex].iteration);
+      selectIterationForPreview(ordered[nextIndex].iteration);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [history, selectedIteration]);
+  }, [history, selectIterationForPreview, selectedIteration]);
   useEffect(() => {
     if (status?.state === "running" || history.length < 1) {
       setLivePlayback(false);
@@ -2139,7 +2334,12 @@ function AutotuneWorkbench({
       return;
     }
     if (history.length === 0) return;
-    setSelectedIteration(history[0].iteration);
+    const displayedIteration = visibleRecord?.iteration;
+    const playbackStart = displayedIteration !== undefined
+      && history.some((item) => item.iteration === displayedIteration)
+      ? displayedIteration
+      : history[history.length - 1].iteration;
+    setSelectedIteration(playbackStart);
     setLivePlayback(true);
   };
   const setFgConfig = (updater: React.SetStateAction<typeof defaultFunctionGeneratorConfig>) => {
@@ -2151,7 +2351,7 @@ function AutotuneWorkbench({
   return (
       <div className="workspace">
         <aside className="control-rail">
-          <Panel title="Run Control" icon={<Activity size={17} />}>
+          <Panel title="Run Control" persistenceKey="autotune-run-control" icon={<Activity size={17} />}>
             <div className="autotune-controls">
               <div className="analysis-check-row">
                 <label>
@@ -2189,6 +2389,24 @@ function AutotuneWorkbench({
               </div>
               {optimizationAlgorithm === "deep-reinforcement" && (
                 <DrlControl status={drlStatus} tuningState={status?.state} onAction={runDrlAction} />
+              )}
+              {optimizationAlgorithm !== "deep-reinforcement" && (
+                <div className="autotune-grid-budget-fields">
+                  <DeferredNumberField
+                    label="Corase"
+                    value={config.search.max_coarse_iterations ?? Math.max(1, Math.round((config.search.max_iterations ?? 40) / 2))}
+                    integer
+                    min={1}
+                    onCommit={(value) => updateSearchIterationBudget(setConfig, "max_coarse_iterations", Math.max(1, Math.round(value)))}
+                  />
+                  <DeferredNumberField
+                    label="Refined"
+                    value={config.search.max_refined_iterations ?? Math.max(0, (config.search.max_iterations ?? 40) - Math.max(1, Math.round((config.search.max_iterations ?? 40) / 2)))}
+                    integer
+                    min={0}
+                    onCommit={(value) => updateSearchIterationBudget(setConfig, "max_refined_iterations", Math.max(0, Math.round(value)))}
+                  />
+                </div>
               )}
               <button className="autotune-control-button start" onClick={() => runAction("start")} disabled={status?.state === "running" || !canRunAnalysis}>
                 Start Auto-Tune
@@ -2256,7 +2474,7 @@ function AutotuneWorkbench({
             disabled={!isViewingLoadedRun && status?.state === "running"}
           />
 
-          <Panel title="Function Generator" icon={<Activity size={17} />}>
+          <Panel title="Function Generator" persistenceKey="autotune-function-generator" icon={<Activity size={17} />}>
             <div className="autotune-run-settings">
               <FunctionGeneratorSettingsRow fgConfig={fgConfig} setFgConfig={setFgConfig} compact />
             </div>
@@ -2310,20 +2528,6 @@ function AutotuneWorkbench({
           </Panel>
 
           <Panel title="Search Space" icon={<RefreshCw size={17} />}>
-            <DeferredNumberField
-              label="Max Coarse Iterations"
-              value={config.search.max_coarse_iterations ?? Math.max(1, Math.round((config.search.max_iterations ?? 40) / 2))}
-              integer
-              min={1}
-              onCommit={(value) => updateSearchIterationBudget(setConfig, "max_coarse_iterations", Math.max(1, Math.round(value)))}
-            />
-            <DeferredNumberField
-              label="Max Refined Iterations"
-              value={config.search.max_refined_iterations ?? Math.max(0, (config.search.max_iterations ?? 40) - Math.max(1, Math.round((config.search.max_iterations ?? 40) / 2)))}
-              integer
-              min={0}
-              onCommit={(value) => updateSearchIterationBudget(setConfig, "max_refined_iterations", Math.max(0, Math.round(value)))}
-            />
             {hardwareSearchFields.map((field) => (
               <SearchParameterField
                 key={field.key}
@@ -2331,12 +2535,15 @@ function AutotuneWorkbench({
                 limit={field.limit}
                 value={config.search[field.key] ?? defaultConfig.search[field.key]}
                 integer={field.key.startsWith("mod0_")}
+                singleLineTitle={field.key === "mod0_ll_bw"}
                 onChange={(value) => {
                   updateSearchParameter(setConfig, field.key, value);
                   if (field.key === "output_inductance_nh") {
                     setInductanceRequest((current) => ({ ...current, output_nh: value.center }));
                   } else if (field.key === "effective_lc_inductance_nh") {
                     setInductanceRequest((current) => ({ ...current, effective_lc_nh: value.center }));
+                  } else if (field.key === "mod0_ll_bw") {
+                    // Search runner writes this shared register; it is not a manual PID field.
                   } else {
                     setXdpPidRequest((current) => ({ ...current, [field.key]: Math.round(value.center) }));
                   }
@@ -2370,13 +2577,18 @@ function AutotuneWorkbench({
             </Panel>
           </div>
           <div className="autotune-result-grid">
-            <Panel title="Penalty Trend" icon={<Pause size={17} />}>
-              <ReactECharts option={penaltyOption(history, selectedIteration)} className="chart" />
-            </Panel>
+            <PenaltyTrendPanel
+              history={history}
+              selectedIteration={selectedIteration}
+              onSelectIteration={selectIterationForPreview}
+              running={status?.state === "running"}
+            />
           </div>
-          <Panel title="Iteration History" icon={<RefreshCw size={17} />}>
-            <IterationTable history={history} selectedIteration={selectedIteration} onSelectIteration={setSelectedIteration} />
-          </Panel>
+          <IterationHistoryPanel
+            history={history}
+            selectedIteration={selectedIteration}
+            onSelectIteration={selectIterationForPreview}
+          />
         </section>
 
         <aside className="metrics-rail">
@@ -2391,12 +2603,10 @@ function AutotuneWorkbench({
             record={visibleRecord}
             selectedAlgorithm={optimizationAlgorithm}
           />
-          <CandidateMetricsPanel
-            title="Best Result"
-            candidateTitle="Best Candidate"
-            metricsTitle="Best Metrics"
-            record={best}
-            showIteration
+          <RecommendedResultsPanel
+            records={recommendedRecords}
+            selectedIteration={selectedIteration}
+            onPreview={selectIterationForPreview}
           />
         </aside>
       </div>
@@ -2513,10 +2723,10 @@ function ManualTuningView({
   const [scopeChannels, setScopeChannels] = useState<string[]>(experimentSettings.scopeChannels);
   const [scopeMeasurements, setScopeMeasurements] = useState<string[]>(experimentSettings.scopeMeasurements);
   const [scopeCapture, setScopeCapture] = useState<ScopeCaptureReadback | null>(null);
-  const [scopeWebPlotOpen, setScopeWebPlotOpen] = useState(true);
-  const [scopePngPlotOpen, setScopePngPlotOpen] = useState(true);
-  const [bodeWebPlotOpen, setBodeWebPlotOpen] = useState(true);
-  const [bodePngPlotOpen, setBodePngPlotOpen] = useState(true);
+  const [scopeWebPlotOpen, setScopeWebPlotOpen] = usePersistentPanelOpen("manual-scope-web-plot", true);
+  const [scopePngPlotOpen, setScopePngPlotOpen] = usePersistentPanelOpen("manual-scope-png-plot", true);
+  const [bodeWebPlotOpen, setBodeWebPlotOpen] = usePersistentPanelOpen("manual-bode-web-plot", true);
+  const [bodePngPlotOpen, setBodePngPlotOpen] = usePersistentPanelOpen("manual-bode-png-plot", true);
   const [scopeRunning, setScopeRunning] = useState(false);
   const [scopeAcquisitionRunning, setScopeAcquisitionRunning] = useState(false);
   const [scopeAcquisitionBusy, setScopeAcquisitionBusy] = useState(false);
@@ -3139,6 +3349,7 @@ function ManualTuningView({
 
           <Panel
             title="Function Generator"
+            persistenceKey="manual-function-generator"
             icon={<Activity size={17} />}
           >
             <div className="fg-panel-layout">
@@ -3626,17 +3837,19 @@ function Panel({
   title,
   icon,
   headerExtra,
+  persistenceKey,
   children
 }: {
   title: string;
   icon: React.ReactNode;
   headerExtra?: React.ReactNode;
+  persistenceKey?: string;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = usePersistentPanelOpen(`panel:${persistenceKey ?? title}`, true);
   return (
     <section className={`panel ${open ? "open" : "collapsed"}`}>
-      <button type="button" className="panel-title panel-toggle" onClick={() => setOpen((current) => !current)}>
+      <button type="button" className="panel-title panel-toggle" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
         <span className="panel-heading">
           {icon}
           <h2>{title}</h2>
@@ -3656,18 +3869,20 @@ function CollapsiblePanel({
   icon,
   summary,
   defaultOpen = false,
+  persistenceKey,
   children
 }: {
   title: string;
   icon: React.ReactNode;
   summary?: string;
   defaultOpen?: boolean;
+  persistenceKey?: string;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, setOpen] = usePersistentPanelOpen(`collapsible:${persistenceKey ?? title}`, defaultOpen);
   return (
     <section className={`panel collapsible-panel ${open ? "open" : ""}`}>
-      <button type="button" className="collapsible-title" onClick={() => setOpen((current) => !current)}>
+      <button type="button" className="collapsible-title" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
         <span className="collapsible-heading">
           {icon}
           <span>{title}</span>
@@ -4195,7 +4410,18 @@ function AutotuneResultImage({
   const pendingKey = imageKey === "scope_png" ? "scope_png_pending" : "bode_png_pending";
   const error = typeof result?.[errorKey] === "string" ? String(result[errorKey]) : "";
   const pending = result?.[pendingKey] === true;
-  const version = versionKeys.map((key) => result?.[key]).find((value) => value !== undefined && value !== null) ?? record?.iteration ?? Date.now();
+  // Recomputed artifacts keep the original capture/sweep id. Include the
+  // analysis label and derived metrics in the cache key so rebuilding a
+  // stored Scope image (for example after a Ts algorithm change) is visible
+  // immediately instead of reusing the browser's old PNG.
+  const versionParts = [
+    ...versionKeys.map((key) => result?.[key]),
+    record?.metrics.settling_analysis_version,
+    record?.metrics.undershoot_settling_time_s,
+    record?.metrics.overshoot_settling_time_s,
+    record?.metrics.score
+  ].filter((value) => value !== undefined && value !== null);
+  const version = versionParts.length > 0 ? versionParts.join("-") : record?.iteration ?? Date.now();
   const [retryNonce, setRetryNonce] = useState(0);
   const [loadFailed, setLoadFailed] = useState(false);
   useEffect(() => {
@@ -4259,16 +4485,20 @@ function countRunDates(runs: Array<{ run_id: string }>): Record<string, number> 
 }
 
 function formatRunLabel(
-  run: Pick<ResultRunSummary, "run_id" | "kind" | "display_name">,
+  run: Pick<ResultRunSummary, "run_id" | "kind" | "display_name" | "algorithm">,
   dateCounts: Record<string, number>,
   index: number,
   includeDuplicateIndex = true
 ): string {
-  if (run.display_name && / #\d+$/.test(run.display_name)) return run.display_name;
-  const date = runDateKey(run.run_id);
-  const kind = run.kind === "saved" ? "Permanent" : "Recent";
-  const duplicateSuffix = includeDuplicateIndex && (dateCounts[date] ?? 0) > 1 ? ` #${index + 1}` : "";
-  return `${kind} / ${date}${duplicateSuffix}`;
+  let baseLabel = run.display_name && / #\d+$/.test(run.display_name) ? run.display_name : "";
+  if (!baseLabel) {
+    const date = runDateKey(run.run_id);
+    const kind = run.kind === "saved" ? "Permanent" : "Recent";
+    const duplicateSuffix = includeDuplicateIndex && (dateCounts[date] ?? 0) > 1 ? ` #${index + 1}` : "";
+    baseLabel = `${kind} / ${date}${duplicateSuffix}`;
+  }
+  const algorithmLabel = run.algorithm === "DRL" ? "DRL" : run.algorithm === "Grid" ? "Grid" : "";
+  return algorithmLabel ? `${baseLabel} [${algorithmLabel}]` : baseLabel;
 }
 
 function formatLoadedRunLabel(runs: AutotuneRunsResponse | null, kind: string, runId: string): string {
@@ -4407,6 +4637,9 @@ function BodeIterationMetrics({ record }: { record: IterationRecord | null }) {
   const phaseMargin = asDisplayNumber(metrics?.phase_margin_deg ?? margins?.phase_margin_deg);
   const crossover = asDisplayNumber(metrics?.crossover_frequency_hz ?? margins?.phase_crossover_hz);
   const gainMargin = asDisplayNumber(metrics?.gain_margin_db ?? margins?.gain_margin_db);
+  const gainRebound = asDisplayNumber(metrics?.bode_gain_rebound_db ?? margins?.gain_rebound_db);
+  const flatSpan = asDisplayNumber(metrics?.bode_gain_flat_span_decades ?? margins?.gain_flat_span_decades);
+  const shapePenalty = asDisplayNumber(metrics?.bode_gain_shape_penalty ?? margins?.gain_shape_penalty);
   return (
     <dl className="kv">
       <dt>Phase Margin</dt>
@@ -4415,6 +4648,12 @@ function BodeIterationMetrics({ record }: { record: IterationRecord | null }) {
       <dd>{crossover === null ? "--" : formatMaybeFrequency(crossover)}</dd>
       <dt>Gain Margin</dt>
       <dd>{gainMargin === null ? "--" : `${gainMargin.toFixed(2)} dB`}</dd>
+      <dt>Gain Rebound</dt>
+      <dd>{gainRebound === null ? "--" : `${gainRebound.toFixed(2)} dB`}</dd>
+      <dt>Flat Span</dt>
+      <dd>{flatSpan === null ? "--" : `${flatSpan.toFixed(2)} dec`}</dd>
+      <dt>Shape Penalty</dt>
+      <dd>{shapePenalty === null ? "--" : shapePenalty.toFixed(2)}</dd>
       <dt>Bode data</dt>
       <dd>{typeof bodeResult?.data_file === "string" ? "saved" : "--"}</dd>
     </dl>
@@ -4655,16 +4894,18 @@ function SearchParameterField({
   limit,
   value,
   integer = false,
+  singleLineTitle = false,
   onChange
 }: {
   label: string;
   limit: string;
   value: SearchParameter;
   integer?: boolean;
+  singleLineTitle?: boolean;
   onChange: (value: SearchParameter) => void;
 }) {
-  const update = (field: "min" | "max" | "points", nextValue: number) => {
-    const normalized = field === "points" || integer ? Math.round(nextValue) : nextValue;
+  const update = (field: "min" | "max", nextValue: number) => {
+    const normalized = integer ? Math.round(nextValue) : nextValue;
     const next = { ...value, [field]: normalized };
     if (field === "min" && next.min > next.max) {
       next.max = next.min;
@@ -4672,17 +4913,12 @@ function SearchParameterField({
     if (field === "max" && next.max < next.min) {
       next.min = next.max;
     }
-    next.points = Math.max(1, Math.min(101, Math.round(next.points || 1)));
-    next.step = next.points > 1 ? Math.abs((next.max - next.min) / (next.points - 1)) : Math.abs(next.max - next.min);
-    if (integer) {
-      next.step = Math.max(1, Math.round(next.step));
-    }
     next.center = Math.min(Math.max(next.center, next.min), next.max);
     onChange(next);
   };
 
   return (
-    <div className="search-parameter">
+    <div className={`search-parameter${singleLineTitle ? " search-parameter-single-line-title" : ""}`}>
       <div className="search-parameter-title">
         <span>{label}</span>
         <small>{limit}</small>
@@ -4690,7 +4926,6 @@ function SearchParameterField({
       <div className="search-parameter-grid">
         <DeferredSearchInput label="min" value={value.min} integer={integer} onCommit={(nextValue) => update("min", nextValue)} />
         <DeferredSearchInput label="max" value={value.max} integer={integer} onCommit={(nextValue) => update("max", nextValue)} />
-        <DeferredSearchInput label="points" value={value.points ?? 1} integer min={1} max={101} onCommit={(nextValue) => update("points", nextValue)} />
       </div>
     </div>
   );
@@ -4817,7 +5052,7 @@ function CandidateMetricsPanel({
   );
 }
 
-function RunCurrentPanel({
+const RunCurrentPanel = React.memo(function RunCurrentPanel({
   title,
   candidateTitle,
   metricsTitle,
@@ -4839,7 +5074,7 @@ function RunCurrentPanel({
   selectedAlgorithm?: string;
 }) {
   return (
-    <Panel title={title} icon={<Activity size={17} />}>
+    <Panel title={title} persistenceKey="autotune-current-result" icon={<Activity size={17} />}>
       <div className="combined-result-section">
         <h4>Run Status</h4>
         <RunStatusReadout
@@ -4862,7 +5097,7 @@ function RunCurrentPanel({
       </div>
     </Panel>
   );
-}
+});
 
 function PidReadout({ record, showIteration = false }: { record: IterationRecord | null; showIteration?: boolean }) {
   const candidate = record?.candidate;
@@ -4886,6 +5121,8 @@ function PidReadout({ record, showIteration = false }: { record: IterationRecord
       <dd>{candidate ? candidate.mod0_kpole2 : "--"}</dd>
       <dt>cm gain</dt>
       <dd>{candidate ? candidate.mod0_cm_gain : "--"}</dd>
+      <dt>LS/LR BW</dt>
+      <dd>{candidate ? candidate.mod0_ll_bw : "--"}</dd>
       <dt>Output L</dt>
       <dd>{candidate ? `${candidate.output_inductance_nh.toFixed(3)} nH` : "--"}</dd>
       <dt>Effective Lc</dt>
@@ -4929,18 +5166,31 @@ function RunStatusReadout({
   const search = normalizeTuningConfig(status?.config).search;
   const maxCoarse = searchCoarseBudget(search);
   const maxRefined = searchRefinedBudget(search);
+  const algorithmValue = status?.state === "running"
+    ? status.experiment?.optimization_algorithm
+    : selectedAlgorithm ?? status?.experiment?.optimization_algorithm;
+  const isDrl = algorithmValue === "deep-reinforcement";
   const safeMaxIterations = Math.max(1, maxCoarse + maxRefined);
-  const coarseDone = Math.min(maxCoarse, countCoarseIterations(history));
+  // DRL candidates use phases such as drl_start/drl_policy instead of the
+  // heuristic baseline/coordinate/local_refine phases. Their configured
+  // budget is stored in max_coarse_iterations, so count the DRL history
+  // against that budget instead of leaving the readout stuck at zero.
+  const coarseDone = isDrl
+    ? Math.min(maxCoarse, iteration)
+    : Math.min(maxCoarse, countCoarseIterations(history));
   const refinedDone = Math.min(maxRefined, Math.max(0, iteration - coarseDone));
   const progressPct = Math.max(0, Math.min(100, (iteration / safeMaxIterations) * 100));
   const currentLabel = current ? `#${current.iteration} ${current.phase}` : "-";
   const bestPenalty = best ? displayPenaltyScore(best) : null;
-  const bestLabel = best ? `#${best.iteration} penalty ${formatMaybeNumber(bestPenalty, 3)}` : "-";
-  const algorithm = optimizationAlgorithmLabel(
-    status?.state === "running"
-      ? status.experiment?.optimization_algorithm
-      : selectedAlgorithm ?? status?.experiment?.optimization_algorithm
-  );
+  const bestObjective = best ? displayObjectiveScore(best) : null;
+  const bestLabel = best
+    ? `#${best.iteration} obj ${formatMaybeNumber(bestObjective, 3)} / pen ${formatMaybeNumber(bestPenalty, 3)}`
+    : "-";
+  const algorithm = isDrl
+    ? "DRL"
+    : algorithmValue === "heuristic" || !algorithmValue
+      ? "Grid+Heuristic"
+      : optimizationAlgorithmLabel(algorithmValue);
   const resultsSaved = Boolean(
     current?.scope_result && typeof current.scope_result === "object" && "scope_png" in current.scope_result
   ) || Boolean(
@@ -4955,7 +5205,7 @@ function RunStatusReadout({
         <dt>Mode</dt>
         <dd>{status?.state === "running" ? "Running" : "Ready"}</dd>
         <dt>Algorithm</dt>
-        <dd>{algorithm}</dd>
+        <dd className="run-status-algorithm" title={algorithm}>{algorithm}</dd>
         <dt>Iter Coarse</dt>
         <dd>{coarseDone} / {maxCoarse}</dd>
         <dt>Iter Refined</dt>
@@ -4977,8 +5227,73 @@ function RunStatusReadout({
   );
 }
 
+function hasInvalidTransient(record: IterationRecord) {
+  return (record.metrics.pass_reasons ?? []).some((reason) =>
+    String(reason).toLowerCase().includes("invalid transient waveform")
+  );
+}
+
+function hasInvalidSettling(record: IterationRecord, kind: "overshoot" | "undershoot") {
+  const explicit = kind === "overshoot"
+    ? record.metrics.overshoot_settling_valid
+    : record.metrics.undershoot_settling_valid;
+  return explicit === false || (explicit === undefined && hasInvalidTransient(record));
+}
+
+function RecommendedResultsPanel({
+  records,
+  selectedIteration,
+  onPreview
+}: {
+  records: IterationRecord[];
+  selectedIteration: number | null;
+  onPreview: (iteration: number | null) => void;
+}) {
+  return (
+    <Panel title="Top 5 Quality Basins" icon={<Gauge size={17} />}>
+      {records.length > 0 ? (
+        <div className="recommended-results">
+          {records.map((record, index) => {
+            const candidate = record.candidate;
+            const selected = selectedIteration === record.iteration;
+            return (
+              <button
+                key={record.iteration}
+                type="button"
+                className={`recommended-result${selected ? " selected" : ""}`}
+                onClick={() => onPreview(selected ? null : record.iteration)}
+                title={`Preview iteration ${record.iteration}`}
+              >
+                <span className="recommended-result-rank">{index + 1}</span>
+                <span className="recommended-result-copy">
+                  <strong>Iteration #{record.iteration}</strong>
+                  <small>
+                    {candidate
+                      ? `kp ${candidate.mod0_kp}  ki ${candidate.mod0_ki}  kd ${candidate.mod0_kd}  p ${candidate.mod0_kpole1}/${candidate.mod0_kpole2}  BW ${candidate.mod0_ll_bw}`
+                      : record.phase}
+                  </small>
+                </span>
+                <span className="recommended-result-penalty">
+                  <small>Objective / Penalty</small>
+                  <strong>{formatMaybeNumber(displayObjectiveScore(record), 3)} / {formatMaybeNumber(displayPenaltyScore(record), 3)}</strong>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="muted">No valid result yet.</p>
+      )}
+    </Panel>
+  );
+}
+
 function Metrics({ record }: { record: IterationRecord | null }) {
   if (!record) return <p className="muted">No iteration has run yet.</p>;
+  const osSettlingInvalid = hasInvalidSettling(record, "overshoot");
+  const usSettlingInvalid = hasInvalidSettling(record, "undershoot");
+  const osDiagnostics = record.metrics.settling_diagnostics?.overshoot;
+  const usDiagnostics = record.metrics.settling_diagnostics?.undershoot;
   return (
     <dl className="kv">
       <dt>Overshoot</dt>
@@ -4986,9 +5301,15 @@ function Metrics({ record }: { record: IterationRecord | null }) {
       <dt>Undershoot</dt>
       <dd>{record.metrics.undershoot_pct.toFixed(2)}%</dd>
       <dt>OS settling</dt>
-      <dd>{formatSettlingUs(record.metrics.overshoot_settling_time_s, record.metrics.settling_time_s)}</dd>
+      <dd>{osSettlingInvalid ? "--" : formatSettlingUs(record.metrics.overshoot_settling_time_s, record.metrics.settling_time_s)}</dd>
       <dt>US settling</dt>
-      <dd>{formatSettlingUs(record.metrics.undershoot_settling_time_s, record.metrics.settling_time_s)}</dd>
+      <dd>{usSettlingInvalid ? "--" : formatSettlingUs(record.metrics.undershoot_settling_time_s, record.metrics.settling_time_s)}</dd>
+      {(record.metrics.settling_analysis_version ?? 0) >= 2 ? (
+        <>
+          <dt>Ts rebound count</dt>
+          <dd>OS {osDiagnostics?.secondary_excursion_count ?? 0} / US {usDiagnostics?.secondary_excursion_count ?? 0}</dd>
+        </>
+      ) : null}
       <dt>Low-load Vout</dt>
       <dd>{record.metrics.low_load_steady_v === null || record.metrics.low_load_steady_v === undefined ? "--" : `${record.metrics.low_load_steady_v.toFixed(3)} V`}</dd>
       <dt>High-load Vout</dt>
@@ -4999,8 +5320,18 @@ function Metrics({ record }: { record: IterationRecord | null }) {
       <dd>{formatMaybeFrequency(record.metrics.crossover_frequency_hz)}</dd>
       <dt>Gain Margin</dt>
       <dd>{record.metrics.gain_margin_db === null || record.metrics.gain_margin_db === undefined ? "--" : `${record.metrics.gain_margin_db.toFixed(2)} dB`}</dd>
+      <dt>Gain Rebound</dt>
+      <dd>{record.metrics.bode_gain_rebound_db === null || record.metrics.bode_gain_rebound_db === undefined ? "--" : `${record.metrics.bode_gain_rebound_db.toFixed(2)} dB`}</dd>
+      <dt>Flat Span</dt>
+      <dd>{record.metrics.bode_gain_flat_span_decades === null || record.metrics.bode_gain_flat_span_decades === undefined ? "--" : `${record.metrics.bode_gain_flat_span_decades.toFixed(2)} dec`}</dd>
+      <dt>Shape Penalty</dt>
+      <dd>{formatMaybeNumber(record.metrics.bode_gain_shape_penalty, 2)}</dd>
       <dt>Penalty</dt>
       <dd>{formatMaybeNumber(displayPenaltyScore(record), 3)}</dd>
+      <dt>Objective</dt>
+      <dd>{formatMaybeNumber(displayObjectiveScore(record), 3)}</dd>
+      <dt>BW bonus</dt>
+      <dd>{formatMaybeNumber(record.bandwidth_bonus, 3)}</dd>
       <dt>Pass</dt>
       <dd>{record.metrics.passed ? "yes" : "no"}</dd>
       <dt>Reason</dt>
@@ -5060,6 +5391,208 @@ function XdpPidTable({ pid }: { pid: XdpPidReadback | null }) {
   );
 }
 
+const penaltyChartRefreshIntervalMs = 5000;
+const iterationRowHeightPx = 34;
+const iterationHeaderHeightPx = 38;
+const iterationVirtualOverscan = 6;
+
+function nearestHistoryIteration(history: IterationRecord[], target: number) {
+  if (history.length === 0) return null;
+  let low = 0;
+  let high = history.length - 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const iteration = history[middle].iteration;
+    if (iteration === target) return iteration;
+    if (iteration < target) low = middle + 1;
+    else high = middle - 1;
+  }
+  const lower = history[Math.max(0, high)];
+  const upper = history[Math.min(history.length - 1, low)];
+  return Math.abs(lower.iteration - target) <= Math.abs(upper.iteration - target)
+    ? lower.iteration
+    : upper.iteration;
+}
+
+const PenaltyTrendPanel = React.memo(function PenaltyTrendPanel({
+  history,
+  selectedIteration,
+  onSelectIteration,
+  running
+}: {
+  history: IterationRecord[];
+  selectedIteration: number | null;
+  onSelectIteration: (iteration: number | null) => void;
+  running: boolean;
+}) {
+  const latestHistoryRef = useRef(history);
+  const selectedIterationRef = useRef(selectedIteration);
+  const onSelectIterationRef = useRef(onSelectIteration);
+  const chartCleanupRef = useRef<(() => void) | null>(null);
+  const dragPublishTimerRef = useRef<number | null>(null);
+  const pendingDragIterationRef = useRef<number | null>(null);
+  const lastDragPublishRef = useRef(0);
+  const lastPublishRef = useRef(performance.now());
+  const publishTimerRef = useRef<number | null>(null);
+  const [displayHistory, setDisplayHistory] = useState(history);
+
+  latestHistoryRef.current = history;
+  selectedIterationRef.current = selectedIteration;
+  onSelectIterationRef.current = onSelectIteration;
+
+  const handleChartReady = useCallback((chart: ECharts) => {
+    chartCleanupRef.current?.();
+    const renderer = chart.getZr();
+    let dragging = false;
+    let dragMoved = false;
+    let suppressNextClick = false;
+
+    const nearestIteration = (offsetX: number, offsetY: number) => {
+      if (!chart.containPixel({ gridIndex: 0 }, [offsetX, offsetY])) return null;
+      const converted = chart.convertFromPixel({ seriesIndex: 0 }, [offsetX, offsetY]);
+      const iterationValue = Number(Array.isArray(converted) ? converted[0] : converted);
+      if (!Number.isFinite(iterationValue)) return null;
+      return nearestHistoryIteration(latestHistoryRef.current, iterationValue);
+    };
+    const selectedLineX = () => {
+      const iteration = selectedIterationRef.current;
+      if (iteration === null) return null;
+      const converted = chart.convertToPixel({ xAxisIndex: 0 }, iteration);
+      const pixel = Number(Array.isArray(converted) ? converted[0] : converted);
+      return Number.isFinite(pixel) ? pixel : null;
+    };
+    const publishDragSelection = (iteration: number, immediate = false) => {
+      pendingDragIterationRef.current = iteration;
+      const publish = () => {
+        dragPublishTimerRef.current = null;
+        const pending = pendingDragIterationRef.current;
+        pendingDragIterationRef.current = null;
+        if (pending === null || pending === selectedIterationRef.current) return;
+        lastDragPublishRef.current = performance.now();
+        onSelectIterationRef.current(pending);
+      };
+      const elapsed = performance.now() - lastDragPublishRef.current;
+      if (immediate || elapsed >= 60) {
+        if (dragPublishTimerRef.current !== null) window.clearTimeout(dragPublishTimerRef.current);
+        publish();
+      } else if (dragPublishTimerRef.current === null) {
+        dragPublishTimerRef.current = window.setTimeout(publish, 60 - elapsed);
+      }
+    };
+    const handleMouseDown = (event: { offsetX: number; offsetY: number }) => {
+      const lineX = selectedLineX();
+      dragging = lineX !== null && Math.abs(event.offsetX - lineX) <= 12;
+      dragMoved = false;
+      if (dragging) renderer.setCursorStyle("ew-resize");
+    };
+    const handleMouseMove = (event: { offsetX: number; offsetY: number }) => {
+      if (!dragging) {
+        const lineX = selectedLineX();
+        renderer.setCursorStyle(lineX !== null && Math.abs(event.offsetX - lineX) <= 12 ? "ew-resize" : "default");
+        return;
+      }
+      const iteration = nearestIteration(event.offsetX, event.offsetY);
+      if (iteration === null) return;
+      dragMoved = true;
+      publishDragSelection(iteration);
+    };
+    const handleMouseUp = (event: { offsetX: number; offsetY: number }) => {
+      if (!dragging) return;
+      const iteration = nearestIteration(event.offsetX, event.offsetY);
+      if (iteration !== null) publishDragSelection(iteration, true);
+      dragging = false;
+      suppressNextClick = dragMoved;
+      renderer.setCursorStyle("default");
+    };
+    const handleClick = (event: { offsetX: number; offsetY: number }) => {
+      if (suppressNextClick) {
+        suppressNextClick = false;
+        return;
+      }
+      const iteration = nearestIteration(event.offsetX, event.offsetY);
+      if (iteration !== null) onSelectIterationRef.current(iteration);
+    };
+    const handleGlobalOut = () => {
+      dragging = false;
+      renderer.setCursorStyle("default");
+    };
+
+    renderer.on("mousedown", handleMouseDown);
+    renderer.on("mousemove", handleMouseMove);
+    renderer.on("mouseup", handleMouseUp);
+    renderer.on("click", handleClick);
+    renderer.on("globalout", handleGlobalOut);
+    chartCleanupRef.current = () => {
+      renderer.off("mousedown", handleMouseDown);
+      renderer.off("mousemove", handleMouseMove);
+      renderer.off("mouseup", handleMouseUp);
+      renderer.off("click", handleClick);
+      renderer.off("globalout", handleGlobalOut);
+    };
+  }, []);
+
+  useEffect(() => {
+    latestHistoryRef.current = history;
+    const publish = () => {
+      publishTimerRef.current = null;
+      lastPublishRef.current = performance.now();
+      setDisplayHistory((current) => current === latestHistoryRef.current ? current : latestHistoryRef.current);
+    };
+    if (!running) {
+      if (publishTimerRef.current !== null) {
+        window.clearTimeout(publishTimerRef.current);
+        publishTimerRef.current = null;
+      }
+      publish();
+      return;
+    }
+    const elapsed = performance.now() - lastPublishRef.current;
+    if (elapsed >= penaltyChartRefreshIntervalMs) {
+      publish();
+    } else if (publishTimerRef.current === null) {
+      publishTimerRef.current = window.setTimeout(publish, penaltyChartRefreshIntervalMs - elapsed);
+    }
+  }, [history, running]);
+
+  useEffect(() => () => {
+    if (publishTimerRef.current !== null) window.clearTimeout(publishTimerRef.current);
+    if (dragPublishTimerRef.current !== null) window.clearTimeout(dragPublishTimerRef.current);
+    chartCleanupRef.current?.();
+  }, []);
+
+  const option = useMemo(
+    () => penaltyOption(displayHistory, selectedIteration),
+    [displayHistory, selectedIteration]
+  );
+  return (
+    <Panel title="Penalty Trend" icon={<Pause size={17} />}>
+      <div title="Click to select an iteration. Drag the red selection line left or right to scrub through iterations.">
+        <ReactECharts option={option} className="chart" lazyUpdate onChartReady={handleChartReady} />
+      </div>
+    </Panel>
+  );
+});
+
+const IterationHistoryPanel = React.memo(function IterationHistoryPanel({
+  history,
+  selectedIteration,
+  onSelectIteration
+}: {
+  history: IterationRecord[];
+  selectedIteration: number | null;
+  onSelectIteration: (iteration: number | null) => void;
+}) {
+  return (
+    <Panel title="Iteration History" icon={<RefreshCw size={17} />}>
+      <IterationTable
+        history={history}
+        selectedIteration={selectedIteration}
+        onSelectIteration={onSelectIteration}
+      />
+    </Panel>
+  );
+});
+
 function IterationTable({
   history,
   selectedIteration,
@@ -5069,14 +5602,67 @@ function IterationTable({
   selectedIteration: number | null;
   onSelectIteration: (iteration: number | null) => void;
 }) {
-  const displayHistory = history.slice().reverse();
+  const displayHistory = useMemo(() => history.slice().reverse(), [history]);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const scrollFrameRef = useRef<number | null>(null);
+  const pendingScrollTopRef = useRef(0);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(310);
+  const visibleStart = Math.max(
+    0,
+    Math.floor(Math.max(0, scrollTop - iterationHeaderHeightPx) / iterationRowHeightPx) - iterationVirtualOverscan
+  );
+  const visibleCount = Math.ceil(viewportHeight / iterationRowHeightPx) + iterationVirtualOverscan * 2;
+  const visibleEnd = Math.min(displayHistory.length, visibleStart + visibleCount);
+  const visibleHistory = displayHistory.slice(visibleStart, visibleEnd);
+  const topSpacerHeight = visibleStart * iterationRowHeightPx;
+  const bottomSpacerHeight = Math.max(0, (displayHistory.length - visibleEnd) * iterationRowHeightPx);
+
+  const handleScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    pendingScrollTopRef.current = event.currentTarget.scrollTop;
+    if (scrollFrameRef.current !== null) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      setScrollTop(pendingScrollTopRef.current);
+    });
+  }, []);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return;
+    const updateHeight = () => setViewportHeight(element.clientHeight || 310);
+    updateHeight();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateHeight);
+    observer?.observe(element);
+    return () => observer?.disconnect();
+  }, []);
+
+  useEffect(() => () => {
+    if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (selectedIteration === null) return;
+    const selectedIndex = displayHistory.findIndex((item) => item.iteration === selectedIteration);
+    const element = containerRef.current;
+    if (selectedIndex < 0 || !element) return;
+    const rowTop = iterationHeaderHeightPx + selectedIndex * iterationRowHeightPx;
+    const rowBottom = rowTop + iterationRowHeightPx;
+    if (rowTop < element.scrollTop + iterationHeaderHeightPx) {
+      element.scrollTo({ top: Math.max(0, rowTop - iterationHeaderHeightPx) });
+    } else if (rowBottom > element.scrollTop + element.clientHeight) {
+      element.scrollTo({ top: rowBottom - element.clientHeight });
+    }
+  }, [displayHistory, selectedIteration]);
 
   return (
     <div
-      className="table-wrap"
+      ref={containerRef}
+      className="table-wrap iteration-history-wrap"
       aria-label="Iteration history"
+      onScroll={handleScroll}
     >
-      <table>
+      <table className="iteration-history-table">
         <thead>
           <tr>
             <th>#</th>
@@ -5087,6 +5673,7 @@ function IterationTable({
             <th>p1</th>
             <th>p2</th>
             <th>cm gain</th>
+            <th>LS/LR BW</th>
             <th><span className="table-head-main">Out L</span><span className="table-head-unit">nH</span></th>
             <th><span className="table-head-main">Eff Lc</span><span className="table-head-unit">nH</span></th>
             <th><span className="table-head-main">PM</span><span className="table-head-unit">deg</span></th>
@@ -5097,10 +5684,16 @@ function IterationTable({
             <th><span className="table-head-main">OS Ts</span><span className="table-head-unit">us</span></th>
             <th><span className="table-head-main">US Ts</span><span className="table-head-unit">us</span></th>
             <th>Penalty</th>
+            <th>Objective</th>
           </tr>
         </thead>
         <tbody>
-          {displayHistory.map((item) => (
+          {topSpacerHeight > 0 ? (
+            <tr className="virtual-spacer" aria-hidden="true">
+              <td colSpan={20} style={{ height: topSpacerHeight }} />
+            </tr>
+          ) : null}
+          {visibleHistory.map((item) => (
             <tr
               key={item.iteration}
               data-iteration={item.iteration}
@@ -5116,6 +5709,7 @@ function IterationTable({
               <td>{item.candidate?.mod0_kpole1 ?? "--"}</td>
               <td>{item.candidate?.mod0_kpole2 ?? "--"}</td>
               <td>{item.candidate?.mod0_cm_gain ?? "--"}</td>
+              <td>{item.candidate?.mod0_ll_bw ?? "--"}</td>
               <td>{item.candidate ? item.candidate.output_inductance_nh.toFixed(1) : "--"}</td>
               <td>{item.candidate ? item.candidate.effective_lc_inductance_nh.toFixed(1) : "--"}</td>
               <td>{formatMaybeNumber(item.metrics.phase_margin_deg, 1)}</td>
@@ -5123,11 +5717,17 @@ function IterationTable({
               <td>{formatMaybeNumber(item.metrics.gain_margin_db, 2)}</td>
               <td>{item.metrics.overshoot_pct.toFixed(2)}</td>
               <td>{item.metrics.undershoot_pct.toFixed(2)}</td>
-              <td>{formatSettlingUs(item.metrics.overshoot_settling_time_s, item.metrics.settling_time_s).replace(" us", "")}</td>
-              <td>{formatSettlingUs(item.metrics.undershoot_settling_time_s, item.metrics.settling_time_s).replace(" us", "")}</td>
+              <td>{hasInvalidSettling(item, "overshoot") ? "--" : formatSettlingUs(item.metrics.overshoot_settling_time_s, item.metrics.settling_time_s).replace(" us", "")}</td>
+              <td>{hasInvalidSettling(item, "undershoot") ? "--" : formatSettlingUs(item.metrics.undershoot_settling_time_s, item.metrics.settling_time_s).replace(" us", "")}</td>
               <td>{formatMaybeNumber(displayPenaltyScore(item), 3)}</td>
+              <td>{formatMaybeNumber(displayObjectiveScore(item), 3)}</td>
             </tr>
           ))}
+          {bottomSpacerHeight > 0 ? (
+            <tr className="virtual-spacer" aria-hidden="true">
+              <td colSpan={20} style={{ height: bottomSpacerHeight }} />
+            </tr>
+          ) : null}
         </tbody>
       </table>
     </div>
@@ -5150,23 +5750,78 @@ function waveformOption(record: IterationRecord | null, target: number) {
   };
 }
 
-function penaltyOption(history: IterationRecord[], selectedIteration: number | null = null) {
-  const plotted = history.map((item) => displayPenaltyScore(item));
+function downsamplePenaltyHistory(
+  history: IterationRecord[],
+  selectedIteration: number | null,
+  maxPoints = 500
+) {
+  if (history.length <= maxPoints) return history;
   const selectedIndex = selectedIteration === null
     ? -1
     : history.findIndex((item) => item.iteration === selectedIteration);
+  const indices = new Set<number>([0, history.length - 1]);
+  if (selectedIndex >= 0) indices.add(selectedIndex);
+  const bucketCount = Math.max(1, Math.floor((maxPoints - 3) / 2));
+  const interiorLength = history.length - 2;
+
+  for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+    const start = 1 + Math.floor((bucket * interiorLength) / bucketCount);
+    const end = Math.min(history.length - 1, 1 + Math.floor(((bucket + 1) * interiorLength) / bucketCount));
+    let minimumIndex = start;
+    let maximumIndex = start;
+    let minimumValue = Number.POSITIVE_INFINITY;
+    let maximumValue = Number.NEGATIVE_INFINITY;
+    for (let index = start; index < end; index += 1) {
+      const value = displayPenaltyScore(history[index]);
+      if (value !== null && value < minimumValue) {
+        minimumValue = value;
+        minimumIndex = index;
+      }
+      if (value !== null && value > maximumValue) {
+        maximumValue = value;
+        maximumIndex = index;
+      }
+    }
+    indices.add(minimumIndex);
+    indices.add(maximumIndex);
+  }
+
+  return [...indices]
+    .sort((left, right) => left - right)
+    .slice(0, maxPoints)
+    .map((index) => history[index]);
+}
+
+function penaltyOption(history: IterationRecord[], selectedIteration: number | null = null) {
+  const sampledHistory = downsamplePenaltyHistory(history, selectedIteration);
+  const plotted = sampledHistory.map((item) => [item.iteration, displayPenaltyScore(item)]);
+  const objectives = sampledHistory.map((item) => [item.iteration, displayObjectiveScore(item)]);
+  const selectedIndex = selectedIteration === null
+    ? -1
+    : sampledHistory.findIndex((item) => item.iteration === selectedIteration);
   const selectedPoint = selectedIndex >= 0
-    ? [[history[selectedIndex].iteration, plotted[selectedIndex]]]
+    ? [[selectedIteration, displayPenaltyScore(sampledHistory[selectedIndex])]]
     : [];
   const selectedMarkLine = selectedIndex >= 0
-    ? [{ xAxis: history[selectedIndex].iteration }]
+    ? [{ xAxis: selectedIteration }]
     : [];
   return {
     animation: false,
     tooltip: { trigger: "axis" },
-    grid: { left: 48, right: 18, top: 20, bottom: 38 },
-    xAxis: { type: "category", data: history.map((item) => item.iteration) },
-    yAxis: { type: "value", name: "penalty" },
+    grid: { left: 48, right: 18, top: 48, bottom: 42 },
+    xAxis: {
+      type: "value",
+      name: "iteration",
+      min: sampledHistory[0]?.iteration,
+      max: sampledHistory.at(-1)?.iteration,
+      minInterval: 1
+    },
+    legend: {
+      data: ["Penalty", "Objective"],
+      top: 2,
+      left: "center"
+    },
+    yAxis: { type: "value", name: "score" },
     series: [
       {
         name: "Penalty",
@@ -5183,6 +5838,15 @@ function penaltyOption(history: IterationRecord[], selectedIteration: number | n
           lineStyle: { color: "#ea4335", width: 2.5, type: "solid", opacity: 0.95 },
           z: 9
         }
+      },
+      {
+        name: "Objective",
+        type: "line",
+        smooth: true,
+        connectNulls: false,
+        data: objectives,
+        lineStyle: { color: "#1a73e8", width: 2 },
+        itemStyle: { color: "#1a73e8" }
       },
       {
         name: "Selected iteration",
@@ -5719,6 +6383,9 @@ function isCoarsePhase(phase: string | undefined) {
 
 function displayPenaltyScore(record: IterationRecord) {
   const reasons = (record.metrics.pass_reasons ?? []).join(" ").toLowerCase();
+  if (reasons.includes("invalid transient waveform")) {
+    return 300;
+  }
   if (reasons.includes("invalid bode") || reasons.includes("duplicate 0 db crossover") || reasons.includes("second 0 db crossover")) {
     return 250;
   }
@@ -5735,6 +6402,128 @@ function displayPenaltyScore(record: IterationRecord) {
     return 300;
   }
   return Number.isFinite(score) ? score : null;
+}
+
+function displayObjectiveScore(record: IterationRecord) {
+  const value = Number(record.objective_score);
+  return record.objective_score !== null
+    && record.objective_score !== undefined
+    && Number.isFinite(value)
+    ? value
+    : null;
+}
+
+function optimizationRecordCompare(left: IterationRecord, right: IterationRecord) {
+  if (left.metrics.passed !== right.metrics.passed) return left.metrics.passed ? -1 : 1;
+  const objectiveDelta = (displayObjectiveScore(left) ?? Number.POSITIVE_INFINITY)
+    - (displayObjectiveScore(right) ?? Number.POSITIVE_INFINITY);
+  if (objectiveDelta !== 0) return objectiveDelta;
+  const bandwidthDelta = (right.candidate?.mod0_ll_bw ?? 0) - (left.candidate?.mod0_ll_bw ?? 0);
+  if (bandwidthDelta !== 0) return bandwidthDelta;
+  return (displayPenaltyScore(left) ?? Number.POSITIVE_INFINITY)
+    - (displayPenaltyScore(right) ?? Number.POSITIVE_INFINITY);
+}
+
+function selectRecommendedRecords(
+  preferred: IterationRecord[] | undefined,
+  history: IterationRecord[],
+  limit: number
+) {
+  const safeLimit = Math.max(0, Math.floor(limit));
+  if (safeLimit === 0) return [];
+  const historyByIteration = new Map(history.map((record) => [record.iteration, record]));
+  const preferredRecords = (preferred ?? [])
+    .map((record) => historyByIteration.get(record.iteration) ?? record)
+    .filter((record) => record.candidate && isRecommendationRecordValid(record));
+  if (preferredRecords.length > 0) {
+    return uniqueIterationRecords(preferredRecords).slice(0, safeLimit);
+  }
+
+  const eligibleHistory = history.some((record) => displayObjectiveScore(record) !== null)
+    ? history.filter((record) => displayObjectiveScore(record) !== null)
+    : history;
+  const ranked = uniqueIterationRecords(eligibleHistory)
+    .filter((record) => record.candidate && isRecommendationRecordValid(record))
+    .sort(optimizationRecordCompare);
+  const qualityPool = ranked.slice(0, Math.max(safeLimit, safeLimit * BASIN_QUALITY_POOL_MULTIPLIER));
+  const selected: IterationRecord[] = [];
+  for (const minimumDistance of [0.18, 0.10, 0]) {
+    for (const record of qualityPool) {
+      if (selected.length >= safeLimit) {
+        return selected.sort(optimizationRecordCompare);
+      }
+      if (selected.some((item) => item.iteration === record.iteration)) continue;
+      if (
+        minimumDistance > 0
+        && selected.some((item) => candidateBasinDistance(item, record) < minimumDistance)
+      ) {
+        continue;
+      }
+      selected.push(record);
+    }
+  }
+  return selected.sort(optimizationRecordCompare);
+}
+
+function uniqueIterationRecords(records: IterationRecord[]) {
+  const seenIterations = new Set<number>();
+  const seenCandidates = new Set<string>();
+  return records.filter((record) => {
+    const candidate = record.candidate;
+    if (!candidate || seenIterations.has(record.iteration)) return false;
+    const key = [
+      candidate.mod0_kp,
+      candidate.mod0_ki,
+      candidate.mod0_kd,
+      candidate.mod0_kpole1,
+      candidate.mod0_kpole2,
+      candidate.mod0_cm_gain,
+      candidate.mod0_ll_bw,
+      candidate.output_inductance_nh.toFixed(6),
+      candidate.effective_lc_inductance_nh.toFixed(6)
+    ].join(":");
+    if (seenCandidates.has(key)) return false;
+    seenIterations.add(record.iteration);
+    seenCandidates.add(key);
+    return true;
+  });
+}
+
+function isRecommendationRecordValid(record: IterationRecord) {
+  const penalty = displayPenaltyScore(record);
+  return penalty !== null && Number.isFinite(penalty) && penalty < 250;
+}
+
+function candidateBasinDistance(left: IterationRecord, right: IterationRecord) {
+  const leftCandidate = left.candidate;
+  const rightCandidate = right.candidate;
+  if (!leftCandidate || !rightCandidate) return Number.POSITIVE_INFINITY;
+  const leftVector = [
+    leftCandidate.mod0_kp / 255,
+    leftCandidate.mod0_ki / 255,
+    leftCandidate.mod0_kd / 255,
+    (leftCandidate.mod0_kpole1 - 2) / 4,
+    (leftCandidate.mod0_kpole2 - 2) / 4,
+    leftCandidate.mod0_cm_gain / 9,
+    (leftCandidate.mod0_ll_bw - 47) / 32,
+    leftCandidate.output_inductance_nh / 40,
+    leftCandidate.effective_lc_inductance_nh / 150
+  ];
+  const rightVector = [
+    rightCandidate.mod0_kp / 255,
+    rightCandidate.mod0_ki / 255,
+    rightCandidate.mod0_kd / 255,
+    (rightCandidate.mod0_kpole1 - 2) / 4,
+    (rightCandidate.mod0_kpole2 - 2) / 4,
+    rightCandidate.mod0_cm_gain / 9,
+    (rightCandidate.mod0_ll_bw - 47) / 32,
+    rightCandidate.output_inductance_nh / 40,
+    rightCandidate.effective_lc_inductance_nh / 150
+  ];
+  return Math.sqrt(leftVector.reduce((total, value, index) => {
+    const delta = value - rightVector[index];
+    return total + delta * delta;
+  }, 0));
 }
 
 function formatSci(value: number | undefined) {

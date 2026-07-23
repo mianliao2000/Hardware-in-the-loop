@@ -12,15 +12,27 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from ..models import AutotuneExperimentConfig, HardwarePidCandidate, SearchSpace, TuningConfig, TuningTargets
+from ..models import (
+    LL_BANDWIDTH_MAX,
+    LL_BANDWIDTH_MIN,
+    AutotuneExperimentConfig,
+    HardwarePidCandidate,
+    SearchSpace,
+    TuningConfig,
+    TuningTargets,
+    hardware_candidate_key,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 18
 ACTION_FIELDS = (
     "mod0_kp",
     "mod0_ki",
     "mod0_kd",
-    "kpole",
+    "mod0_kpole1",
+    "mod0_kpole2",
+    "mod0_cm_gain",
+    "mod0_ll_bw",
     "output_inductance_nh",
     "effective_lc_inductance_nh",
 )
@@ -32,9 +44,17 @@ METRIC_FIELDS = (
     "phase_margin_deg",
     "crossover_frequency_khz",
     "gain_margin_db",
+    "bode_gain_shape_penalty",
 )
+KPOLE_VALUES = (2, 3, 4, 5, 6)
+# Retained for explicit diversity scheduling only. The SAC action now carries
+# kpole1 and kpole2 as two independent dimensions; it no longer encodes an
+# arbitrary ordinal index into this table.
+KPOLE_PAIRS = tuple((kpole1, kpole2) for kpole1 in KPOLE_VALUES for kpole2 in KPOLE_VALUES)
 
 SETTLING_WEIGHT_PER_US = 10.0
+MAX_PENALTY = 300.0
+BODE_SHAPE_PENALTY_PASS_PROXY = 13.0
 INVALID_REASON_TOKENS = (
     "protection skipped",
     "transient protection",
@@ -52,7 +72,10 @@ def action_bounds(search: SearchSpace) -> tuple[np.ndarray, np.ndarray]:
             search.mod0_kp.min,
             search.mod0_ki.min,
             search.mod0_kd.min,
-            3.0,
+            search.mod0_kpole1.min,
+            search.mod0_kpole2.min,
+            search.mod0_cm_gain.min,
+            search.mod0_ll_bw.min,
             search.output_inductance_nh.min,
             search.effective_lc_inductance_nh.min,
         ],
@@ -63,7 +86,10 @@ def action_bounds(search: SearchSpace) -> tuple[np.ndarray, np.ndarray]:
             search.mod0_kp.max,
             search.mod0_ki.max,
             search.mod0_kd.max,
-            6.0,
+            search.mod0_kpole1.max,
+            search.mod0_kpole2.max,
+            search.mod0_cm_gain.max,
+            search.mod0_ll_bw.max,
             search.output_inductance_nh.max,
             search.effective_lc_inductance_nh.max,
         ],
@@ -73,13 +99,15 @@ def action_bounds(search: SearchSpace) -> tuple[np.ndarray, np.ndarray]:
 
 
 def candidate_to_action(candidate: HardwarePidCandidate) -> np.ndarray:
-    kpole = 3.0 if abs(int(candidate.mod0_kpole1) - 3) <= abs(int(candidate.mod0_kpole1) - 6) else 6.0
     return np.asarray(
         [
             candidate.mod0_kp,
             candidate.mod0_ki,
             candidate.mod0_kd,
-            kpole,
+            candidate.mod0_kpole1,
+            candidate.mod0_kpole2,
+            candidate.mod0_cm_gain,
+            candidate.mod0_ll_bw,
             candidate.output_inductance_nh,
             candidate.effective_lc_inductance_nh,
         ],
@@ -107,16 +135,16 @@ def candidate_from_normalized(
     values = np.asarray(normalized, dtype=np.float64).reshape(len(ACTION_FIELDS))
     low, high = action_bounds(search)
     raw = low + (np.clip(values, -1.0, 1.0) + 1.0) * 0.5 * (high - low)
-    kpole = 3 if abs(raw[3] - 3.0) <= abs(raw[3] - 6.0) else 6
     return HardwarePidCandidate(
         mod0_kp=int(round(float(raw[0]))),
         mod0_ki=int(round(float(raw[1]))),
         mod0_kd=int(round(float(raw[2]))),
-        mod0_kpole1=kpole,
-        mod0_kpole2=kpole,
-        mod0_cm_gain=2,
-        output_inductance_nh=float(raw[4]),
-        effective_lc_inductance_nh=float(raw[5]),
+        mod0_kpole1=min(6, max(2, int(round(float(raw[3]))))),
+        mod0_kpole2=min(6, max(2, int(round(float(raw[4]))))),
+        mod0_cm_gain=min(9, max(0, int(round(float(raw[5]))))),
+        mod0_ll_bw=min(LL_BANDWIDTH_MAX, max(LL_BANDWIDTH_MIN, int(round(float(raw[6]))))),
+        output_inductance_nh=float(raw[7]),
+        effective_lc_inductance_nh=float(raw[8]),
         phase=phase,
     )
 
@@ -136,16 +164,7 @@ def candidate_with_delta(
 
 
 def candidate_key(candidate: HardwarePidCandidate) -> tuple[Any, ...]:
-    return (
-        int(candidate.mod0_kp),
-        int(candidate.mod0_ki),
-        int(candidate.mod0_kd),
-        int(candidate.mod0_kpole1),
-        int(candidate.mod0_kpole2),
-        int(candidate.mod0_cm_gain),
-        round(float(candidate.output_inductance_nh), 6),
-        round(float(candidate.effective_lc_inductance_nh), 6),
-    )
+    return hardware_candidate_key(candidate)
 
 
 def candidate_from_mapping(value: Mapping[str, Any], phase: str | None = None) -> HardwarePidCandidate:
@@ -158,6 +177,7 @@ def candidate_from_mapping(value: Mapping[str, Any], phase: str | None = None) -
         mod0_kpole1=kpole1,
         mod0_kpole2=kpole2,
         mod0_cm_gain=int(value.get("mod0_cm_gain", 2)),
+        mod0_ll_bw=int(value.get("mod0_ll_bw", 66)),
         output_inductance_nh=float(value.get("output_inductance_nh", 100.024)),
         effective_lc_inductance_nh=float(value.get("effective_lc_inductance_nh", 369.276)),
         phase=str(phase or value.get("phase") or "drl"),
@@ -172,6 +192,7 @@ def candidate_to_mapping(candidate: HardwarePidCandidate) -> dict[str, Any]:
         "mod0_kpole1": int(candidate.mod0_kpole1),
         "mod0_kpole2": int(candidate.mod0_kpole2),
         "mod0_cm_gain": int(candidate.mod0_cm_gain),
+        "mod0_ll_bw": int(candidate.mod0_ll_bw),
         "output_inductance_nh": float(candidate.output_inductance_nh),
         "effective_lc_inductance_nh": float(candidate.effective_lc_inductance_nh),
         "phase": candidate.phase,
@@ -187,6 +208,7 @@ def metric_vector(metrics: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         metrics.get("phase_margin_deg"),
         _hertz_to_kilohertz(metrics.get("crossover_frequency_hz")),
         metrics.get("gain_margin_db"),
+        metrics.get("bode_gain_shape_penalty"),
     )
     values = np.zeros(len(METRIC_FIELDS), dtype=np.float64)
     mask = np.zeros(len(METRIC_FIELDS), dtype=np.float64)
@@ -205,9 +227,21 @@ def vector_to_metric_mapping(values: np.ndarray | list[float]) -> dict[str, floa
 
 def relabeled_score(metrics: Mapping[str, Any], targets: TuningTargets) -> tuple[float, bool]:
     metric_payload = metrics.get("metrics") if isinstance(metrics.get("metrics"), Mapping) else metrics
-    values, mask = metric_vector(metric_payload)
+    # Surrogate internals use the canonical vector units (us and kHz), while
+    # hardware records use seconds and Hz.  Do not run canonical mappings
+    # through the hardware-unit converter a second time.
+    canonical_core_fields = METRIC_FIELDS[:-1]
+    if all(field in metric_payload for field in canonical_core_fields):
+        values = np.asarray(
+            [finite_float(metric_payload.get(field)) for field in METRIC_FIELDS],
+            dtype=np.float64,
+        )
+        mask = np.isfinite(values).astype(np.float64)
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        values, mask = metric_vector(metric_payload)
     if not bool(np.all(mask[:4])):
-        return 250.0, False
+        return MAX_PENALTY, False
     mapping = vector_to_metric_mapping(values)
     score = 0.0
     score += max(0.0, mapping["overshoot_pct"] - targets.overshoot_pct)
@@ -224,6 +258,9 @@ def relabeled_score(metrics: Mapping[str, Any], targets: TuningTargets) -> tuple
         phase_ok = phase_error <= 0.0
     else:
         score += 100.0
+
+    if mask[7] > 0:
+        score += max(0.0, mapping["bode_gain_shape_penalty"])
     target_fc_khz = targets.crossover_frequency_hz / 1e3
     if mask[5] > 0 and mapping["crossover_frequency_khz"] > 0 and target_fc_khz > 0:
         crossover_error_pct = max(
@@ -241,9 +278,20 @@ def relabeled_score(metrics: Mapping[str, Any], targets: TuningTargets) -> tuple
         and mapping["overshoot_settling_time_us"] <= target_us
         and mapping["undershoot_settling_time_us"] <= target_us
     )
-    passed = transient_ok and phase_ok and crossover_ok
+    reasons = " ".join(
+        str(item).lower() for item in (metric_payload.get("pass_reasons", []) or [])
+    )
+    shape_ok = "bode gain shape failed" not in reasons
+    if mask[7] > 0:
+        # The measured path has an exact validity reason based on rebound and
+        # flat-span thresholds. Synthetic SAC rollouts only see the scalar
+        # shape target, whose largest still-valid value is about 12.6 points.
+        shape_ok = shape_ok and (
+            mapping["bode_gain_shape_penalty"] <= BODE_SHAPE_PENALTY_PASS_PROXY
+        )
+    passed = transient_ok and phase_ok and crossover_ok and shape_ok
     if max(invalid_labels(metrics)) > 0:
-        return 250.0, False
+        return MAX_PENALTY, False
     if passed:
         reward = 0.15 * _headroom(targets.overshoot_pct, mapping["overshoot_pct"])
         reward += 0.15 * _headroom(targets.undershoot_pct, mapping["undershoot_pct"])
@@ -254,8 +302,8 @@ def relabeled_score(metrics: Mapping[str, Any], targets: TuningTargets) -> tuple
         reward += max(0.0, targets.phase_margin_tolerance_deg) * 0.05
         crossover_headroom = max(0.0, (target_fc_khz - mapping["crossover_frequency_khz"]) / target_fc_khz * 100.0)
         reward += min(crossover_headroom, 100.0) / 100.0 * 0.25
-        score = max(-3.0, score - reward)
-    return float(min(250.0, score)), bool(passed)
+        score -= reward
+    return float(min(MAX_PENALTY, score)), bool(passed)
 
 
 def invalid_labels(metrics_or_record: Mapping[str, Any]) -> tuple[int, int, int]:
@@ -322,6 +370,7 @@ def operating_signature(config: TuningConfig, experiment: AutotuneExperimentConf
                 "mod0_kpole1",
                 "mod0_kpole2",
                 "mod0_cm_gain",
+                "mod0_ll_bw",
                 "output_inductance_nh",
                 "effective_lc_inductance_nh",
             )

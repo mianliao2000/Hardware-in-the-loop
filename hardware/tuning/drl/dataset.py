@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -11,12 +11,24 @@ from typing import Any, Iterable, Protocol
 
 import numpy as np
 
-from ..models import AutotuneExperimentConfig, HardwarePidCandidate, SearchSpace, TuningConfig
+from ..models import (
+    AutotuneExperimentConfig,
+    HardwarePidCandidate,
+    SearchSpace,
+    TuningConfig,
+    effective_lc_inductance_from_raw,
+    effective_lc_inductance_raw,
+    output_inductance_from_raw,
+    output_inductance_raw,
+)
 from .common import (
+    ACTION_FIELDS,
+    KPOLE_PAIRS,
     METRIC_FIELDS,
     artifact_id,
     atomic_write_json,
     candidate_from_mapping,
+    candidate_from_normalized,
     candidate_key,
     candidate_to_mapping,
     candidate_to_normalized,
@@ -24,6 +36,7 @@ from .common import (
     invalid_labels,
     metric_vector,
     relabeled_score,
+    vector_to_metric_mapping,
 )
 
 
@@ -90,16 +103,22 @@ def load_autotune_dataset(
     config: TuningConfig,
     experiment: AutotuneExperimentConfig | None = None,
     allow_legacy_inferred: bool = True,
+    include_run_ids: set[str] | None = None,
 ) -> tuple[DrlDataset, dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     source_runs: list[dict[str, Any]] = []
     source_record_count = 0
     excluded_action_count = 0
+    excluded_missing_bandwidth_count = 0
     excluded_out_of_search_space_count = 0
+    excluded_measurement_integrity_count = 0
+    excluded_legacy_settling_count = 0
     for root in run_roots:
         if not root.exists():
             continue
         for run_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            if include_run_ids is not None and run_dir.name not in include_run_ids:
+                continue
             rows = _load_run_rows(run_dir)
             if not rows:
                 continue
@@ -132,9 +151,29 @@ def load_autotune_dataset(
                 }
             )
             for row in rows:
+                optimizer_metadata = row.get("optimizer_metadata")
+                if isinstance(optimizer_metadata, dict) and bool(
+                    optimizer_metadata.get("exclude_from_surrogate")
+                ):
+                    excluded_measurement_integrity_count += 1
+                    continue
                 candidate_payload = row.get("candidate")
                 metrics_payload = row.get("metrics")
                 if not isinstance(candidate_payload, dict) or not isinstance(metrics_payload, dict):
+                    continue
+                # Settling V2 changes the semantic meaning of both Ts labels.
+                # Mixing first-entry V1 measurements with final-entry V2
+                # measurements would teach the surrogate the old false-fast
+                # behavior, so old records remain browsable but never train a
+                # model using the current settling-label schema.
+                if int(metrics_payload.get("settling_analysis_version") or 0) < 15:
+                    excluded_legacy_settling_count += 1
+                    continue
+                # Runs recorded before the unified LS/LR field was introduced
+                # were measured with two independent register values. Treating
+                # them as an inferred value of 74 would create false 8-D labels.
+                if "mod0_ll_bw" not in candidate_payload:
+                    excluded_missing_bandwidth_count += 1
                     continue
                 candidate = candidate_from_mapping(candidate_payload, phase=str(row.get("phase") or "loaded"))
                 if not _candidate_is_representable(candidate):
@@ -163,23 +202,38 @@ def load_autotune_dataset(
                         "baseline_mask": baseline_mask,
                     }
                 )
+    aggregation = _apply_raw_key_robust_targets(samples, config)
     dataset = _dataset_from_samples(samples, config.search)
+    unique_hardware_keys = {candidate_key(candidate) for candidate in dataset.candidates}
     manifest = {
         "dataset_id": artifact_id("dataset"),
         "schema_version": 1,
         "sample_count": dataset.size,
+        "unique_hardware_candidate_count": len(unique_hardware_keys),
+        "repeat_measurement_count": dataset.size - len(unique_hardware_keys),
+        "included_run_ids": sorted(include_run_ids) if include_run_ids is not None else None,
         "source_record_count": source_record_count,
         "excluded_incompatible_action_count": excluded_action_count,
+        "excluded_missing_bandwidth_count": excluded_missing_bandwidth_count,
         "excluded_out_of_search_space_count": excluded_out_of_search_space_count,
+        "excluded_measurement_integrity_count": excluded_measurement_integrity_count,
+        "excluded_legacy_settling_count": excluded_legacy_settling_count,
         "source_runs": source_runs,
         "allow_legacy_inferred": allow_legacy_inferred,
         "metric_fields": list(METRIC_FIELDS),
+        "settling_analysis_version": 15,
         "feature_layout": [
-            "normalized_action[6]",
-            "session_baseline_metrics[7]",
-            "session_baseline_mask[7]",
+            f"normalized_action[{len(ACTION_FIELDS)}]",
+            f"session_baseline_metrics[{len(METRIC_FIELDS)}]",
+            f"session_baseline_mask[{len(METRIC_FIELDS)}]",
         ],
-        "invalid_label_layout": ["protection", "invalid_transient", "invalid_bode"],
+        "invalid_label_layout": [
+            "protection",
+            "invalid_transient",
+            "invalid_bode",
+            "robust_pass_probability",
+        ],
+        "raw_key_robust_aggregation": aggregation,
         "target_relabel": {
             "overshoot_pct": config.targets.overshoot_pct,
             "undershoot_pct": config.targets.undershoot_pct,
@@ -291,6 +345,428 @@ def build_collection_plan(
     }
 
 
+def build_targeted_collection_plan(
+    dataset: DrlDataset,
+    config: TuningConfig,
+    predictor: CandidatePredictor,
+    *,
+    near_pass_basin_count: int = 3,
+    repeats_per_basin: int = 5,
+    directional_basin_count: int = 2,
+    local_sobol_count: int = 19,
+    guarded_global_count: int = 10,
+    seed: int = 20260720,
+) -> dict[str, Any]:
+    """Build the focused 100-point follow-up after the 9-D bootstrap run.
+
+    The allocation is intentionally explicit: 15 near-pass repeats, 56
+    two-sided/two-scale raw-hardware perturbations, 19 basin-local Sobol
+    points, and 10 surrogate-guarded global points. Confirmation and BW climb
+    candidates are inserted online by ``PlannedCandidateTuner`` and consume
+    the fixed outer hardware budget rather than extending it silently.
+    """
+
+    if dataset.size < 20:
+        raise RuntimeError("At least 20 compatible measurements are required for a targeted collection plan.")
+    anchors = select_near_pass_candidates(dataset, config.search, near_pass_basin_count)
+    if len(anchors) < near_pass_basin_count:
+        raise RuntimeError(f"Only {len(anchors)} distinct near-pass basins were found.")
+    directional_anchors = [
+        candidate for candidate in anchors if _supports_directional_design(candidate, config.search)
+    ][:directional_basin_count]
+    if len(directional_anchors) < directional_basin_count:
+        raise RuntimeError(
+            f"Only {len(directional_anchors)} near-pass basins have room for both small-step directions; "
+            f"{directional_basin_count} are required."
+        )
+    existing = {candidate_key(candidate) for candidate in dataset.candidates}
+    plan_items: list[dict[str, Any]] = []
+
+    for repeat_index in range(repeats_per_basin):
+        for basin_index, anchor in enumerate(anchors):
+            phase = "baseline" if not plan_items else "drl_targeted_near_pass_repeat"
+            candidate = _with_phase(anchor, phase)
+            item = _plan_item(candidate, "near_pass_repeat", _single_prediction(predictor, dataset, config.search, candidate))
+            item["optimizer_metadata"].update(
+                {"basin_rank": basin_index + 1, "repeat_index": repeat_index + 1, "intentional_repeat": True}
+            )
+            plan_items.append(item)
+
+    directional = _generate_directional_raw_candidates(
+        directional_anchors,
+        config.search,
+        existing,
+    )
+    if len(directional) != 56:
+        raise RuntimeError(f"Targeted directional design produced {len(directional)} points; exactly 56 are required.")
+    for candidate, metadata in directional:
+        existing.add(candidate_key(candidate))
+        item = _plan_item(candidate, "two_sided_local_step", _single_prediction(predictor, dataset, config.search, candidate))
+        item["optimizer_metadata"].update(metadata)
+        plan_items.append(item)
+
+    local_candidates = _generate_local_candidates(
+        anchors,
+        config.search,
+        local_sobol_count,
+        existing,
+        seed + 1,
+        phase="drl_targeted_local_sobol",
+    )
+    for candidate in local_candidates:
+        existing.add(candidate_key(candidate))
+        plan_items.append(
+            _plan_item(candidate, "basin_local_sobol", _single_prediction(predictor, dataset, config.search, candidate))
+        )
+
+    global_candidates, global_predictions = _guarded_global_candidates(
+        dataset,
+        config,
+        predictor,
+        guarded_global_count,
+        existing,
+        seed + 2,
+    )
+    for candidate, prediction in zip(global_candidates, global_predictions):
+        existing.add(candidate_key(candidate))
+        plan_items.append(_plan_item(candidate, "guarded_global", prediction))
+
+    expected_repeat_count = near_pass_basin_count * repeats_per_basin
+    expected_budget = expected_repeat_count + 56 + local_sobol_count + guarded_global_count
+    if len(plan_items) != expected_budget:
+        raise RuntimeError(f"Targeted plan has {len(plan_items)} points; expected {expected_budget}.")
+    for index, item in enumerate(plan_items, 1):
+        item["index"] = index
+    plan_id = artifact_id("targeted_collection")
+    return {
+        "plan_id": plan_id,
+        "schema_version": 2,
+        "seed": int(seed),
+        "targeted": True,
+        "budget": len(plan_items),
+        "dynamic_confirmation": True,
+        "confirmation_count": 3,
+        "bandwidth_climb_after_confirmation": True,
+        "allocation": {
+            "near_pass_repeat": expected_repeat_count,
+            "two_sided_local_step": 56,
+            "basin_local_sobol": local_sobol_count,
+            "guarded_global": guarded_global_count,
+        },
+        "near_pass_anchors": [candidate_to_mapping(candidate) for candidate in anchors],
+        "candidates": plan_items,
+    }
+
+
+def select_near_pass_candidates(
+    dataset: DrlDataset,
+    search: SearchSpace,
+    count: int = 3,
+) -> list[HardwarePidCandidate]:
+    """Select low-score, valid, raw-key-distinct basins with action-space separation."""
+
+    grouped: dict[tuple[Any, ...], list[int]] = {}
+    for index, candidate in enumerate(dataset.candidates):
+        if (
+            np.max(dataset.invalid_labels[index, :3]) > 0
+            or not np.all(dataset.metric_mask[index, :6] > 0)
+            or not _candidate_is_legal(candidate, search)
+        ):
+            continue
+        grouped.setdefault(candidate_key(candidate), []).append(index)
+    ranked: list[tuple[float, int]] = []
+    for indexes in grouped.values():
+        representative = min(indexes, key=lambda index: float(dataset.scores[index]))
+        median_score = float(np.median(dataset.scores[indexes]))
+        ranked.append((median_score, representative))
+    ranked.sort(key=lambda item: (item[0], float(dataset.scores[item[1]])))
+    if not ranked:
+        return []
+
+    selected: list[int] = [ranked[0][1]]
+    pool = ranked[1 : max(40, count * 12)]
+    while len(selected) < count and pool:
+        separated = [
+            item
+            for item in pool
+            if min(float(np.linalg.norm(dataset.actions[item[1]] - dataset.actions[index])) for index in selected) >= 0.35
+        ]
+        if separated:
+            chosen = separated[0]
+        else:
+            chosen = max(
+                pool,
+                key=lambda item: min(
+                    float(np.linalg.norm(dataset.actions[item[1]] - dataset.actions[index])) for index in selected
+                ),
+            )
+        selected.append(chosen[1])
+        pool.remove(chosen)
+    return [_with_phase(dataset.candidates[index], "drl_targeted_near_pass") for index in selected[:count]]
+
+
+def _generate_directional_raw_candidates(
+    anchors: list[HardwarePidCandidate],
+    search: SearchSpace,
+    excluded: set[tuple[Any, ...]],
+) -> list[tuple[HardwarePidCandidate, dict[str, Any]]]:
+    specs: tuple[tuple[str, tuple[int, int]], ...] = (
+        ("mod0_kp", (2, 5)),
+        ("mod0_ki", (2, 5)),
+        ("mod0_kd", (2, 5)),
+        ("mod0_cm_gain", (1, 2)),
+        ("mod0_ll_bw", (1, 2)),
+        ("output_inductance_raw", (1, 2)),
+        ("effective_lc_inductance_raw", (1, 2)),
+    )
+    generated: list[tuple[HardwarePidCandidate, dict[str, Any]]] = []
+    local_seen: set[tuple[Any, ...]] = set()
+    for basin_index, anchor in enumerate(anchors):
+        for field, steps in specs:
+            for direction in (-1, 1):
+                for scale_index, step in enumerate(steps, 1):
+                    if field == "output_inductance_raw":
+                        raw = output_inductance_raw(anchor.output_inductance_nh) + direction * step
+                        candidate = replace(
+                            anchor,
+                            output_inductance_nh=output_inductance_from_raw(raw),
+                            phase="drl_targeted_directional",
+                        )
+                    elif field == "effective_lc_inductance_raw":
+                        raw = effective_lc_inductance_raw(anchor.effective_lc_inductance_nh) + direction * step
+                        candidate = replace(
+                            anchor,
+                            effective_lc_inductance_nh=effective_lc_inductance_from_raw(raw),
+                            phase="drl_targeted_directional",
+                        )
+                    else:
+                        candidate = replace(
+                            anchor,
+                            **{field: int(getattr(anchor, field)) + direction * step},
+                            phase="drl_targeted_directional",
+                        )
+                    key = candidate_key(candidate)
+                    if not _candidate_is_legal(candidate, search):
+                        raise RuntimeError(
+                            f"Near-pass basin {basin_index + 1} cannot support {field} direction {direction:+d} step {step}."
+                        )
+                    if key in excluded or key in local_seen:
+                        raise RuntimeError(
+                            f"Raw-key collision in directional design for basin {basin_index + 1}, {field}, "
+                            f"direction {direction:+d}, step {step}."
+                        )
+                    local_seen.add(key)
+                    generated.append(
+                        (
+                            candidate,
+                            {
+                                "basin_rank": basin_index + 1,
+                                "perturbed_field": field,
+                                "direction": direction,
+                                "step_scale": scale_index,
+                                "step": step,
+                            },
+                        )
+                    )
+    return generated
+
+
+def _supports_directional_design(candidate: HardwarePidCandidate, search: SearchSpace) -> bool:
+    return bool(
+        search.mod0_kp.min <= candidate.mod0_kp - 5
+        and candidate.mod0_kp + 5 <= search.mod0_kp.max
+        and search.mod0_ki.min <= candidate.mod0_ki - 5
+        and candidate.mod0_ki + 5 <= search.mod0_ki.max
+        and search.mod0_kd.min <= candidate.mod0_kd - 5
+        and candidate.mod0_kd + 5 <= search.mod0_kd.max
+        and search.mod0_cm_gain.min <= candidate.mod0_cm_gain - 2
+        and candidate.mod0_cm_gain + 2 <= search.mod0_cm_gain.max
+        and search.mod0_ll_bw.min <= candidate.mod0_ll_bw - 2
+        and candidate.mod0_ll_bw + 2 <= search.mod0_ll_bw.max
+    )
+
+
+def _guarded_global_candidates(
+    dataset: DrlDataset,
+    config: TuningConfig,
+    predictor: CandidatePredictor,
+    count: int,
+    excluded: set[tuple[Any, ...]],
+    seed: int,
+) -> tuple[list[HardwarePidCandidate], list[dict[str, Any]]]:
+    pool: list[HardwarePidCandidate] = []
+    local_seen: set[tuple[Any, ...]] = set()
+    for point in _sobol_points(max(2000, count * 200), len(ACTION_FIELDS), seed):
+        candidate = candidate_from_normalized(point * 2.0 - 1.0, config.search, "drl_targeted_guarded_global")
+        key = candidate_key(candidate)
+        if key in excluded or key in local_seen or not _candidate_is_legal(candidate, config.search):
+            continue
+        local_seen.add(key)
+        pool.append(candidate)
+    predictions = predictor.predict_features(dataset.features_for_candidates(pool, config.search))
+    invalid_probability = np.asarray(predictions["invalid_probability"], dtype=np.float64)
+    protection_probability = invalid_probability[:, 0]
+    safety = 1.0 - protection_probability
+    uncertainty = np.asarray(predictions["uncertainty"], dtype=np.float64).reshape(-1)
+    calibration = predictor.predict_features(dataset.features)
+    calibration_invalid = np.asarray(calibration["invalid_probability"], dtype=np.float64)
+    observed_safe = dataset.invalid_labels[:, 0] <= 0
+    calibrated_protection_threshold = (
+        float(np.quantile(calibration_invalid[observed_safe, 0], 0.95))
+        if np.any(observed_safe)
+        else 0.25
+    )
+    protection_threshold = max(
+        float(getattr(predictor, "invalid_probability_threshold", 0.25)),
+        calibrated_protection_threshold,
+    )
+    uncertainty_threshold = float(getattr(predictor, "uncertainty_threshold", float("inf")))
+    eligible = [
+        index
+        for index in range(len(pool))
+        if protection_probability[index] <= protection_threshold
+        and uncertainty[index] <= uncertainty_threshold
+    ]
+    eligible.sort(key=lambda index: (-float(safety[index]), -float(uncertainty[index])))
+    if len(eligible) < count:
+        raise RuntimeError(
+            f"Only {len(eligible)} global candidates passed the calibrated protection/uncertainty guard; "
+            f"{count} are required."
+        )
+    selected = eligible[:count]
+    selected_predictions = []
+    for index in selected:
+        prediction = _prediction_at(predictions, index)
+        prediction.update(
+            {
+                "global_guard": "calibrated_protection_plus_uncertainty",
+                "protection_probability": float(protection_probability[index]),
+                "protection_probability_threshold": protection_threshold,
+                "uncertainty_threshold": uncertainty_threshold,
+            }
+        )
+        selected_predictions.append(prediction)
+    return [pool[index] for index in selected], selected_predictions
+
+
+def build_bootstrap_collection_plan(
+    config: TuningConfig,
+    repeat_count: int = 40,
+    global_count: int = 160,
+    local_count: int = 40,
+    seed: int = 20260720,
+) -> dict[str, Any]:
+    """Build the first exact-schema plan without a surrogate or seed dataset.
+
+    A regular Cartesian grid is intractable in nine dimensions. The bootstrap
+    therefore combines an explicit stable center anchor, a scrambled global
+    Sobol design, and a denser local Sobol design around that anchor. Pole
+    pairs are stratified across all 25 independent 2--6 combinations.
+    """
+
+    repeat_count = max(1, int(repeat_count))
+    global_count = max(1, int(global_count))
+    local_count = max(0, int(local_count))
+    search = config.search
+    anchor_unquantized = HardwarePidCandidate(
+        mod0_kp=int(round(search.mod0_kp.center)),
+        mod0_ki=int(round(search.mod0_ki.center)),
+        mod0_kd=int(round(search.mod0_kd.center)),
+        mod0_kpole1=int(round(search.mod0_kpole1.center)),
+        mod0_kpole2=int(round(search.mod0_kpole2.center)),
+        mod0_cm_gain=int(round(search.mod0_cm_gain.center)),
+        mod0_ll_bw=int(round(search.mod0_ll_bw.center)),
+        output_inductance_nh=float(search.output_inductance_nh.center),
+        effective_lc_inductance_nh=float(search.effective_lc_inductance_nh.center),
+        phase="drl_bootstrap_anchor",
+    )
+    # Use the same normalization/quantization path as SAC inference so the
+    # persisted plan cannot contain a value the 9-D runtime cannot reproduce.
+    anchor = candidate_from_normalized(
+        candidate_to_normalized(anchor_unquantized, search),
+        search,
+        "drl_bootstrap_anchor",
+    )
+
+    excluded = {candidate_key(anchor)}
+    global_candidates: list[HardwarePidCandidate] = []
+    global_seen: set[tuple[Any, ...]] = set()
+    points = _sobol_points(max(global_count * 3, global_count), len(ACTION_FIELDS), seed)
+    for sequence_index, point in enumerate(points):
+        candidate = candidate_from_normalized(
+            point * 2.0 - 1.0,
+            search,
+            "drl_bootstrap_global_sobol",
+        )
+        kpole1, kpole2 = KPOLE_PAIRS[sequence_index % len(KPOLE_PAIRS)]
+        candidate = replace(candidate, mod0_kpole1=kpole1, mod0_kpole2=kpole2)
+        key = candidate_key(candidate)
+        if key in excluded or key in global_seen:
+            continue
+        global_seen.add(key)
+        global_candidates.append(candidate)
+        if len(global_candidates) >= global_count:
+            break
+    if len(global_candidates) < global_count:
+        raise RuntimeError(
+            f"Only {len(global_candidates)} unique global 9-D bootstrap candidates were generated; "
+            f"{global_count} are required."
+        )
+    excluded.update(global_seen)
+
+    local_candidates = _generate_local_candidates(
+        [anchor],
+        search,
+        local_count,
+        excluded,
+        seed + 1,
+        phase="drl_bootstrap_local_sobol",
+    )
+    exploration = [
+        _plan_item(candidate, "global_9d_sobol", None)
+        for candidate in global_candidates
+    ] + [
+        _plan_item(candidate, "local_anchor_sobol", None)
+        for candidate in local_candidates
+    ]
+    random.Random(seed).shuffle(exploration)
+
+    # Put the first anchor at index 1 so it becomes the explicit session
+    # baseline. Interleave the remaining repeats to estimate drift/noise over
+    # the whole run instead of measuring all repeats back-to-back.
+    plan_items = [_plan_item(_with_phase(anchor, "baseline"), "repeat_anchor", None)]
+    repeats_remaining = repeat_count - 1
+    repeat_interval = max(1, len(exploration) // max(1, repeats_remaining))
+    for item in exploration:
+        plan_items.append(item)
+        explored = sum(1 for current in plan_items if current.get("source") != "repeat_anchor")
+        if repeats_remaining > 0 and explored % repeat_interval == 0:
+            plan_items.append(_plan_item(anchor, "repeat_anchor", None))
+            repeats_remaining -= 1
+    while repeats_remaining > 0:
+        plan_items.append(_plan_item(anchor, "repeat_anchor", None))
+        repeats_remaining -= 1
+
+    for index, item in enumerate(plan_items, 1):
+        item["index"] = index
+    plan_id = artifact_id("bootstrap_collection")
+    return {
+        "plan_id": plan_id,
+        "schema_version": 1,
+        "seed": int(seed),
+        "bootstrap": True,
+        "requires_provisional_surrogate": False,
+        "budget": len(plan_items),
+        "allocation": {
+            "repeat": repeat_count,
+            "global_9d_sobol": global_count,
+            "local_anchor_sobol": local_count,
+        },
+        "anchor": candidate_to_mapping(anchor),
+        "candidates": plan_items,
+    }
+
+
 def save_collection_plan(plan: dict[str, Any], plan_root: Path) -> Path:
     plan_id = str(plan.get("plan_id") or artifact_id("collection"))
     target = plan_root / plan_id / "plan.json"
@@ -306,7 +782,7 @@ def select_anchor_candidates(
     valid_indexes = [
         index
         for index in range(dataset.size)
-        if np.max(dataset.invalid_labels[index]) <= 0
+        if np.max(dataset.invalid_labels[index, :3]) <= 0
         and np.all(dataset.metric_mask[index, :6] > 0)
         and _candidate_is_legal(dataset.candidates[index], search)
     ]
@@ -340,13 +816,13 @@ def select_anchor_candidates(
 
 def _dataset_from_samples(samples: list[dict[str, Any]], search: SearchSpace) -> DrlDataset:
     if not samples:
-        width = 6 + len(METRIC_FIELDS) * 2
+        width = len(ACTION_FIELDS) + len(METRIC_FIELDS) * 2
         return DrlDataset(
             features=np.zeros((0, width), dtype=np.float32),
-            actions=np.zeros((0, 6), dtype=np.float32),
+            actions=np.zeros((0, len(ACTION_FIELDS)), dtype=np.float32),
             metrics=np.zeros((0, len(METRIC_FIELDS)), dtype=np.float32),
             metric_mask=np.zeros((0, len(METRIC_FIELDS)), dtype=np.float32),
-            invalid_labels=np.zeros((0, 3), dtype=np.float32),
+            invalid_labels=np.zeros((0, 4), dtype=np.float32),
             scores=np.zeros(0, dtype=np.float32),
             passed=np.zeros(0, dtype=np.float32),
             groups=np.asarray([], dtype=str),
@@ -502,10 +978,155 @@ def _first_numeric(payload: dict[str, Any], keys: tuple[str, ...]) -> float | No
 
 def _candidate_is_representable(candidate: HardwarePidCandidate) -> bool:
     return bool(
-        candidate.mod0_cm_gain == 2
-        and candidate.mod0_kpole1 == candidate.mod0_kpole2
-        and candidate.mod0_kpole1 in {3, 6}
+        0 <= candidate.mod0_cm_gain <= 9
+        and 0 <= candidate.mod0_ll_bw <= 127
+        and candidate.mod0_kpole1 in {2, 3, 4, 5, 6}
+        and candidate.mod0_kpole2 in {2, 3, 4, 5, 6}
     )
+
+
+def _apply_raw_key_robust_targets(
+    samples: list[dict[str, Any]],
+    config: TuningConfig,
+) -> dict[str, Any]:
+    """Replace noisy repeats with conservative raw-key aggregate targets.
+
+    A single hardware capture is not a deterministic label near the 2 us
+    settling boundary.  Every occurrence of one exact register key therefore
+    receives the same robust metric target: p90 for transient magnitude/Ts
+    and Bode shape penalty, p10 for phase margin, and the median for
+    crossover/gain margin.  The fourth
+    classifier target is a Jeffreys-smoothed robust-pass probability.
+    This makes three confirmed passes materially different from one lucky pass.
+    """
+
+    if not samples:
+        return {
+            "enabled": True,
+            "candidate_group_count": 0,
+            "repeat_group_count": 0,
+            "max_repeat_count": 0,
+            "quantiles": {},
+        }
+    grouped: dict[tuple[Any, ...], list[int]] = {}
+    for index, sample in enumerate(samples):
+        grouped.setdefault(candidate_key(sample["candidate"]), []).append(index)
+    confirmed_windows = _latest_confirmed_windows(samples)
+    quantiles = (0.90, 0.90, 0.90, 0.90, 0.10, 0.50, 0.50, 0.90)
+    repeat_counts: list[int] = []
+    confirmed_group_count = 0
+    for key, indexes in grouped.items():
+        repeat_counts.append(len(indexes))
+        confirmed_indexes = confirmed_windows.get(key)
+        target_indexes = confirmed_indexes or indexes
+        if confirmed_indexes:
+            confirmed_group_count += 1
+        pass_count = sum(float(samples[index]["passed"]) >= 0.5 for index in target_indexes)
+        pass_probability = (float(pass_count) + 0.5) / (float(len(target_indexes)) + 1.0)
+        robust_metrics = np.zeros(len(METRIC_FIELDS), dtype=np.float32)
+        robust_mask = np.zeros(len(METRIC_FIELDS), dtype=np.float32)
+        for column, quantile in enumerate(quantiles):
+            values = [
+                float(samples[index]["metrics"][column])
+                for index in target_indexes
+                if float(samples[index]["metric_mask"][column]) > 0.0
+                and np.isfinite(float(samples[index]["metrics"][column]))
+            ]
+            if values:
+                robust_metrics[column] = float(np.quantile(np.asarray(values, dtype=np.float64), quantile))
+                robust_mask[column] = 1.0
+        robust_payload = vector_to_metric_mapping(robust_metrics)
+        robust_score, _ = relabeled_score(robust_payload, config.targets)
+        safety_labels = np.asarray(
+            [samples[index]["invalid_labels"][:3] for index in target_indexes],
+            dtype=np.float32,
+        )
+        safety_probability_targets = np.mean(safety_labels, axis=0)
+        requirement_failure_probability = 1.0 - pass_probability
+        combined_labels = np.concatenate(
+            [safety_probability_targets, np.asarray([pass_probability], dtype=np.float32)]
+        ).astype(np.float32)
+        for index in indexes:
+            samples[index]["metrics"] = robust_metrics.copy()
+            samples[index]["metric_mask"] = robust_mask.copy()
+            samples[index]["invalid_labels"] = combined_labels.copy()
+            samples[index]["score"] = float(robust_score)
+            samples[index]["passed"] = float(pass_probability)
+            samples[index]["record"].setdefault("drl_robust_target", {})
+            samples[index]["record"]["drl_robust_target"].update(
+                {
+                    "raw_key_repeat_count": len(indexes),
+                    "robust_target_measurement_count": len(target_indexes),
+                    "pass_count": int(pass_count),
+                    "pass_probability": float(pass_probability),
+                    "confirmed_streak_target": bool(confirmed_indexes),
+                    "requirement_failure_probability": float(requirement_failure_probability),
+                }
+            )
+    return {
+        "enabled": True,
+        "candidate_group_count": len(grouped),
+        "repeat_group_count": sum(count > 1 for count in repeat_counts),
+        "max_repeat_count": max(repeat_counts, default=0),
+        "confirmed_group_count": confirmed_group_count,
+        "quantiles": {
+            "overshoot_pct": 0.90,
+            "undershoot_pct": 0.90,
+            "overshoot_settling_time_us": 0.90,
+            "undershoot_settling_time_us": 0.90,
+            "phase_margin_deg": 0.10,
+            "crossover_frequency_khz": 0.50,
+            "gain_margin_db": 0.50,
+            "bode_gain_shape_penalty": 0.90,
+        },
+        "pass_probability_prior": "Jeffreys Beta(0.5, 0.5)",
+        "robust_pass_threshold": 0.80,
+    }
+
+
+def _latest_confirmed_windows(
+    samples: list[dict[str, Any]],
+    required: int = 3,
+) -> dict[tuple[Any, ...], list[int]]:
+    """Return the latest truly consecutive passing window for each raw key.
+
+    Confirmation is a temporal hardware property: three measurements must be
+    adjacent iterations in the same run.  Grouping all historical repeats can
+    otherwise let an old failure permanently invalidate a point that was later
+    re-measured and confirmed under stable conditions.
+    """
+
+    windows: dict[tuple[Any, ...], list[int]] = {}
+    streak: list[int] = []
+    previous_group: str | None = None
+    previous_iteration: int | None = None
+    previous_key: tuple[Any, ...] | None = None
+    for index, sample in enumerate(samples):
+        group = str(sample.get("group") or "")
+        record = sample.get("record") if isinstance(sample.get("record"), dict) else {}
+        try:
+            iteration = int(record.get("iteration"))
+        except (TypeError, ValueError):
+            iteration = None
+        key = candidate_key(sample["candidate"])
+        adjacent = bool(
+            group
+            and group == previous_group
+            and iteration is not None
+            and previous_iteration is not None
+            and iteration == previous_iteration + 1
+            and key == previous_key
+        )
+        if float(sample.get("passed", 0.0)) >= 0.5:
+            streak = [*streak, index] if adjacent else [index]
+        else:
+            streak = []
+        if len(streak) >= max(1, int(required)):
+            windows[key] = streak[-max(1, int(required)):]
+        previous_group = group
+        previous_iteration = iteration
+        previous_key = key
+    return windows
 
 
 def _candidate_is_legal(candidate: HardwarePidCandidate, search: SearchSpace) -> bool:
@@ -514,6 +1135,7 @@ def _candidate_is_legal(candidate: HardwarePidCandidate, search: SearchSpace) ->
         search.mod0_kp.min <= candidate.mod0_kp <= search.mod0_kp.max
         and search.mod0_ki.min <= candidate.mod0_ki <= search.mod0_ki.max
         and search.mod0_kd.min <= candidate.mod0_kd <= search.mod0_kd.max
+        and search.mod0_ll_bw.min <= candidate.mod0_ll_bw <= search.mod0_ll_bw.max
         and search.output_inductance_nh.min - tolerance
         <= candidate.output_inductance_nh
         <= search.output_inductance_nh.max + tolerance
@@ -534,9 +1156,15 @@ def _finite_float(value: Any) -> float | None:
 
 def _baseline_for_rows(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray]:
     baseline = next((row for row in rows if str(row.get("phase", "")).lower() == "baseline"), None)
+    # Never infer session context from the first measured candidate. That row
+    # is also a supervised target, so feeding its metrics back as a baseline
+    # leaks the answer into every feature row from the run. Runs without a
+    # dedicated baseline remain explicitly missing and are imputed from the
+    # training partition by the offline benchmark.
     if baseline is None:
-        baseline = next((row for row in rows if isinstance(row.get("metrics"), dict)), {})
-    return metric_vector(baseline.get("metrics") if isinstance(baseline, dict) else {})
+        baseline = {}
+    metrics = baseline.get("metrics") if isinstance(baseline, dict) else None
+    return metric_vector(metrics if isinstance(metrics, dict) else {})
 
 
 def _top_distinct_candidates(
@@ -550,7 +1178,7 @@ def _top_distinct_candidates(
     for raw_index in indexes:
         index = int(raw_index)
         if (
-            np.max(dataset.invalid_labels[index]) > 0
+            np.max(dataset.invalid_labels[index, :3]) > 0
             or not np.all(dataset.metric_mask[index, :6] > 0)
             or not _candidate_is_legal(dataset.candidates[index], search)
         ):
@@ -579,7 +1207,7 @@ def _generate_local_candidates(
 ) -> list[HardwarePidCandidate]:
     if not bases or count <= 0:
         return []
-    points = _sobol_points(max(count * 5, count), 6, seed)
+    points = _sobol_points(max(count * 5, count), len(ACTION_FIELDS), seed)
     candidates: list[HardwarePidCandidate] = []
     local_seen: set[tuple[Any, ...]] = set()
     for index, point in enumerate(points):

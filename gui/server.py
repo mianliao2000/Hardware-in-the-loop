@@ -81,6 +81,7 @@ from hardware.tuning import (
     TuningConfig,
     TuningTargets,
     Waveform,
+    automatic_search_parameter,
 )
 from hardware.tuning.drl import DrlWorkflowManager
 
@@ -90,7 +91,7 @@ DEVICE_LOCK = threading.Lock()
 # saving/rendering off the hardware path without letting work accumulate over a
 # long auto-tune run.
 ARTIFACT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autotune-artifact")
-ARTIFACT_QUEUE_SLOTS = threading.BoundedSemaphore(8)
+ARTIFACT_QUEUE_SLOTS = threading.BoundedSemaphore(2)
 FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 SCOPE_CONNECTIONS: dict[str, TektronixOscilloscope] = {}
 BODE_CONNECTIONS: dict[str, dict[str, object]] = {}
@@ -103,12 +104,18 @@ LATEST_BODE_PNG = RESULTS_DIR / "latest_bode_sweep.png"
 AUTOTUNE_RUN_DIR = RESULTS_DIR / "autotune_runs"
 AUTOTUNE_RECENT_DIR = AUTOTUNE_RUN_DIR / "recent"
 AUTOTUNE_SAVED_DIR = AUTOTUNE_RUN_DIR / "saved"
-AUTOTUNE_RECENT_LIMIT = 5
+# Targeted experiments can span a base run plus one or more recovery runs.
+# Keep enough Recent entries that starting a recovery cannot evict the source
+# measurements before they are aggregated or explicitly saved.
+AUTOTUNE_RECENT_LIMIT = 10
 AUTOTUNE_RECENT_MIN_ITERATIONS = 10
 SCOPE_CAPTURE_CACHE: dict[str, dict] = {}
 SCOPE_CAPTURE_CACHE_LIMIT = 1
 SCOPE_DISPLAY_MAX_POINTS = 140_000
 SCOPE_TRIGGER_OFFSET_FROM_LEFT_S = 2e-6
+SCOPE_AUTOTUNE_MAX_RECORD_LENGTH = 250_000
+SCOPE_AUTOTUNE_MAINTENANCE_INTERVAL = 100
+SCOPE_AUTOTUNE_CAPTURE_ATTEMPTS = 3
 DEFAULT_SCOPE_AXIS_SETTINGS = {
     "leftMin": -0.5,
     "leftMax": 3.0,
@@ -127,8 +134,11 @@ DEFAULT_SCOPE_AXIS_SETTINGS = {
 }
 
 
-def _submit_artifact(function, *args) -> None:
-    ARTIFACT_QUEUE_SLOTS.acquire()
+def _submit_artifact(function, *args) -> bool:
+    # Plot generation is optional and can be rebuilt from NPZ data. Never let
+    # a saturated renderer stall the hardware measurement thread.
+    if not ARTIFACT_QUEUE_SLOTS.acquire(blocking=False):
+        return False
 
     def run_artifact() -> None:
         try:
@@ -143,6 +153,7 @@ def _submit_artifact(function, *args) -> None:
     except Exception:
         ARTIFACT_QUEUE_SLOTS.release()
         raise
+    return True
 
 
 class ServerHardwareExperimentRunner:
@@ -155,6 +166,59 @@ class ServerHardwareExperimentRunner:
 
     def set_iteration_context(self, iteration: int) -> None:
         self._iteration_context = max(1, int(iteration))
+
+    def restore_candidate(
+        self,
+        candidate: HardwarePidCandidate,
+        config: TuningConfig,
+        experiment: AutotuneExperimentConfig,
+    ) -> dict:
+        """Program a confirmed candidate without launching another measurement."""
+
+        started = time.perf_counter()
+        vout = _prepare_vout_for_autotune(
+            address=experiment.board_address,
+            page=experiment.board_page,
+            adapter_kind=experiment.board_adapter,
+            voltage=config.targets.vout_target_v,
+            tolerance_v=experiment.vout_tolerance_v,
+        )
+        if not vout.get("ok"):
+            return {"ok": False, "error": f"VOUT restore check failed: {vout.get('error')}"}
+        pid = _set_xdp_pid(
+            address=experiment.board_address,
+            page=experiment.board_page,
+            adapter_kind=experiment.board_adapter,
+            values={**candidate.pid_values(), **candidate.current_mode_values()},
+        )
+        if not pid.get("ok"):
+            return {"ok": False, "error": f"Confirmed PID restore failed: {pid.get('error')}"}
+        bandwidth = _set_mod0_ll_bandwidth(
+            address=experiment.board_address,
+            page=experiment.board_page,
+            adapter_kind=experiment.board_adapter,
+            value=candidate.avp_bandwidth_value(),
+        )
+        if not bandwidth.get("ok"):
+            return {"ok": False, "error": f"Confirmed AVP bandwidth restore failed: {bandwidth.get('error')}"}
+        inductance = _set_inductance(
+            address=experiment.board_address,
+            page=experiment.board_page,
+            adapter_kind=experiment.board_adapter,
+            output_inductance_nh=candidate.output_inductance_nh,
+            effective_lc_inductance_nh=candidate.effective_lc_inductance_nh,
+        )
+        if not inductance.get("ok"):
+            return {"ok": False, "error": f"Confirmed inductance restore failed: {inductance.get('error')}"}
+        return {
+            "ok": True,
+            "candidate": {
+                **candidate.pid_values(),
+                **candidate.current_mode_values(),
+                "mod0_ll_bw": candidate.avp_bandwidth_value(),
+            },
+            "duration_s": round(time.perf_counter() - started, 3),
+        }
 
     def recover_after_transient_protection(
         self,
@@ -212,7 +276,8 @@ class ServerHardwareExperimentRunner:
                     mod0_kd=int(round(search.mod0_kd.center)),
                     mod0_kpole1=3 if abs(search.mod0_kpole1.center - 3) <= abs(search.mod0_kpole1.center - 6) else 6,
                     mod0_kpole2=3 if abs(search.mod0_kpole2.center - 3) <= abs(search.mod0_kpole2.center - 6) else 6,
-                    mod0_cm_gain=2,
+                    mod0_cm_gain=int(round(search.mod0_cm_gain.clamped(search.mod0_cm_gain.center))),
+                    mod0_ll_bw=int(round(search.mod0_ll_bw.clamped(search.mod0_ll_bw.center))),
                     output_inductance_nh=float(search.output_inductance_nh.center),
                     effective_lc_inductance_nh=float(search.effective_lc_inductance_nh.center),
                     phase="safe_recovery_baseline",
@@ -227,6 +292,15 @@ class ServerHardwareExperimentRunner:
                     ),
                 )
                 run_step(
+                    "restore_safe_avp_bandwidth_baseline",
+                    lambda: _set_mod0_ll_bandwidth(
+                        address=experiment.board_address,
+                        page=experiment.board_page,
+                        adapter_kind=experiment.board_adapter,
+                        value=baseline.avp_bandwidth_value(),
+                    ),
+                )
+                run_step(
                     "restore_safe_inductance_baseline",
                     lambda: _set_inductance(
                         address=experiment.board_address,
@@ -236,7 +310,7 @@ class ServerHardwareExperimentRunner:
                         effective_lc_inductance_nh=baseline.effective_lc_inductance_nh,
                     ),
                 )
-                baseline_failures = [step for step in steps[-2:] if not step.get("ok")]
+                baseline_failures = [step for step in steps[-3:] if not step.get("ok")]
                 if baseline_failures:
                     return {
                         "ok": False,
@@ -345,6 +419,17 @@ class ServerHardwareExperimentRunner:
             if not pid_write.get("ok"):
                 raise RuntimeError(f"PID write failed: {pid_write.get('error')}")
 
+            bandwidth_write = _set_mod0_ll_bandwidth(
+                address=experiment.board_address,
+                page=experiment.board_page,
+                adapter_kind=experiment.board_adapter,
+                value=candidate.avp_bandwidth_value(),
+            )
+            write_results["avp_bandwidth"] = bandwidth_write
+            mark_stage("write_avp_bandwidth")
+            if not bandwidth_write.get("ok"):
+                raise RuntimeError(f"AVP bandwidth write failed: {bandwidth_write.get('error')}")
+
             inductance_write = _set_inductance(
                 address=experiment.board_address,
                 page=experiment.board_page,
@@ -409,6 +494,8 @@ class ServerHardwareExperimentRunner:
                     scope_axis_settings=_normalize_scope_axis_settings(scope_cfg.get("scope_axis_settings")),
                     async_artifacts=async_artifacts,
                     iteration_number=iteration_number,
+                    response_channel=response_channel,
+                    response_targets=config.targets,
                 )
                 mark_stage("scope_capture")
                 if not scope_result.get("ok"):
@@ -417,11 +504,21 @@ class ServerHardwareExperimentRunner:
                 waveform = _response_waveform_from_scope(scope_result, response_channel)
                 _enforce_scope_response_safety(waveform, config.targets.vout_target_v, experiment.response_abs_limit_v)
 
+            capture_metrics = None
+            if scope_result:
+                capture_id = str(scope_result.get("capture_id", "") or "")
+                capture_entry = SCOPE_CAPTURE_CACHE.get(capture_id) if capture_id else None
+                if isinstance(capture_entry, dict):
+                    cached_metrics = capture_entry.get("settling_metrics")
+                    if isinstance(cached_metrics, ResponseMetrics):
+                        capture_metrics = cached_metrics
+
             metrics = ResponseAnalyzer(config.targets).analyze_hardware(
                 waveform,
                 bode_result.get("margins") if bode_result else None,
                 enable_transient=experiment.enable_transient_analysis,
                 enable_bode=experiment.enable_bode_analysis,
+                precomputed_transient=capture_metrics,
             )
             mark_stage("metrics")
             write_results["stage_durations_s"] = dict(stage_durations)
@@ -453,12 +550,14 @@ class AutotuneRunStore:
         self._current_run_id: str | None = None
         self._current_run_kind: str | None = None
         self._persisted_iterations = 0
+        self._history_generation = 0
         # Status polling continues after a run reaches a terminal state. Keep
         # the final write idempotent so each poll does not rewrite the full run.
         self._last_persisted_signature: tuple[object, ...] | None = None
 
     def start_new(self, status: dict | None = None) -> dict:
         with self._lock:
+            self._history_generation += 1
             self.recent_dir.mkdir(parents=True, exist_ok=True)
             previous_run_id = self._current_run_id
             previous_kind = self._current_run_kind
@@ -576,6 +675,35 @@ class AutotuneRunStore:
                 self._enforce_recent_limit()
             return next_status
 
+    def persist_iteration_record(self, record: dict, terminal: bool = False) -> None:
+        """Durably append one iteration without rewriting the full run on every step."""
+
+        with self._lock:
+            if self._current_run_id is None or not isinstance(record, dict):
+                return
+            try:
+                iteration = int(record.get("iteration") or 0)
+            except (TypeError, ValueError):
+                return
+            if iteration <= self._persisted_iterations:
+                return
+            run_kind = self._current_run_kind or "recent"
+            run_dir = (self.saved_dir if run_kind == "saved" else self.recent_dir) / self._current_run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            payload = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+            descriptor = os.open(str(run_dir / "iterations.jsonl"), os.O_APPEND | os.O_CREAT | os.O_WRONLY)
+            try:
+                os.write(descriptor, payload)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            self._persisted_iterations = iteration
+
+        # JSONL is the per-iteration crash-safe journal. Refresh the larger
+        # status snapshot periodically and once at the terminal state.
+        if terminal or iteration % 10 == 0:
+            self.persist_status(TUNING_SESSION.status())
+
     def needs_persist(self, status: dict) -> bool:
         """Return whether a status poll contains unsaved run state."""
 
@@ -599,6 +727,7 @@ class AutotuneRunStore:
 
     def stop_current(self) -> None:
         with self._lock:
+            self._history_generation += 1
             self._current_run_id = None
             self._current_run_kind = None
             self._persisted_iterations = 0
@@ -771,7 +900,7 @@ class AutotuneRunStore:
             if repaired:
                 self._write_json(run_dir / "run_status.json", status)
                 self._write_summary(run_dir, status)
-            return {"ok": True, **status}
+            return {"ok": True, **_compact_loaded_status_for_client(status)}
 
     def resume_run(self, run_id: str, kind: str = "recent") -> dict:
         with self._lock:
@@ -785,6 +914,7 @@ class AutotuneRunStore:
             run_dir = source
             self._current_run_id = run_dir.name
             self._current_run_kind = run_kind
+            self._history_generation += 1
             self._persisted_iterations = len(status.get("history") if isinstance(status.get("history"), list) else [])
             status = copy.deepcopy(status)
             status["run"] = self._run_payload(run_dir.name, run_kind, run_dir)
@@ -794,6 +924,14 @@ class AutotuneRunStore:
             if run_kind == "recent":
                 self._enforce_recent_limit()
             return {"ok": True, "restored": restored, **resumed}
+
+    def history_token(self) -> str:
+        """Identify one in-memory history so clients never merge different runs."""
+
+        with self._lock:
+            run_id = self._current_run_id or "none"
+            run_kind = self._current_run_kind or "session"
+            return f"{os.getpid()}:{self._history_generation}:{run_kind}:{run_id}"
 
     def save_animation_gif(self, run_id: str | None = None, kind: str = "recent", duration_ms: int = 100) -> dict:
         with self._lock:
@@ -1674,6 +1812,7 @@ class AutotuneRunStore:
                 target,
                 iteration,
                 scope_axis_settings,
+                record.get("metrics") if isinstance(record.get("metrics"), dict) else None,
             ):
                 changed = True
             record["scope_result"] = scope_result
@@ -1751,10 +1890,18 @@ class AutotuneRunStore:
         target: Path,
         iteration: int,
         axis_settings: dict | None,
+        metrics_payload: dict | None = None,
     ) -> bool:
         entry = _scope_capture_entry_from_result(scope_result)
         if entry is None:
             return False
+        if isinstance(metrics_payload, dict):
+            try:
+                entry["settling_metrics"] = ResponseMetrics(**metrics_payload)
+            except (TypeError, ValueError):
+                # Legacy records may not contain every current metrics field;
+                # those can still be rebuilt by analyzing the saved waveform.
+                pass
         _plot_full_scope_capture_png(
             entry,
             axis_settings,
@@ -1795,6 +1942,7 @@ class AutotuneRunStore:
         summary = {
             "run_id": run_dir.name,
             "display_name": self._display_name_for_run(run_dir.name, "recent" if run_dir.parent == self.recent_dir else "saved"),
+            "algorithm": self._algorithm_label_for_status(status),
             "kind": "recent" if run_dir.parent == self.recent_dir else "saved",
             "path": _path_label(run_dir),
             "updated_at": time.time(),
@@ -1812,25 +1960,38 @@ class AutotuneRunStore:
         self._write_json(run_dir / "summary.json", existing)
 
     def _list_kind(self, folder: Path, kind: str) -> list[dict]:
+        """List lightweight run descriptors without loading full histories.
+
+        ``run_status.json`` can contain thousands of iterations and tens of
+        megabytes of diagnostics. Reading every status just to populate the
+        Result Library made a page refresh scale with the total archive size.
+        ``summary.json`` is the index for this endpoint; the complete status is
+        loaded only by ``load_run`` after the user presses Load.
+        """
+
         if not folder.exists():
             return []
         runs = []
         for run_dir in folder.iterdir():
             if not run_dir.is_dir():
                 continue
-            summary = self._read_json(run_dir / "summary.json") or {"run_id": run_dir.name}
-            status = self._read_json(run_dir / "run_status.json")
-            if isinstance(status, dict) and self._repair_run_status_artifact_paths(run_dir, status):
-                self._write_json(run_dir / "run_status.json", status)
-                self._write_summary(run_dir, status)
-                summary = self._read_json(run_dir / "summary.json") or summary
-            history = status.get("history") if isinstance(status, dict) and isinstance(status.get("history"), list) else None
-            if history is not None and int(summary.get("iteration_count") or 0) != len(history):
-                summary["iteration_count"] = len(history)
-                self._write_json(run_dir / "summary.json", summary)
+            summary_path = run_dir / "summary.json"
+            summary = self._read_json(summary_path)
+            if not isinstance(summary, dict):
+                # One-time compatibility path for a legacy run without an
+                # index. Future listings use the summary written here.
+                status = self._read_json(run_dir / "run_status.json")
+                if isinstance(status, dict):
+                    self._write_summary(run_dir, status)
+                    summary = self._read_json(summary_path)
+            if not isinstance(summary, dict):
+                summary = {"run_id": run_dir.name}
+            else:
+                summary = dict(summary)
             summary["run_id"] = run_dir.name
             summary["display_name"] = self._display_name_for_run(run_dir.name, kind)
             summary["kind"] = kind
+            summary.setdefault("algorithm", "Grid")
             runs.append(summary)
         runs.sort(key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0), reverse=True)
         return runs
@@ -1937,9 +2098,27 @@ class AutotuneRunStore:
         return f"{prefix} / {text or 'Unknown'}"
 
     @staticmethod
+    def _algorithm_label_for_status(status: dict) -> str:
+        experiment = status.get("experiment") if isinstance(status.get("experiment"), dict) else {}
+        algorithm = str(experiment.get("optimization_algorithm") or "").strip().lower()
+        if any(token in algorithm for token in ("drl", "reinforcement", "safe-sac", "sac")):
+            return "DRL"
+
+        # Older summaries may predate the experiment algorithm field. Their
+        # iteration phases still make DRL runs unambiguous.
+        history = status.get("history") if isinstance(status.get("history"), list) else []
+        for record in history:
+            phase = str(record.get("phase") or "").strip().lower() if isinstance(record, dict) else ""
+            if phase.startswith("drl_") or phase.startswith("drl-"):
+                return "DRL"
+        return "Grid"
+
+    @staticmethod
     def _write_json(path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
 
     @staticmethod
     def _read_json(path: Path) -> dict | None:
@@ -1963,6 +2142,105 @@ AUTOTUNE_RUN_STORE = AutotuneRunStore(
     AUTOTUNE_RECENT_LIMIT,
     AUTOTUNE_RECENT_MIN_ITERATIONS,
 )
+TUNING_SESSION.set_iteration_callback(AUTOTUNE_RUN_STORE.persist_iteration_record)
+
+
+def _compact_loaded_status_for_client(status: dict) -> dict:
+    """Drop per-iteration diagnostics from an archived status response.
+
+    The run_status.json file remains authoritative and untouched, so Resume,
+    relabeling, and artifact repair still have the original diagnostics.  The
+    browser only needs candidate, metrics, and artifact references for old
+    history rows.
+    """
+
+    history = status.get("history")
+    if isinstance(history, list):
+        compact_history: list[dict] = []
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            compact = dict(record)
+            compact["waveform"] = {"time_s": [], "vout_v": [], "input_v": []}
+            compact["write_results"] = {}
+            compact["optimizer_metadata"] = {}
+            compact["bode_result"] = _compact_bode_result(compact.get("bode_result") or {})
+            compact["scope_result"] = _compact_scope_result(compact.get("scope_result") or {})
+            compact_history.append(compact)
+        status["history"] = compact_history
+    recommendations = status.get("recommendations")
+    if isinstance(recommendations, list):
+        status["recommendations"] = [
+            {
+                **record,
+                "waveform": {"time_s": [], "vout_v": [], "input_v": []},
+                "write_results": {},
+                "optimizer_metadata": {},
+                "bode_result": _compact_bode_result(record.get("bode_result") or {}),
+                "scope_result": _compact_scope_result(record.get("scope_result") or {}),
+            }
+            for record in recommendations
+            if isinstance(record, dict)
+        ]
+    return status
+
+
+def _requested_history_cursor(query: str, history_token: str) -> int | None:
+    params = parse_qs(query)
+    requested_token = str(params.get("history_token", [""])[0] or "")
+    raw_after = params.get("after_iteration", [None])[0]
+    if requested_token != history_token or raw_after in (None, ""):
+        return None
+    try:
+        return max(0, int(str(raw_after)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _incremental_status_for_client(
+    status: dict,
+    query: str,
+    history_token: str,
+    *,
+    history_is_filtered: bool = False,
+) -> dict:
+    """Return either a complete status or history records newer than the cursor."""
+
+    history = status.get("history") if isinstance(status.get("history"), list) else []
+    after_iteration = _requested_history_cursor(query, history_token)
+
+    numbered_history: list[tuple[dict, int]] = []
+    for index, record in enumerate(history):
+        if not isinstance(record, dict):
+            continue
+        try:
+            iteration = int(record.get("iteration") or index + 1)
+        except (TypeError, ValueError):
+            iteration = index + 1
+        numbered_history.append((record, iteration))
+    history_total = int(status.get("history_total", len(history)) or 0)
+    last_iteration = int(
+        status.get(
+            "history_last_iteration",
+            max((iteration for _, iteration in numbered_history), default=0),
+        )
+        or 0
+    )
+    delta_allowed = bool(
+        after_iteration is not None
+        and after_iteration <= last_iteration
+    )
+    payload = dict(status)
+    if delta_allowed and not history_is_filtered:
+        payload["history"] = [
+            record for record, iteration in numbered_history if iteration > int(after_iteration)
+        ]
+    payload["history_delta"] = delta_allowed
+    payload["history_token"] = history_token
+    payload["history_after_iteration"] = int(after_iteration or 0) if delta_allowed else None
+    payload["history_total"] = history_total
+    payload["history_last_iteration"] = last_iteration
+    return payload
 
 
 def _start_drl_hardware(config: TuningConfig, experiment: AutotuneExperimentConfig) -> dict:
@@ -2209,7 +2487,10 @@ def _web_search_context(query: str) -> str:
     return "\n".join(lines)[:3500]
 
 
-def _call_llm_chat(messages: object, context: object, model_choice: object = None) -> tuple[str, str]:
+LLM_COMPLETION_MARKER = "[[AI_COPILOT_RESPONSE_COMPLETE]]"
+
+
+def _call_llm_chat(messages: object, context: object, model_choice: object = None) -> tuple[str, str, dict[str, object]]:
     choice = _resolve_llm_choice(model_choice)
     api_key = _first_env(choice["api_key_env"])  # type: ignore[arg-type]
     if not api_key:
@@ -2219,9 +2500,10 @@ def _call_llm_chat(messages: object, context: object, model_choice: object = Non
     base_url = _first_env(choice["base_url_env"]) or str(choice["default_base_url"])  # type: ignore[arg-type]
     model = _first_env(choice["model_env"]) or str(choice["default_model"])  # type: ignore[arg-type]
     explicit_endpoint = _first_env(choice["endpoint_env"])  # type: ignore[arg-type]
-    timeout_s = float(os.environ.get("LLM_TIMEOUT_S", "30") or "30")
+    timeout_s = float(os.environ.get("LLM_TIMEOUT_S", "120") or "120")
     temperature = float(os.environ.get("LLM_TEMPERATURE", "0.2") or "0.2")
-    max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "700") or "700")
+    max_tokens = max(256, min(100000, int(os.environ.get("LLM_MAX_TOKENS", "10000") or "10000")))
+    max_continuations = max(1, min(8, int(os.environ.get("LLM_MAX_CONTINUATIONS", "4") or "4")))
 
     clean_messages = _coerce_llm_messages(messages)
     user_query = _latest_user_message(clean_messages)
@@ -2231,48 +2513,97 @@ def _call_llm_chat(messages: object, context: object, model_choice: object = Non
         "You are a concise assistant embedded inside the Google Power Auto-Tuner GUI. "
         "Help users understand this hardware-in-the-loop PID tuning interface: PID Auto-Tune, "
         "Manual Tuning, Self Testing, XDP/PMBus board control, Bode 100, oscilloscope, "
-        "function generator, and power supply panels. Respond in English. "
+        "function generator, and power supply panels. Respond in the same language as the user. "
         "Do not claim that you can directly control hardware; tell the user which GUI control "
-        "or workflow to use. Be safety-aware and practical.\n\n"
+        "or workflow to use. Be safety-aware and practical. "
+        f"A response is complete only when it ends with the exact marker {LLM_COMPLETION_MARKER}. "
+        "Always put that marker once at the very end, after the complete answer; never stop before it.\n\n"
         f"Current GUI context JSON:\n{gui_context}"
     )
     if search_context:
         system_prompt += f"\n\nExternal web search context:\n{search_context}"
     outgoing = [{"role": "system", "content": system_prompt}, *clean_messages]
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": outgoing,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-    ).encode("utf-8")
-    request = urllib_request.Request(
-        _llm_chat_endpoint(base_url, explicit_endpoint),
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib_request.urlopen(request, timeout=timeout_s) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib_error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:700]
-        raise RuntimeError(f"LLM API error {exc.code}: {detail}") from exc
-    except urllib_error.URLError as exc:
-        raise RuntimeError(f"Could not reach LLM API: {exc.reason}") from exc
+    reply_parts: list[str] = []
+    returned_model = model
+    final_finish_reason = ""
+    continuation_count = 0
+    for continuation_index in range(max_continuations + 1):
+        body = json.dumps(
+            {
+                "model": model,
+                "messages": outgoing,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        ).encode("utf-8")
+        request = urllib_request.Request(
+            _llm_chat_endpoint(base_url, explicit_endpoint),
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=timeout_s) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:700]
+            raise RuntimeError(f"LLM API error {exc.code}: {detail}") from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"Could not reach LLM API: {exc.reason}") from exc
 
-    choices = payload.get("choices") if isinstance(payload, dict) else None
-    if not choices:
-        raise RuntimeError("LLM API returned no choices.")
-    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-    reply = _sanitize_llm_reply(str(message.get("content", "")).strip())
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not choices:
+            raise RuntimeError("LLM API returned no choices.")
+        choice_result = choices[0] if isinstance(choices[0], dict) else {}
+        message = choice_result.get("message", {}) if isinstance(choice_result, dict) else {}
+        raw_reply = str(message.get("content", "")).strip()
+        marker_present = LLM_COMPLETION_MARKER in raw_reply
+        visible_reply = raw_reply.split(LLM_COMPLETION_MARKER, 1)[0] if marker_present else raw_reply
+        clean_reply = _sanitize_llm_reply(visible_reply)
+        if clean_reply:
+            reply_parts.append(clean_reply)
+        returned_model = str(payload.get("model", returned_model))
+
+        finish_reason = str(choice_result.get("finish_reason", "")).strip().lower()
+        final_finish_reason = finish_reason
+        if marker_present:
+            break
+        if continuation_index >= max_continuations:
+            raise RuntimeError(
+                "LLM provider repeatedly returned an incomplete response without the completion marker "
+                f"(last finish_reason={finish_reason or 'missing'}). Try another model or ask again."
+            )
+        if not raw_reply:
+            raise RuntimeError("LLM used its output budget without returning visible text.")
+        continuation_count += 1
+        outgoing.extend(
+            [
+                {"role": "assistant", "content": raw_reply},
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response was incomplete because it did not include the required "
+                        f"ending marker {LLM_COMPLETION_MARKER}. Continue exactly where it stopped, "
+                        "do not repeat earlier text, finish every unfinished sentence/list, and put the "
+                        "marker once at the very end."
+                    ),
+                },
+            ]
+        )
+
+    reply = "\n".join(part.strip() for part in reply_parts if part.strip()).strip()
     if not reply:
         raise RuntimeError("LLM API returned an empty reply.")
-    return reply, str(payload.get("model", model))
+    return reply, returned_model, {
+        "complete": True,
+        "completion_protocol": "sentinel-v1",
+        "continuations": continuation_count,
+        "finish_reason": final_finish_reason,
+        "max_tokens": max_tokens,
+    }
 
 
 class GuiHandler(BaseHTTPRequestHandler):
@@ -2324,11 +2655,32 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._handle_bode100_idn(parsed.query)
             return
         if parsed.path == "/api/tuning/status":
-            status = TUNING_SESSION.status()
+            history_token = AUTOTUNE_RUN_STORE.history_token()
+            requested_cursor = _requested_history_cursor(parsed.query, history_token)
+            status = TUNING_SESSION.status(after_iteration=requested_cursor)
             is_running = status.get("state") == "running"
+            # A matching token should never move backwards, but fail closed to
+            # a complete snapshot for malformed/stale cursors.
+            if (
+                requested_cursor is not None
+                and requested_cursor > int(status.get("history_last_iteration", 0) or 0)
+            ):
+                requested_cursor = None
+                status = TUNING_SESSION.status()
+                is_running = status.get("state") == "running"
+            # Persistence and artifact reconciliation require the complete
+            # history. During an active run, keep the cursor-filtered payload.
+            if not is_running and requested_cursor is not None:
+                status = TUNING_SESSION.status()
             artifacts_changed = _refresh_status_artifact_readiness(status, include_history=not is_running)
             if not is_running and (artifacts_changed or AUTOTUNE_RUN_STORE.needs_persist(status)):
                 status = AUTOTUNE_RUN_STORE.persist_status(status)
+            status = _incremental_status_for_client(
+                status,
+                parsed.query,
+                history_token,
+                history_is_filtered=is_running and requested_cursor is not None,
+            )
             self._send_json({"ok": True, **status})
             return
         if parsed.path == "/api/tuning/config":
@@ -2397,6 +2749,12 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tuning/drl/validate":
             self._handle_drl_action("validate")
+            return
+        if parsed.path == "/api/tuning/drl/targeted":
+            self._handle_drl_action("targeted")
+            return
+        if parsed.path == "/api/tuning/drl/targeted-recovery":
+            self._handle_drl_action("targeted-recovery")
             return
         if parsed.path == "/api/tuning/drl/stop":
             self._handle_drl_action("stop")
@@ -2617,6 +2975,26 @@ class GuiHandler(BaseHTTPRequestHandler):
                     result = DRL_WORKFLOW.start_training(config, experiment)
                 elif action == "validate":
                     result = DRL_WORKFLOW.start_validation(config, experiment)
+                elif action == "targeted":
+                    source_run_ids = payload.get("source_run_ids")
+                    if not isinstance(source_run_ids, list):
+                        raise RuntimeError("Targeted collection requires a source_run_ids list.")
+                    result = DRL_WORKFLOW.start_targeted_collection(
+                        config,
+                        experiment,
+                        [str(value) for value in source_run_ids],
+                    )
+                elif action == "targeted-recovery":
+                    source_plan_id = str(payload.get("source_plan_id") or "")
+                    source_plan_indexes = payload.get("source_plan_indexes")
+                    if not isinstance(source_plan_indexes, list):
+                        raise RuntimeError("Targeted recovery requires a source_plan_indexes list.")
+                    result = DRL_WORKFLOW.start_targeted_recovery(
+                        config,
+                        experiment,
+                        source_plan_id,
+                        [int(value) for value in source_plan_indexes],
+                    )
                 else:
                     raise RuntimeError(f"Unsupported DRL action: {action}")
             self._send_json(result)
@@ -2882,8 +3260,8 @@ class GuiHandler(BaseHTTPRequestHandler):
             messages = payload.get("messages", [])
             context = payload.get("context", {})
             model_choice = payload.get("model_choice") or payload.get("model")
-            reply, model = _call_llm_chat(messages, context, model_choice)
-            self._send_json({"ok": True, "reply": reply, "model": model})
+            reply, model, completion = _call_llm_chat(messages, context, model_choice)
+            self._send_json({"ok": True, "reply": reply, "model": model, "completion": completion})
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=400)
 
@@ -3236,6 +3614,7 @@ def _read_xdp_pid(address: str, page: int, adapter_kind: str) -> dict:
                 "loop": _loop_name(page),
                 "pid_registers": board.read_mod0_pid_registers(page),
                 "current_mode_registers": board.read_mod0_current_mode_registers(page),
+                "ll_bandwidth": board.read_mod0_ll_bandwidth(page),
                 "timestamp": time.time(),
             }
         except Exception as exc:
@@ -3260,6 +3639,8 @@ def _set_xdp_pid(address: str, page: int, adapter_kind: str, values: dict) -> di
                 raise ValueError(f"Unsupported XDP field(s): {', '.join(unknown)}")
             pid_values = {name: value for name, value in int_values.items() if name in supported_pid_fields}
             current_mode_values = {name: value for name, value in int_values.items() if name == "mod0_cm_gain"}
+            if "mod0_cm_gain" in current_mode_values and not 0 <= current_mode_values["mod0_cm_gain"] <= 9:
+                raise ValueError("mod0_cm_gain must be an integer from 0 through 9.")
             write = board.set_mod0_pid_registers(pid_values, page) if pid_values else None
             current_mode_write = (
                 board.set_mod0_current_mode_registers(current_mode_values, page)
@@ -3285,6 +3666,30 @@ def _set_xdp_pid(address: str, page: int, adapter_kind: str, values: dict) -> di
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc), "address": address, "page": page, "requested": values}
+        finally:
+            if board is not None:
+                board.close()
+
+
+def _set_mod0_ll_bandwidth(*, address: str, page: int, adapter_kind: str, value: int) -> dict:
+    with DEVICE_LOCK:
+        board = None
+        try:
+            if not 47 <= int(value) <= 127:
+                raise ValueError("mod0_ll_bw search value must be an integer from 47 through 127.")
+            board = _connect_board(address, adapter_kind)
+            write = board.set_mod0_ll_bandwidth(int(value), page)
+            return {
+                "ok": True,
+                "address": f"0x{board.device.address:02X}",
+                "page": page,
+                "loop": _loop_name(page),
+                "value": int(value),
+                "write": write,
+                "timestamp": time.time(),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "address": address, "page": page}
         finally:
             if board is not None:
                 board.close()
@@ -3514,6 +3919,7 @@ def _run_bode_sweep(
                 host=host,
                 port=port,
                 timeout_ms=timeout_ms,
+                runner=bode_driver,
             )
         else:
             bode = BodeScpiClient(resource_name=bode_driver.resource_name, timeout_ms=timeout_ms)
@@ -3534,15 +3940,20 @@ def _run_bode_sweep(
         config_reused = bool(
             reuse_session and getattr(bode, "_autotune_config_signature", None) == config_signature
         )
-        if not config_reused:
-            bode.configure_gain_phase(
-                start_hz=start_hz,
-                stop_hz=stop_hz,
-                points=points,
-                bandwidth_hz=bandwidth_hz,
-                source_dbm=effective_source_dbm,
-            )
-            bode._autotune_config_signature = config_signature
+        # Re-define the gain/phase measurement before every hardware sweep.
+        # Bode Analyzer Suite can keep a stale trace/format state on a reused
+        # SCPI session even when the requested numeric config is unchanged;
+        # that produced low-frequency phase noise and many false 0 dB
+        # crossovers in long runs. The configuration commands are cheap
+        # compared with acquisition and make each iteration self-contained.
+        bode.configure_gain_phase(
+            start_hz=start_hz,
+            stop_hz=stop_hz,
+            points=points,
+            bandwidth_hz=bandwidth_hz,
+            source_dbm=effective_source_dbm,
+        )
+        bode._autotune_config_signature = config_signature
         mark_stage("configure")
         data = bode.run_sweep()
         mark_stage("acquire_transfer")
@@ -3552,41 +3963,22 @@ def _run_bode_sweep(
         BODE_SWEEP_DIR.mkdir(parents=True, exist_ok=True)
         data_file_path = BODE_SWEEP_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{sweep_id}.npz"
         data_file_pending = False
-        if async_artifacts:
-            data_file_pending = True
-            _schedule_bode_data_artifact(
-                frequency_hz=data.frequency_hz,
-                magnitude_db=data.magnitude_db,
-                phase_deg=data.phase_deg,
-                path=data_file_path,
-                metadata={
-                    "start_hz": float(start_hz),
-                    "stop_hz": float(stop_hz),
-                    "points": int(points),
-                    "bandwidth_hz": float(bandwidth_hz),
-                    "source_vpp": np.nan if source_vpp is None else float(source_vpp),
-                    "source_dbm": np.nan if effective_source_dbm is None else float(effective_source_dbm),
-                    "identity": str(identity),
-                    "timestamp": float(timestamp),
-                },
-            )
-        else:
-            _write_bode_data_artifact(
-                np.asarray(data.frequency_hz, dtype=np.float64),
-                np.asarray(data.magnitude_db, dtype=np.float64),
-                np.asarray(data.phase_deg, dtype=np.float64),
-                data_file_path,
-                {
-                    "start_hz": float(start_hz),
-                    "stop_hz": float(stop_hz),
-                    "points": int(points),
-                    "bandwidth_hz": float(bandwidth_hz),
-                    "source_vpp": np.nan if source_vpp is None else float(source_vpp),
-                    "source_dbm": np.nan if effective_source_dbm is None else float(effective_source_dbm),
-                    "identity": str(identity),
-                    "timestamp": float(timestamp),
-                },
-            )
+        _write_bode_data_artifact(
+            np.asarray(data.frequency_hz, dtype=np.float64),
+            np.asarray(data.magnitude_db, dtype=np.float64),
+            np.asarray(data.phase_deg, dtype=np.float64),
+            data_file_path,
+            {
+                "start_hz": float(start_hz),
+                "stop_hz": float(stop_hz),
+                "points": int(points),
+                "bandwidth_hz": float(bandwidth_hz),
+                "source_vpp": np.nan if source_vpp is None else float(source_vpp),
+                "source_dbm": np.nan if effective_source_dbm is None else float(effective_source_dbm),
+                "identity": str(identity),
+                "timestamp": float(timestamp),
+            },
+        )
         mark_stage("data_artifact")
         bode_png = None
         bode_png_error = None
@@ -3600,8 +3992,7 @@ def _run_bode_sweep(
             )
             if async_artifacts:
                 bode_png = _scope_png_public_path(bode_png_path)
-                bode_png_pending = True
-                _schedule_bode_png_artifact(
+                bode_png_pending = _schedule_bode_png_artifact(
                     frequency_hz=data.frequency_hz,
                     magnitude_db=data.magnitude_db,
                     phase_deg=data.phase_deg,
@@ -3609,6 +4000,9 @@ def _run_bode_sweep(
                     path=bode_png_path,
                     title=bode_title,
                 )
+                if not bode_png_pending:
+                    bode_png = None
+                    bode_png_error = "PNG rendering deferred because the artifact queue is busy."
             else:
                 bode_png = _plot_full_bode_sweep_png(
                     frequency_hz=data.frequency_hz,
@@ -3730,6 +4124,7 @@ def _get_bode_connection(
     host: str,
     port: int,
     timeout_ms: int,
+    runner: Bode100Driver | None = None,
 ) -> tuple[BodeScpiClient, str, bool]:
     key = _bode_connection_key(host, port)
     with BODE_CONNECTION_LOCK:
@@ -3754,7 +4149,10 @@ def _get_bode_connection(
                 client.lock()
             except Exception:
                 pass
-            BODE_CONNECTIONS[key] = {"client": client, "identity": identity}
+            # Retain the driver as long as the cached VISA session. Otherwise
+            # its stdin pipe is garbage-collected and the console ScpiRunner
+            # interprets EOF as "press enter to stop".
+            BODE_CONNECTIONS[key] = {"client": client, "identity": identity, "runner": runner}
             return client, identity, False
         except Exception:
             try:
@@ -3769,6 +4167,7 @@ def _drop_bode_connection(host: str, port: int) -> None:
     with BODE_CONNECTION_LOCK:
         cached = BODE_CONNECTIONS.pop(key, None)
     client = cached.get("client") if cached else None
+    runner = cached.get("runner") if cached else None
     if isinstance(client, BodeScpiClient):
         try:
             client.unlock()
@@ -3778,6 +4177,8 @@ def _drop_bode_connection(host: str, port: int) -> None:
             client.close()
         except Exception:
             pass
+    if isinstance(runner, Bode100Driver):
+        runner.stop_scpi_server()
 
 
 def _is_stale_bode_session_error(exc: Exception) -> bool:
@@ -3787,6 +4188,8 @@ def _is_stale_bode_session_error(exc: Exception) -> bool:
         or "session handle" in message
         or "resource might be closed" in message
         or "connection is closed" in message
+        or "connection for the given session has been lost" in message
+        or "vi_error_conn_lost" in message
     )
 
 
@@ -3951,15 +4354,15 @@ def _set_function_generator(resource: str, channel: int, mode: str, payload: dic
             if mode_name == "square":
                 fg.configure_square_levels(
                     frequency_hz=float(payload.get("frequency_hz", 10000.0)),
-                    low_v=float(payload.get("low_v", 0.0)),
-                    high_v=float(payload.get("high_v", 1.0)),
+                    low_v=float(payload.get("low_v", 0.1)),
+                    high_v=float(payload.get("high_v", 1.1)),
                     channel=channel,
                 )
             elif mode_name == "pulse":
                 fg.configure_pulse_levels(
                     frequency_hz=float(payload.get("frequency_hz", 10000.0)),
-                    low_v=float(payload.get("low_v", 0.0)),
-                    high_v=float(payload.get("high_v", 1.0)),
+                    low_v=float(payload.get("low_v", 0.1)),
+                    high_v=float(payload.get("high_v", 1.1)),
                     width_s=_optional_float(payload.get("pulse_width_s")),
                     channel=channel,
                 )
@@ -3969,7 +4372,7 @@ def _set_function_generator(resource: str, channel: int, mode: str, payload: dic
                 fg.configure_sine(
                     frequency_hz=float(payload.get("frequency_hz", 10000.0)),
                     amplitude_vpp=float(payload.get("amplitude_vpp", 1.0)),
-                    offset_v=float(payload.get("offset_v", 0.0)),
+                    offset_v=float(payload.get("offset_v", 0.6)),
                     phase_deg=_optional_float(payload.get("phase_deg")),
                     channel=channel,
                 )
@@ -4129,7 +4532,7 @@ def _linear_x_metadata(x: np.ndarray) -> tuple[float, float, int]:
     return x_start, x_increment, points
 
 
-def _schedule_scope_capture_artifact(channels: dict[str, dict], path: Path, metadata: dict) -> None:
+def _schedule_scope_capture_artifact(channels: dict[str, dict], path: Path, metadata: dict) -> bool:
     compact_channels = {}
     for source, record in channels.items():
         compact_channels[source] = {
@@ -4140,7 +4543,7 @@ def _schedule_scope_capture_artifact(channels: dict[str, dict], path: Path, meta
             "original_points": int(record.get("original_points") or len(record["y"])),
             "transfer_encoding": record.get("transfer_encoding") or "",
         }
-    _submit_artifact(_write_scope_capture_artifact, compact_channels, path, copy.deepcopy(metadata))
+    return _submit_artifact(_write_scope_capture_artifact, compact_channels, path, copy.deepcopy(metadata))
 
 
 def _write_scope_capture_artifact(channels: dict[str, dict], path: Path, metadata: dict) -> None:
@@ -4242,16 +4645,15 @@ def _store_full_scope_capture(capture_id: str, captures: list, timestamp: float,
             "original_points": int(capture.original_points or len(capture.y)),
             "transfer_encoding": capture.transfer_encoding,
             "data_file": "",
-            "data_file_pending": bool(async_save),
+            "data_file_pending": False,
         }
     metadata = {
         "capture_id": capture_id,
         "timestamp": timestamp,
     }
-    if async_save:
-        _schedule_scope_capture_artifact(channel_records, file_path, metadata)
-    else:
-        _write_scope_capture_artifact(channel_records, file_path, metadata)
+    # NPZ is the source of truth and is much cheaper than rendering. Write it
+    # immediately so large waveform arrays can be released before returning.
+    _write_scope_capture_artifact(channel_records, file_path, metadata)
     try:
         data_file = str(file_path.relative_to(ROOT)).replace("\\", "/")
     except ValueError:
@@ -4336,6 +4738,22 @@ def _refresh_status_artifact_readiness(status: dict, *, include_history: bool = 
             result[pending_key] = False
             result[error_key] = None
             changed = True
+        bode_result = record.get("bode_result")
+        if isinstance(bode_result, dict) and bode_result.get("data_file_pending") is True:
+            path = _path_from_result_reference(bode_result.get("data_file"))
+            if path is not None and path.is_file() and path.stat().st_size > 0:
+                bode_result["data_file_pending"] = False
+                changed = True
+        scope_result = record.get("scope_result")
+        waveforms = scope_result.get("waveforms") if isinstance(scope_result, dict) else None
+        if isinstance(waveforms, list):
+            for waveform in waveforms:
+                if not isinstance(waveform, dict) or waveform.get("data_file_pending") is not True:
+                    continue
+                path = _path_from_result_reference(waveform.get("data_file"))
+                if path is not None and path.is_file() and path.stat().st_size > 0:
+                    waveform["data_file_pending"] = False
+                    changed = True
     return changed
 
 
@@ -4609,8 +5027,8 @@ def _schedule_bode_data_artifact(
     phase_deg: list[float],
     path: Path,
     metadata: dict,
-) -> None:
-    _submit_artifact(
+) -> bool:
+    return _submit_artifact(
         _write_bode_data_artifact,
         np.asarray(frequency_hz, dtype=np.float64).copy(),
         np.asarray(magnitude_db, dtype=np.float64).copy(),
@@ -4655,43 +5073,15 @@ def _scope_input_edge_times_s(channels: dict) -> list[tuple[float, str]]:
     y_array = y_array[finite]
     if x_array.size < 2:
         return []
-    low = float(np.percentile(y_array, 10))
-    high = float(np.percentile(y_array, 90))
-    if not np.isfinite(low) or not np.isfinite(high) or abs(high - low) < 1e-9:
-        return []
-    threshold = (low + high) / 2.0
-
-    edge_candidates: list[tuple[float, str]] = []
-    crossing_sets = (
-        ("rising", np.where((y_array[:-1] < threshold) & (y_array[1:] >= threshold))[0]),
-        ("falling", np.where((y_array[:-1] >= threshold) & (y_array[1:] < threshold))[0]),
-    )
-    for kind, indices in crossing_sets:
-        for raw_index in indices:
-            index = int(raw_index)
-            y0 = float(y_array[index])
-            y1 = float(y_array[index + 1])
-            x_start = float(x_array[index])
-            x_stop = float(x_array[index + 1])
-            if y1 == y0:
-                crossing_time = x_start
-            else:
-                fraction = max(0.0, min(1.0, (threshold - y0) / (y1 - y0)))
-                crossing_time = x_start + fraction * (x_stop - x_start)
-            edge_candidates.append((crossing_time, kind))
-
-    if not edge_candidates:
-        return []
-
-    edge_candidates.sort(key=lambda item: item[0])
-    span_s = max(0.0, float(x_array[-1] - x_array[0]))
-    debounce_s = max(0.5e-6, min(5e-6, span_s * 0.005))
-    edges: list[tuple[float, str]] = []
-    for edge_time, kind in edge_candidates:
-        if edges and edge_time - edges[-1][0] < debounce_s:
-            continue
-        edges.append((edge_time, kind))
-    return edges
+    # Use exactly the same robust threshold, hysteresis and debounce as the
+    # analyzer. Separate plot-only edge logic previously allowed annotations
+    # to disagree with the values used for scoring.
+    edge_indices = ResponseAnalyzer(TuningTargets()).input_edge_indices(y_array.tolist())
+    return [
+        (float(x_array[index]), kind)
+        for index, kind in edge_indices
+        if 0 <= index < x_array.size
+    ]
 
 
 def _draw_scope_settling_markers(
@@ -4703,6 +5093,17 @@ def _draw_scope_settling_markers(
     x_scale: float,
     metrics: ResponseMetrics | None = None,
 ) -> None:
+    # Old records only had a shared invalid-waveform reason. V2+ records carry
+    # independent OS/US validity flags, so one failed direction must not hide
+    # the valid settling marker for the other direction.
+    legacy_invalid = (
+        metrics is not None
+        and int(getattr(metrics, "settling_analysis_version", 1) or 1) < 2
+        and any(
+        "invalid transient waveform" in str(reason).lower()
+        for reason in (metrics.pass_reasons or [])
+        )
+    )
     edge_times = _selected_scope_settling_marker_edges(_scope_input_edge_times_s(channels))
     if not edge_times:
         return
@@ -4715,15 +5116,20 @@ def _draw_scope_settling_markers(
 
     for edge_time_s, kind in edge_times:
         settling_time_s = None
+        settling_valid = not legacy_invalid
         if metrics is not None:
             if kind == "rising":
                 settling_time_s = float(metrics.undershoot_settling_time_s)
+                settling_valid = bool(getattr(metrics, "undershoot_settling_valid", True)) and not legacy_invalid
             else:
                 settling_time_s = float(metrics.overshoot_settling_time_s)
-        if settling_time_s is None or not math.isfinite(settling_time_s) or settling_time_s < 0:
+                settling_valid = bool(getattr(metrics, "overshoot_settling_valid", True)) and not legacy_invalid
+        if not settling_valid:
+            settling_time_s = None
+        elif settling_time_s is None or not math.isfinite(settling_time_s) or settling_time_s < 0:
             continue
         edge_x = (edge_time_s - x0) * x_scale
-        settle_x = (edge_time_s + settling_time_s - x0) * x_scale
+        settle_x = (edge_time_s + settling_time_s - x0) * x_scale if settling_time_s is not None else edge_x
         edge_visible = x_min <= edge_x <= x_max
         settle_visible = x_min <= settle_x <= x_max
 
@@ -4736,6 +5142,22 @@ def _draw_scope_settling_markers(
                 alpha=0.85,
                 zorder=0,
             )
+        if not settling_valid and edge_visible:
+            label_x = min(edge_x + 0.035 * (x_max - x_min), x_max - 0.04 * (x_max - x_min))
+            axis.text(
+                label_x,
+                0.805,
+                "Ts --",
+                transform=axis.get_xaxis_transform(),
+                color=settle_color,
+                fontsize=13,
+                fontweight="bold",
+                ha="left",
+                va="bottom",
+                bbox={"boxstyle": "round,pad=0.28", "facecolor": "white", "edgecolor": "#f3b7b0", "alpha": 0.94},
+                clip_on=True,
+            )
+            continue
         if settle_visible:
             axis.axvline(
                 settle_x,
@@ -4780,14 +5202,40 @@ def _draw_scope_settling_markers(
             )
 
 
-def _scope_response_metrics_from_plot_channels(channels: dict) -> ResponseMetrics | None:
+def _is_recoverable_scope_capture_error(exc: Exception) -> bool:
+    """Return whether reconnecting and flushing the scope may fix the error."""
+
+    if isinstance(exc, TimeoutError):
+        return True
+    message = str(exc).lower()
+    return _is_stale_scope_session_error(exc) or any(
+        marker in message
+        for marker in (
+            "single acquisition did not complete",
+            "timeout",
+            "timed out",
+            "vi_error_tmo",
+            "low on memory",
+            "out of memory",
+            "insufficient memory",
+        )
+    )
+
+
+def _scope_response_metrics_from_plot_channels(
+    channels: dict,
+    *,
+    response_channel: str = "CH3",
+    targets: TuningTargets | None = None,
+) -> ResponseMetrics | None:
     ch1 = channels.get("CH1") or channels.get("ch1")
-    ch3 = channels.get("CH3") or channels.get("ch3")
-    if not ch1 or not ch3:
+    response_key = str(response_channel or "CH3").upper()
+    response = channels.get(response_key) or channels.get(response_key.lower())
+    if not ch1 or not response:
         return None
 
-    time_array = np.asarray(ch3.get("x", []), dtype=np.float64)
-    response_array = np.asarray(ch3.get("y", []), dtype=np.float64)
+    time_array = np.asarray(response.get("x", []), dtype=np.float64)
+    response_array = np.asarray(response.get("y", []), dtype=np.float64)
     input_time = np.asarray(ch1.get("x", []), dtype=np.float64)
     input_array = np.asarray(ch1.get("y", []), dtype=np.float64)
     total = min(time_array.size, response_array.size)
@@ -4824,7 +5272,7 @@ def _scope_response_metrics_from_plot_channels(channels: dict) -> ResponseMetric
         aligned_input = np.interp(time_array, input_time, input_array)
 
     try:
-        return ResponseAnalyzer(TuningTargets()).analyze(
+        return ResponseAnalyzer(targets or TuningTargets()).analyze(
             Waveform(
                 time_s=time_array.tolist(),
                 vout_v=response_array.tolist(),
@@ -4927,16 +5375,18 @@ def _plot_full_scope_capture_png(
         lines.append(line)
         labels.append(source)
         if source.upper() == "CH3":
+            decision_cutoff_hz = ResponseAnalyzer.RESPONSE_LOWPASS_CUTOFF_HZ
+            decision_label = f"CH3 {decision_cutoff_hz / 1e6:g}MHz LPF"
             filtered_y = response_filter._zero_phase_lowpass(
                 x_array[:total].tolist(),
                 y_array[:total].tolist(),
-                cutoff_hz=ResponseAnalyzer.RESPONSE_LOWPASS_CUTOFF_HZ,
+                cutoff_hz=decision_cutoff_hz,
             )
             if len(filtered_y) == total:
                 filtered_line, = axis.plot(
                     (x_array[:total] - x0) * x_scale,
                     filtered_y,
-                    label="CH3 5MHz LPF",
+                    label=decision_label,
                     linewidth=1.8,
                     color="#ea4335",
                     alpha=1.0,
@@ -4944,7 +5394,7 @@ def _plot_full_scope_capture_png(
                     rasterized=True,
                 )
                 lines.append(filtered_line)
-                labels.append("CH3 5MHz LPF")
+                labels.append(decision_label)
 
     left_color = "#1a73e8"
     right_color = "#ea4335"
@@ -4960,7 +5410,9 @@ def _plot_full_scope_capture_png(
     left_ax.spines["left"].set_color(left_color)
     right_ax.spines["right"].set_color(right_color)
     left_ax.grid(True, color="#d9dee7", linewidth=0.8, alpha=0.8)
-    settling_metrics = _scope_response_metrics_from_plot_channels(channels)
+    settling_metrics = entry.get("settling_metrics")
+    if not isinstance(settling_metrics, ResponseMetrics):
+        settling_metrics = _scope_response_metrics_from_plot_channels(channels)
     _draw_scope_settling_markers(
         left_ax,
         channels=channels,
@@ -4992,12 +5444,12 @@ def _schedule_bode_png_artifact(
     margins: dict | None,
     path: Path,
     title: str,
-) -> None:
+) -> bool:
     frequency_copy = np.asarray(frequency_hz, dtype=np.float64).copy()
     magnitude_copy = np.asarray(magnitude_db, dtype=np.float64).copy()
     phase_copy = np.asarray(phase_deg, dtype=np.float64).copy()
     margins_copy = copy.deepcopy(margins or {})
-    _submit_artifact(
+    return _submit_artifact(
         _write_bode_png_artifact,
         frequency_copy,
         magnitude_copy,
@@ -5034,10 +5486,10 @@ def _schedule_scope_png_artifact(
     scope_axis_settings: dict | None,
     path: Path,
     title: str,
-) -> None:
+) -> bool:
     capture_copy = _copy_scope_capture_for_plot(capture_entry)
     axis_copy = copy.deepcopy(scope_axis_settings)
-    _submit_artifact(_write_scope_png_artifact, capture_copy, axis_copy, path, title)
+    return _submit_artifact(_write_scope_png_artifact, capture_copy, axis_copy, path, title)
 
 
 def _write_scope_png_artifact(
@@ -5075,6 +5527,10 @@ def _copy_scope_capture_for_plot(capture_entry: dict) -> dict:
         "created_at": capture_entry.get("created_at"),
         "resource": capture_entry.get("resource"),
         "channels": copied_channels,
+        # Freeze the synchronous analysis result for the background renderer.
+        # Recomputing it later can produce a PNG label that disagrees with the
+        # score/history when the backend code changes or an artifact is queued.
+        "settling_metrics": capture_entry.get("settling_metrics"),
     }
 
 
@@ -5132,6 +5588,8 @@ def _capture_scope(
     scope_axis_settings: dict | None = None,
     async_artifacts: bool = False,
     iteration_number: int | None = None,
+    response_channel: str = "CH3",
+    response_targets: TuningTargets | None = None,
 ) -> dict:
     started = time.perf_counter()
     stage_started = started
@@ -5155,6 +5613,9 @@ def _capture_scope(
     scope_actual_window_s = None
     scope_scale_s_per_div = None
     scope_trigger_position_percent = None
+    scope_memory_guard: dict[str, object] = {}
+    scope_recovery_attempts: list[dict[str, object]] = []
+    autotune_memory_guard_enabled = iteration_number is not None
     if function_generator_frequency_hz is not None and function_generator_frequency_hz > 0:
         function_generator_period_s = 1.0 / float(function_generator_frequency_hz)
         scope_window_s = max(
@@ -5163,7 +5624,8 @@ def _capture_scope(
         )
     with DEVICE_LOCK:
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(SCOPE_AUTOTUNE_CAPTURE_ATTEMPTS):
+            scope = None
             try:
                 scope, opened = _get_scope_connection(resource, timeout_ms=6000)
                 mark_stage("session")
@@ -5174,7 +5636,11 @@ def _capture_scope(
                     "resource": resource,
                     "channels": {},
                 }
-                config_signature = (tuple(safe_channels), scope_window_s)
+                config_signature = (
+                    tuple(safe_channels),
+                    scope_window_s,
+                    SCOPE_AUTOTUNE_MAX_RECORD_LENGTH if autotune_memory_guard_enabled else None,
+                )
                 config_reused = bool(
                     not opened and getattr(scope, "_autotune_config_signature", None) == config_signature
                 )
@@ -5200,6 +5666,12 @@ def _capture_scope(
                     scope._autotune_actual_window_s = scope_actual_window_s
                     scope._autotune_trigger_position_percent = scope_trigger_position_percent
                 mark_stage("configure")
+                if autotune_memory_guard_enabled:
+                    scope_memory_guard = scope.prepare_autotune_acquisition(
+                        max_record_length=SCOPE_AUTOTUNE_MAX_RECORD_LENGTH,
+                        maintenance_interval=SCOPE_AUTOTUNE_MAINTENANCE_INTERVAL,
+                    )
+                mark_stage("scope_memory_guard")
                 force_after_s = 0.5 if scope_window_s is None else max(0.25, min(2.0, scope_window_s * 1.5))
                 scope.single_acquisition(timeout_s=8.0, force_after_s=force_after_s)
                 mark_stage("acquisition")
@@ -5237,7 +5709,7 @@ def _capture_scope(
                             "display_strategy": display_strategy,
                             "capture_id": capture_id,
                             "data_file": data_file,
-                            "data_file_pending": bool(async_artifacts),
+                            "data_file_pending": False,
                             "transfer_encoding": capture.transfer_encoding,
                         }
                     )
@@ -5251,6 +5723,15 @@ def _capture_scope(
                                 {"source": source_channel, "measurement": measurement, "value": None, "ok": False, "error": str(exc)}
                             )
                 mark_stage("display_data")
+                # Calculate the marker values while this capture is still the
+                # active synchronous result. The PNG task may run later, but it
+                # must display exactly this immutable metrics snapshot rather
+                # than re-analyzing the waveform in a background thread.
+                capture_cache_entry["settling_metrics"] = _scope_response_metrics_from_plot_channels(
+                    capture_cache_entry["channels"],
+                    response_channel=response_channel,
+                    targets=response_targets,
+                )
                 _remember_scope_capture(capture_id, capture_cache_entry)
                 scope_png = None
                 scope_png_error = None
@@ -5264,13 +5745,15 @@ def _capture_scope(
                     )
                     if async_artifacts:
                         scope_png = _scope_png_public_path(scope_png_path)
-                        scope_png_pending = True
-                        _schedule_scope_png_artifact(
+                        scope_png_pending = _schedule_scope_png_artifact(
                             capture_entry=capture_cache_entry,
                             scope_axis_settings=scope_axis_settings,
                             path=scope_png_path,
                             title=scope_title,
                         )
+                        if not scope_png_pending:
+                            scope_png = None
+                            scope_png_error = "PNG rendering deferred because the artifact queue is busy."
                     else:
                         scope_png = _plot_full_scope_capture_png(
                             capture_cache_entry,
@@ -5310,20 +5793,44 @@ def _capture_scope(
                     "session_reused": not opened,
                     "config_reused": config_reused,
                     "session_retry": attempt,
+                    "capture_attempts": attempt + 1,
+                    "scope_memory_guard": scope_memory_guard,
+                    "scope_recovery_attempts": scope_recovery_attempts,
                     "stage_durations_s": stage_durations,
                     "duration_s": round(time.perf_counter() - started, 3),
                     "timestamp": time.time(),
                 }
             except Exception as exc:
                 last_error = exc
+                recoverable = _is_recoverable_scope_capture_error(exc)
+                recovery: dict[str, object] = {
+                    "attempt": attempt + 1,
+                    "error": str(exc),
+                    "recoverable": recoverable,
+                    "forced_flush": False,
+                }
+                if recoverable and scope is not None and autotune_memory_guard_enabled:
+                    try:
+                        recovery["memory_guard"] = scope.prepare_autotune_acquisition(
+                            max_record_length=SCOPE_AUTOTUNE_MAX_RECORD_LENGTH,
+                            maintenance_interval=SCOPE_AUTOTUNE_MAINTENANCE_INTERVAL,
+                            force_flush=True,
+                        )
+                        recovery["forced_flush"] = True
+                    except Exception as recovery_exc:
+                        recovery["recovery_error"] = str(recovery_exc)
+                scope_recovery_attempts.append(recovery)
                 _drop_scope_connection(resource)
-                if attempt == 0 and _is_stale_scope_session_error(exc):
+                if recoverable and attempt + 1 < SCOPE_AUTOTUNE_CAPTURE_ATTEMPTS:
+                    time.sleep(0.25 * (attempt + 1))
                     continue
                 break
         return {
             "ok": False,
             "resource": resource,
             "error": str(last_error) if last_error is not None else "Scope capture failed.",
+            "capture_attempts": len(scope_recovery_attempts),
+            "scope_recovery_attempts": scope_recovery_attempts,
             "duration_s": round(time.perf_counter() - started, 3),
             "timestamp": time.time(),
         }
@@ -5523,7 +6030,8 @@ def _config_from_payload(payload: dict | None) -> TuningConfig:
     default_refined = getattr(default_search, "max_refined_iterations", max(0, legacy_max_iterations - default_coarse))
     max_coarse_iterations = _int_field(search_payload, "max_coarse_iterations", default_coarse)
     max_refined_iterations = _int_field(search_payload, "max_refined_iterations", default_refined)
-    if legacy_max_iterations > max_coarse_iterations + max_refined_iterations:
+    explicit_phase_budgets = "max_coarse_iterations" in search_payload and "max_refined_iterations" in search_payload
+    if not explicit_phase_budgets and legacy_max_iterations > max_coarse_iterations + max_refined_iterations:
         max_coarse_iterations += legacy_max_iterations - (max_coarse_iterations + max_refined_iterations)
     total_iterations = max(1, max_coarse_iterations + max_refined_iterations)
     return TuningConfig(
@@ -5556,21 +6064,24 @@ def _config_from_payload(payload: dict | None) -> TuningConfig:
             max_iterations=total_iterations,
             max_coarse_iterations=max_coarse_iterations,
             max_refined_iterations=max_refined_iterations,
-            mod0_kp=_search_parameter_from_payload(search_payload, "mod0_kp", default_search.mod0_kp, integer=True),
-            mod0_ki=_search_parameter_from_payload(search_payload, "mod0_ki", default_search.mod0_ki, integer=True),
-            mod0_kd=_search_parameter_from_payload(search_payload, "mod0_kd", default_search.mod0_kd, integer=True),
-            mod0_kpole1=_search_parameter_from_payload(search_payload, "mod0_kpole1", default_search.mod0_kpole1, integer=True),
-            mod0_kpole2=_search_parameter_from_payload(search_payload, "mod0_kpole2", default_search.mod0_kpole2, integer=True),
-            mod0_cm_gain=_search_parameter_from_payload(search_payload, "mod0_cm_gain", default_search.mod0_cm_gain, integer=True),
+            mod0_kp=_search_parameter_from_payload(search_payload, "mod0_kp", default_search.mod0_kp, integer=True, coarse_iteration_budget=max_coarse_iterations),
+            mod0_ki=_search_parameter_from_payload(search_payload, "mod0_ki", default_search.mod0_ki, integer=True, coarse_iteration_budget=max_coarse_iterations),
+            mod0_kd=_search_parameter_from_payload(search_payload, "mod0_kd", default_search.mod0_kd, integer=True, coarse_iteration_budget=max_coarse_iterations),
+            mod0_kpole1=_search_parameter_from_payload(search_payload, "mod0_kpole1", default_search.mod0_kpole1, integer=True, coarse_iteration_budget=max_coarse_iterations),
+            mod0_kpole2=_search_parameter_from_payload(search_payload, "mod0_kpole2", default_search.mod0_kpole2, integer=True, coarse_iteration_budget=max_coarse_iterations),
+            mod0_cm_gain=_search_parameter_from_payload(search_payload, "mod0_cm_gain", default_search.mod0_cm_gain, integer=True, coarse_iteration_budget=max_coarse_iterations),
+            mod0_ll_bw=_search_parameter_from_payload(search_payload, "mod0_ll_bw", default_search.mod0_ll_bw, integer=True, coarse_iteration_budget=max_coarse_iterations),
             output_inductance_nh=_search_parameter_from_payload(
                 search_payload,
                 "output_inductance_nh",
                 default_search.output_inductance_nh,
+                coarse_iteration_budget=max_coarse_iterations,
             ),
             effective_lc_inductance_nh=_search_parameter_from_payload(
                 search_payload,
                 "effective_lc_inductance_nh",
                 default_search.effective_lc_inductance_nh,
+                coarse_iteration_budget=max_coarse_iterations,
             ),
         ),
     )
@@ -5601,7 +6112,13 @@ def _experiment_from_payload(payload: dict | None) -> AutotuneExperimentConfig:
     )
 
 
-def _search_parameter_from_payload(payload: dict, name: str, default: SearchParameter, integer: bool = False) -> SearchParameter:
+def _search_parameter_from_payload(
+    payload: dict,
+    name: str,
+    default: SearchParameter,
+    integer: bool = False,
+    coarse_iteration_budget: int | None = None,
+) -> SearchParameter:
     raw = payload.get(name)
     if isinstance(raw, dict):
         center = _float_field(raw, "center", default.center)
@@ -5629,7 +6146,10 @@ def _search_parameter_from_payload(payload: dict, name: str, default: SearchPara
         minimum = round(minimum)
         maximum = round(maximum)
         step = max(1, round(step))
-    return SearchParameter(center=float(center), min=float(minimum), max=float(maximum), step=float(step), points=points)
+    parameter = SearchParameter(center=float(center), min=float(minimum), max=float(maximum), step=float(step), points=points)
+    if coarse_iteration_budget is not None:
+        return automatic_search_parameter(parameter, coarse_iteration_budget, integer=integer)
+    return parameter
 
 
 def _float_field(payload: dict, name: str, default: float) -> float:
@@ -5840,6 +6360,9 @@ def _compact_scope_result(result: dict) -> dict:
         "session_reused": result.get("session_reused"),
         "config_reused": result.get("config_reused"),
         "session_retry": result.get("session_retry"),
+        "capture_attempts": result.get("capture_attempts"),
+        "scope_memory_guard": result.get("scope_memory_guard"),
+        "scope_recovery_attempts": result.get("scope_recovery_attempts"),
         "stage_durations_s": result.get("stage_durations_s"),
         "duration_s": result.get("duration_s"),
         "error": result.get("error"),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, is_dataclass
+import math
 from typing import Any, Literal
 
 
@@ -14,9 +15,43 @@ HARDWARE_TUNING_FIELD_NAMES = (
     "mod0_kpole1",
     "mod0_kpole2",
     "mod0_cm_gain",
+    "mod0_ll_bw",
     "output_inductance_nh",
     "effective_lc_inductance_nh",
 )
+LL_BANDWIDTH_MIN = 47
+LL_BANDWIDTH_MAX = 79
+LL_BANDWIDTH_MAX_BONUS = 10.0
+
+
+def bandwidth_bonus(
+    candidate: "HardwarePidCandidate | None",
+    *,
+    passed: bool,
+    both_analyses_enabled: bool = True,
+) -> float:
+    """Return the bounded soft reward for a feasible unified LS/LR bandwidth."""
+
+    if candidate is None or not passed or not both_analyses_enabled:
+        return 0.0
+    span = float(LL_BANDWIDTH_MAX - LL_BANDWIDTH_MIN)
+    normalized = (float(candidate.mod0_ll_bw) - LL_BANDWIDTH_MIN) / span
+    return LL_BANDWIDTH_MAX_BONUS * min(1.0, max(0.0, normalized))
+
+
+def bandwidth_objective(
+    penalty: float,
+    candidate: "HardwarePidCandidate | None",
+    *,
+    passed: bool,
+    both_analyses_enabled: bool = True,
+) -> tuple[float, float]:
+    bonus = bandwidth_bonus(
+        candidate,
+        passed=passed,
+        both_analyses_enabled=both_analyses_enabled,
+    )
+    return float(penalty) - bonus, bonus
 
 
 @dataclass(frozen=True)
@@ -62,6 +97,39 @@ class SearchParameter:
         return min(max(value, self.min), self.max)
 
 
+def automatic_search_parameter(
+    parameter: SearchParameter,
+    coarse_iteration_budget: int,
+    *,
+    integer: bool,
+) -> SearchParameter:
+    """Choose internal grid resolution from the run budget and parameter span."""
+
+    span = max(0.0, float(parameter.max) - float(parameter.min))
+    if span <= 0.0:
+        points = 1
+        step = 1.0 if integer else 0.0
+    else:
+        # Nine levels preserve useful one-direction bandwidth climbing even
+        # for short runs; larger coarse budgets automatically add resolution.
+        per_dimension = max(
+            9,
+            int(math.ceil(max(1, int(coarse_iteration_budget)) / len(HARDWARE_TUNING_FIELD_NAMES))),
+        )
+        available = int(round(span)) + 1 if integer else 101
+        points = max(2, min(101, available, per_dimension))
+        step = span / (points - 1)
+        if integer:
+            step = max(1.0, round(step))
+    return SearchParameter(
+        center=parameter.clamped(parameter.center),
+        min=parameter.min,
+        max=parameter.max,
+        step=step,
+        points=points,
+    )
+
+
 @dataclass(frozen=True)
 class HardwarePidCandidate:
     mod0_kp: int = 165
@@ -70,6 +138,8 @@ class HardwarePidCandidate:
     mod0_kpole1: int = 3
     mod0_kpole2: int = 3
     mod0_cm_gain: int = 2
+    # One search variable drives both Loop-A low-load bandwidth fields.
+    mod0_ll_bw: int = 66
     output_inductance_nh: float = 100.024
     effective_lc_inductance_nh: float = 369.276
     phase: str = "baseline"
@@ -88,6 +158,58 @@ class HardwarePidCandidate:
             "mod0_cm_gain": int(self.mod0_cm_gain),
         }
 
+    def avp_bandwidth_value(self) -> int:
+        return int(self.mod0_ll_bw)
+
+
+def output_inductance_raw(value_nh: float) -> int:
+    """Return the actual 13-bit register code written for output inductance."""
+
+    if value_nh <= 0:
+        raise ValueError("Output Inductance must be positive.")
+    return int(round(10.0 * 4096.0 / (float(value_nh) * 0.35)))
+
+
+def output_inductance_from_raw(raw: int) -> float:
+    if int(raw) <= 0:
+        raise ValueError("Output Inductance raw code must be positive.")
+    return 10.0 * 4096.0 / (int(raw) * 0.35)
+
+
+def effective_lc_inductance_raw(value_nh: float) -> int:
+    """Return the actual 9-bit register code written for effective Lc."""
+
+    if value_nh <= 0:
+        raise ValueError("Effective Lc Inductance must be positive.")
+    return int(round(4096.0 / (0.035 * float(value_nh))))
+
+
+def effective_lc_inductance_from_raw(raw: int) -> float:
+    if int(raw) <= 0:
+        raise ValueError("Effective Lc Inductance raw code must be positive.")
+    return 4096.0 / (0.035 * int(raw))
+
+
+def hardware_candidate_key(candidate: HardwarePidCandidate) -> tuple[int, ...]:
+    """Deduplicate candidates by the values the board actually receives.
+
+    L and Lc are edited in nH in the GUI but quantized to integer register
+    codes before the hardware write. Distinct floats that encode to the same
+    raw fields are therefore the same experiment and must share one key.
+    """
+
+    return (
+        int(candidate.mod0_kp),
+        int(candidate.mod0_ki),
+        int(candidate.mod0_kd),
+        int(candidate.mod0_kpole1),
+        int(candidate.mod0_kpole2),
+        int(candidate.mod0_cm_gain),
+        int(candidate.mod0_ll_bw),
+        output_inductance_raw(candidate.output_inductance_nh),
+        effective_lc_inductance_raw(candidate.effective_lc_inductance_nh),
+    )
+
 
 @dataclass(frozen=True)
 class SearchSpace:
@@ -103,9 +225,10 @@ class SearchSpace:
     mod0_kp: SearchParameter = field(default_factory=lambda: SearchParameter(165, 100, 255, 19.375, 9))
     mod0_ki: SearchParameter = field(default_factory=lambda: SearchParameter(220, 150, 255, 13.125, 9))
     mod0_kd: SearchParameter = field(default_factory=lambda: SearchParameter(175, 100, 200, 12.5, 9))
-    mod0_kpole1: SearchParameter = field(default_factory=lambda: SearchParameter(3, 3, 6, 3, 2))
-    mod0_kpole2: SearchParameter = field(default_factory=lambda: SearchParameter(3, 3, 6, 3, 2))
-    mod0_cm_gain: SearchParameter = field(default_factory=lambda: SearchParameter(2, 2, 2, 1, 1))
+    mod0_kpole1: SearchParameter = field(default_factory=lambda: SearchParameter(3, 2, 6, 1, 5))
+    mod0_kpole2: SearchParameter = field(default_factory=lambda: SearchParameter(3, 2, 6, 1, 5))
+    mod0_cm_gain: SearchParameter = field(default_factory=lambda: SearchParameter(2, 0, 9, 1, 10))
+    mod0_ll_bw: SearchParameter = field(default_factory=lambda: SearchParameter(66, 47, 79, 1, 33))
     output_inductance_nh: SearchParameter = field(default_factory=lambda: SearchParameter(100.024, 80.019, 120.029, 10.0025, 5))
     effective_lc_inductance_nh: SearchParameter = field(default_factory=lambda: SearchParameter(369.276, 295.421, 443.131, 36.9275, 5))
 
@@ -141,6 +264,14 @@ class ResponseMetrics:
     phase_margin_deg: float | None = None
     crossover_frequency_hz: float | None = None
     gain_margin_db: float | None = None
+    bode_gain_rebound_db: float | None = None
+    bode_gain_flat_span_decades: float | None = None
+    bode_gain_slope_p90_db_per_decade: float | None = None
+    bode_gain_shape_penalty: float = 0.0
+    settling_analysis_version: int = 1
+    overshoot_settling_valid: bool = True
+    undershoot_settling_valid: bool = True
+    settling_diagnostics: dict[str, Any] = field(default_factory=dict)
     pass_reasons: list[str] = field(default_factory=list)
 
 
@@ -190,6 +321,8 @@ class IterationRecord:
     bode_result: dict[str, Any] = field(default_factory=dict)
     scope_result: dict[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
+    objective_score: float | None = None
+    bandwidth_bonus: float | None = None
     optimizer_metadata: dict[str, Any] = field(default_factory=dict)
 
 
